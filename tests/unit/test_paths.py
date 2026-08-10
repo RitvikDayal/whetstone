@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -43,15 +45,33 @@ def test_state_root_differs_per_project(tmp_path, monkeypatch):
 
 
 def test_symlinked_ancestor_into_a_cloud_path_is_refused(tmp_path):
-    real = tmp_path / "OneDrive" / "state"
-    real.mkdir(parents=True)
+    cloud = tmp_path / "OneDrive"
+    cloud.mkdir()
     link = tmp_path / "plain-looking"
     try:
-        link.symlink_to(tmp_path / "OneDrive", target_is_directory=True)
+        link.symlink_to(cloud, target_is_directory=True)
     except (OSError, NotImplementedError) as exc:
-        pytest.skip(f"cannot create symlinks here: {exc}")
+        # Fallback: try Windows junction (mklink /J) which doesn't require elevation
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    f'mklink /J "{link}" "{cloud}"',
+                    shell=True,
+                    check=True,
+                    capture_output=True,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError) as junction_exc:
+                pytest.skip(
+                    f"cannot create symlinks or junctions: symlink={exc}, junction={junction_exc}"
+                )
+        else:
+            pytest.skip(f"cannot create symlinks here: {exc}")
+
+    target = link / "state"
+    assert not target.exists(), "the leaf must not exist; that is the branch the bug lived in"
+
     with pytest.raises(UnsafeStatePathError):
-        state_root(tmp_path, str(link / "state"))
+        state_root(tmp_path, str(target))
 
 
 def test_state_root_resolves_a_path_that_does_not_exist_yet(tmp_path):
