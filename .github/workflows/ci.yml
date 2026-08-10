@@ -3,6 +3,10 @@ on:
   push: { branches: [main] }
   pull_request:
 
+# Read-only. CI runs tests; it never merges, publishes, or writes to the repo.
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -12,8 +16,11 @@ jobs:
         python: ["3.11", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      # Pinned to commit SHAs: a tag is mutable, and .coderabbit.yaml asks
+      # reviewers to flag tag pins. Both majors run on node24; the v4/v3 pair
+      # this replaces was node20, which Actions has deprecated.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - run: uv python install ${{ matrix.python }}
       - run: uv sync --all-groups
       - run: uv run ruff check src tests
