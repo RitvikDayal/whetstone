@@ -11,11 +11,17 @@ It never merges and it never deploys.
 
 ## Install
 
+Nothing is published yet. To follow along:
+
 ```bash
-pip install whetstone-cli
+git clone https://github.com/RitvikDayal/whetstone
+cd whetstone
+uv sync --all-groups
 ```
 
-## Use
+## Planned commands
+
+None of these do anything yet. They are installed and they tell you so.
 
 ```bash
 whetstone init      # interactive setup; verifies every answer by running it
