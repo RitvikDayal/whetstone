@@ -47,7 +47,7 @@ def state_root(project_root: Path, override: str | None = None) -> Path:
             str(project_root.resolve()).encode("utf-8")
         ).hexdigest()[:12]
         root = Path.home() / ".whetstone" / digest
-    root = root.resolve() if root.exists() else root.absolute()
+    root = root.resolve()
     assert_not_cloud_synced(root)
     root.mkdir(parents=True, exist_ok=True)
     return root

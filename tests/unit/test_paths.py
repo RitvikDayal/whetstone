@@ -40,3 +40,22 @@ def test_state_root_differs_per_project(tmp_path, monkeypatch):
     a = state_root(tmp_path / "alpha")
     b = state_root(tmp_path / "beta")
     assert a != b
+
+
+def test_symlinked_ancestor_into_a_cloud_path_is_refused(tmp_path):
+    real = tmp_path / "OneDrive" / "state"
+    real.mkdir(parents=True)
+    link = tmp_path / "plain-looking"
+    try:
+        link.symlink_to(tmp_path / "OneDrive", target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create symlinks here: {exc}")
+    with pytest.raises(UnsafeStatePathError):
+        state_root(tmp_path, str(link / "state"))
+
+
+def test_state_root_resolves_a_path_that_does_not_exist_yet(tmp_path):
+    target = tmp_path / "not" / "created" / "yet"
+    assert not target.exists()
+    result = state_root(tmp_path, str(target))
+    assert result.is_dir()
