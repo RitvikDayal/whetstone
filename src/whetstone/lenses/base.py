@@ -82,8 +82,13 @@ class Candidate:
         Deliberately excludes title, detail, and severity so that a reworded or
         re-scored candidate is recognised as the same finding and cannot
         resurrect a rejection.
+
+        JSON-encodes the components rather than joining them on a separator:
+        `subject` holds file paths, package names, and routes, and a route can
+        contain any separator you might pick. Joining on "|" made
+        ("a|b", "c", "d") and ("a", "b|c", "d") hash identically.
         """
-        raw = f"{self.lens}|{self.rule_id}|{self.subject}"
+        raw = json.dumps([self.lens, self.rule_id, self.subject])
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

@@ -1,7 +1,9 @@
+import dataclasses
 from pathlib import Path
 
 import pytest
 
+from whetstone.errors import LensError
 from whetstone.lenses.base import (
     Candidate,
     Evidence,
@@ -38,6 +40,18 @@ def test_dedupe_key_ignores_cosmetic_fields():
     assert _candidate().dedupe_key == _candidate(title="reworded").dedupe_key
 
 
+def test_dedupe_key_is_not_confused_by_separators_in_components():
+    a = _candidate(lens="a|b", rule_id="c", subject="d")
+    b = _candidate(lens="a", rule_id="b|c", subject="d")
+    assert a.dedupe_key != b.dedupe_key
+
+
+def test_dedupe_key_handles_a_route_subject_with_a_pipe():
+    a = _candidate(subject="/search?q=x|y")
+    b = _candidate(subject="/search?q=x", rule_id="R1|y")
+    assert a.dedupe_key != b.dedupe_key
+
+
 def test_severity_ordering():
     assert severity_at_least(Severity.high, Severity.medium)
     assert not severity_at_least(Severity.low, Severity.medium)
@@ -51,8 +65,9 @@ def test_evidence_json_is_deterministic():
 
 
 def test_candidate_is_immutable():
-    with pytest.raises(Exception):  # noqa: B017 - frozen dataclass, exact type not the point
-        _candidate().subject = "elsewhere"
+    candidate = _candidate()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        candidate.subject = "elsewhere"
 
 
 class _Fake:
@@ -87,3 +102,27 @@ def test_run_context_carries_scope(tmp_path):
         run_id="run-1",
     )
     assert ctx.files == (Path("src/a.py"),)
+
+
+def test_load_plugins_failure_is_sticky_not_silently_partial(monkeypatch):
+    import whetstone.lenses.registry as registry_module
+
+    class _BrokenEntry:
+        name = "broken"
+
+        def load(self):
+            def _factory():
+                raise RuntimeError("boom")
+
+            return _factory
+
+    monkeypatch.setattr(registry_module, "entry_points", lambda group=None: [_BrokenEntry()])
+    monkeypatch.setattr(registry_module, "_REGISTRY", {})
+    monkeypatch.setattr(registry_module, "_LOADED_PLUGINS", False)
+    monkeypatch.setattr(registry_module, "_LOAD_ERROR", None, raising=False)
+
+    with pytest.raises(LensError):
+        available_lenses()
+    # The second call must still raise — not silently return a partial registry.
+    with pytest.raises(LensError):
+        available_lenses()
