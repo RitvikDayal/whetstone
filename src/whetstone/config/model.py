@@ -7,11 +7,31 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..severity import Severity
+
 
 class Tier(StrEnum):
     quick = "quick"
     standard = "standard"
     deep = "deep"
+
+
+class OnCeiling(StrEnum):
+    """One member on purpose. Hitting the ceiling stops the run and reports what
+    it skipped; a run that quietly examined half the surface reads as clean and
+    is worse than no run. Anything else here would be that. More members land
+    when there is a second behaviour that does not silently truncate.
+    """
+
+    stop_and_report = "stop_and_report"
+
+
+class Trust(StrEnum):
+    """Autonomy is earned by track record. `assumed` is the one opt-out: it skips
+    probation for a lens the user already knows they want.
+    """
+
+    assumed = "assumed"
 
 
 class _Strict(BaseModel):
@@ -81,15 +101,18 @@ class CeilingConfig(_Strict):
 class BudgetConfig(_Strict):
     tier: Tier = Tier.quick
     ceiling: CeilingConfig = Field(default_factory=CeilingConfig)
-    on_ceiling: str = "stop_and_report"
+    on_ceiling: OnCeiling = OnCeiling.stop_and_report
 
 
 class LensConfig(_Strict):
     enabled: bool = True
     autonomy: int = 0
-    trust: str | None = None
+    trust: Trust | None = None
     only: list[str] | None = None
-    severity_floor: str | None = None
+    # Typed against the lens vocabulary, not `str`. `severity_floor: HIGH` used
+    # to validate here and surface much later as a bare KeyError inside
+    # severity_at_least.
+    severity_floor: Severity | None = None
 
     @field_validator("autonomy")
     @classmethod

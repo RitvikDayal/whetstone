@@ -4,8 +4,9 @@ from pathlib import Path
 import pytest
 
 from whetstone.config.loader import CONFIG_NAME, find_config, load_config
-from whetstone.config.model import Tier
+from whetstone.config.model import OnCeiling, Tier, Trust
 from whetstone.errors import ConfigError, LiteralSecretError
+from whetstone.lenses.base import Severity, severity_at_least
 
 MINIMAL = """\
 version: 1
@@ -331,6 +332,84 @@ def test_secret_key_message_names_the_required_form(tmp_path):
         load_config(path)
     assert "${env:VAR_NAME}" in str(caught.value)
     assert "github_token" in str(caught.value)
+
+
+def test_severity_floor_is_validated_against_the_severity_enum(tmp_path):
+    """'HIGH' used to validate here and become a KeyError in severity_at_least."""
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        lenses:
+          hygiene: { severity_floor: HIGH }
+        """,
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    assert "severity_floor" in str(caught.value)
+    assert "critical" in str(caught.value)
+
+
+def test_severity_floor_round_trips_into_the_lens_enum(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        lenses:
+          hygiene: { severity_floor: high }
+        """,
+    )
+    floor = load_config(path).lenses["hygiene"].severity_floor
+    assert floor is Severity.high
+    assert severity_at_least(Severity.critical, floor)
+    assert not severity_at_least(Severity.low, floor)
+
+
+def test_unknown_on_ceiling_is_rejected(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        budget: { on_ceiling: keep_going }
+        """,
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    assert "on_ceiling" in str(caught.value)
+    assert "stop_and_report" in str(caught.value)
+
+
+def test_unknown_trust_is_rejected(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        lenses:
+          hygiene: { trust: yes_please }
+        """,
+    )
+    with pytest.raises(ConfigError, match="assumed"):
+        load_config(path)
+
+
+def test_documented_lens_settings_are_accepted(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        budget: { on_ceiling: stop_and_report }
+        lenses:
+          hygiene: { enabled: true, autonomy: 3, trust: assumed }
+        """,
+    )
+    cfg = load_config(path)
+    assert cfg.budget.on_ceiling is OnCeiling.stop_and_report
+    assert cfg.lenses["hygiene"].trust is Trust.assumed
 
 
 @pytest.mark.parametrize(

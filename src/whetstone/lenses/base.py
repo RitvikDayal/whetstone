@@ -15,25 +15,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-
-class Severity(StrEnum):
-    low = "low"
-    medium = "medium"
-    high = "high"
-    critical = "critical"
-
-
-_SEVERITY_ORDER: dict[str, int] = {
-    Severity.low: 0,
-    Severity.medium: 1,
-    Severity.high: 2,
-    Severity.critical: 3,
-}
-
-
-def severity_at_least(value: Severity, floor: Severity) -> bool:
-    """True when *value* is at or above *floor*."""
-    return _SEVERITY_ORDER[value] >= _SEVERITY_ORDER[floor]
+# Re-exported: `Severity` is shared with `config`, which must not import the
+# lens layer. See whetstone/severity.py.
+from ..severity import Severity as Severity
+from ..severity import severity_at_least as severity_at_least
 
 
 class EvidenceKind(StrEnum):
