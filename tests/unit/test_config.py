@@ -126,3 +126,73 @@ def test_unknown_top_level_key_is_rejected(tmp_path):
     )
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+def test_unknown_key_in_a_sink_is_rejected(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        sinks:
+          - { kind: dashboard, labls: [x] }
+        """,
+    )
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_env_reference_is_case_insensitive_on_the_prefix(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEMO_PW", "s3cret")
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        environment:
+          app:
+            auth: { kind: form, password: "${ENV:DEMO_PW}" }
+        """,
+    )
+    assert load_config(path).environment.app.auth["password"] == "s3cret"
+
+
+def test_runtime_placeholder_named_env_something_is_untouched(tmp_path):
+    """${ENVIRONMENT} is not an env reference - no colon, so it must survive."""
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        environment:
+          commands: { dev: "serve --mode ${ENVIRONMENT}" }
+        """,
+    )
+    assert load_config(path).environment.commands.dev == "serve --mode ${ENVIRONMENT}"
+
+
+@pytest.mark.parametrize(
+    "section,doc",
+    [
+        (
+            "environment",
+            "version: 1\nproject: { name: demo }\nenvironment: { commnds: {} }\n",
+        ),
+        (
+            "budget",
+            "version: 1\nproject: { name: demo }\nbudget: { teir: quick }\n",
+        ),
+        (
+            "boundaries",
+            "version: 1\nproject: { name: demo }\nboundaries: { includ: ['a'] }\n",
+        ),
+        (
+            "project",
+            "version: 1\nproject: { name: demo, forg: {} }\n",
+        ),
+    ],
+)
+def test_unknown_key_in_a_nested_section_is_rejected(tmp_path, section, doc):
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError):
+        load_config(path)

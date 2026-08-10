@@ -102,10 +102,12 @@ class LensConfig(_Strict):
         return value
 
 
-class SinkConfig(BaseModel):
-    """Sinks carry adapter-specific keys, so extras are allowed here."""
+class SinkConfig(_Strict):
+    """Sinks will grow adapter-specific keys (Jira field IDs, GitHub labels).
+    Those get modelled per adapter when the adapter lands. Until then a typo
+    in a sink entry must fail, not be silently accepted as a future field.
+    """
 
-    model_config = ConfigDict(extra="allow")
     kind: str
 
 

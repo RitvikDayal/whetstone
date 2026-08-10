@@ -15,9 +15,11 @@ from .model import WhetstoneConfig
 
 CONFIG_NAME = "whetstone.yaml"
 
-# Matches ${env:VAR_NAME}. Deliberately narrower than ${VAR} so that runtime
-# placeholders Whetstone substitutes itself — ${WHETSTONE_PORT} — pass through.
-_ENV_REF = re.compile(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
+# Matches ${env:VAR_NAME} (env prefix case-insensitive, variable name is not —
+# environment variable names are case-sensitive). Deliberately narrower than
+# ${VAR} so that runtime placeholders Whetstone substitutes itself —
+# ${WHETSTONE_PORT} — pass through.
+_ENV_REF = re.compile(r"\$\{[Ee][Nn][Vv]:([A-Za-z_][A-Za-z0-9_]*)\}")
 
 _SECRET_KEYS = frozenset(
     {"password", "token", "secret", "api_key", "apikey", "private_key"}
