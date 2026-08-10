@@ -171,6 +171,26 @@ def test_runtime_placeholder_named_env_something_is_untouched(tmp_path):
     assert load_config(path).environment.commands.dev == "serve --mode ${ENVIRONMENT}"
 
 
+def test_non_utf8_config_is_a_config_error(tmp_path):
+    path = tmp_path / CONFIG_NAME
+    path.write_bytes(b"version: 1\nproject: { name: d\xffemo }\n")
+    with pytest.raises(ConfigError, match="UTF-8"):
+        load_config(path)
+
+
+def test_missing_config_file_is_a_config_error(tmp_path):
+    """find_config returns a path that load_config re-opens; it can vanish."""
+    with pytest.raises(ConfigError, match="does not exist"):
+        load_config(tmp_path / CONFIG_NAME)
+
+
+def test_config_path_that_is_a_directory_is_a_config_error(tmp_path):
+    directory = tmp_path / CONFIG_NAME
+    directory.mkdir()
+    with pytest.raises(ConfigError, match="could not be read"):
+        load_config(directory)
+
+
 def test_resolved_secret_never_reaches_the_error_text(tmp_path, monkeypatch):
     """A typo elsewhere in the config must not print the resolved secret.
 

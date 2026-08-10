@@ -19,6 +19,10 @@ class UnsafeStatePathError(WhetstoneError):
     """The resolved state directory looks cloud-synced; SQLite would be torn."""
 
 
+class StateDirError(WhetstoneError):
+    """The state directory could not be created, or is not a directory."""
+
+
 class GitError(WhetstoneError):
     """A git invocation failed."""
 

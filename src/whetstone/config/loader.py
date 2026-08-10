@@ -56,7 +56,25 @@ def find_config(start: Path) -> Path:
 def load_config(path: Path) -> WhetstoneConfig:
     """Load and validate the config at *path*."""
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{path} is not valid UTF-8 (byte {exc.start}: {exc.reason}).\n"
+            "Re-save it as UTF-8 without a byte-order mark."
+        ) from exc
+    except FileNotFoundError as exc:
+        raise ConfigError(
+            f"{path} does not exist.\nRun `whetstone init` to create one."
+        ) from exc
+    except OSError as exc:
+        # Covers IsADirectoryError, PermissionError, and the assorted platform
+        # spellings of the same two mistakes — Windows raises PermissionError
+        # where POSIX raises IsADirectoryError for a directory.
+        detail = "it is a directory" if path.is_dir() else str(exc)
+        raise ConfigError(f"{path} could not be read: {detail}") from exc
+
+    try:
+        raw = yaml.safe_load(text) or {}
     except yaml.YAMLError as exc:
         raise ConfigError(f"{path} is not valid YAML: {exc}") from exc
     if not isinstance(raw, dict):
