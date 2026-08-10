@@ -171,6 +171,148 @@ def test_runtime_placeholder_named_env_something_is_untouched(tmp_path):
     assert load_config(path).environment.commands.dev == "serve --mode ${ENVIRONMENT}"
 
 
+def test_resolved_secret_never_reaches_the_error_text(tmp_path, monkeypatch):
+    """A typo elsewhere in the config must not print the resolved secret.
+
+    `budget.tier` is validated against an enum, so a bogus value there fails
+    Pydantic validation and the whole input is rendered into the message.
+    """
+    secret = "ghp_R3alSecretValue0000000000000000000000"
+    monkeypatch.setenv("DEMO_GH_TOKEN", secret)
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        budget:
+          tier: "${env:DEMO_GH_TOKEN}"
+        """,
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    rendered = str(caught.value)
+    assert secret not in rendered
+    assert "${env:DEMO_GH_TOKEN}" in rendered
+    # The message must still say which key was wrong.
+    assert "tier" in rendered
+
+
+def test_redaction_covers_a_secret_under_a_misspelled_key(tmp_path, monkeypatch):
+    """`extra="forbid"` renders the rejected value, so a typo'd key leaks it."""
+    secret = "AKIAIOSFODNN7EXAMPLESECRET"
+    monkeypatch.setenv("DEMO_AWS", secret)
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        sinks:
+          - { kind: dashboard, api_tokn: "${env:DEMO_AWS}" }
+        """,
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    rendered = str(caught.value)
+    assert secret not in rendered
+    assert "api_tokn" in rendered
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "access_token",
+        "github_token",
+        "client_secret",
+        "secret_key",
+        "api_secret",
+        "auth_token",
+        "aws_secret_access_key",
+        "credentials",
+        "password",
+        "api_key",
+        "private_key",
+        "apikey",
+        "passwd",
+    ],
+)
+def test_secret_shaped_keys_reject_literals(tmp_path, key):
+    path = _write(
+        tmp_path,
+        f"""
+        version: 1
+        project: {{ name: demo }}
+        environment:
+          app:
+            auth: {{ kind: form, {key}: literalvalue }}
+        """,
+    )
+    with pytest.raises(LiteralSecretError, match=key):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["kind", "keyword", "keys", "base_branch", "viewports", "monkey", "key"],
+)
+def test_innocent_keys_are_not_treated_as_secrets(tmp_path, key):
+    """Over-matching would reject valid config in someone else's repository."""
+    path = _write(
+        tmp_path,
+        f"""
+        version: 1
+        project: {{ name: demo }}
+        environment:
+          app:
+            auth: {{ {key}: plainvalue }}
+        """,
+    )
+    assert load_config(path).environment.app.auth[key] == "plainvalue"
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "1234567890",
+        "{ value: literalsecret }",
+        "[literalsecret]",
+        "true",
+        "null",
+        '["${env:DEMO_PW}"]',
+    ],
+)
+def test_non_string_under_a_secret_key_is_rejected(tmp_path, literal, monkeypatch):
+    monkeypatch.setenv("DEMO_PW", "s3cret")
+    path = _write(
+        tmp_path,
+        f"""
+        version: 1
+        project: {{ name: demo }}
+        environment:
+          app:
+            auth: {{ kind: form, password: {literal} }}
+        """,
+    )
+    with pytest.raises(LiteralSecretError, match="password"):
+        load_config(path)
+
+
+def test_secret_key_message_names_the_required_form(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        environment:
+          app:
+            auth: { github_token: 1234567890 }
+        """,
+    )
+    with pytest.raises(LiteralSecretError) as caught:
+        load_config(path)
+    assert "${env:VAR_NAME}" in str(caught.value)
+    assert "github_token" in str(caught.value)
+
+
 @pytest.mark.parametrize(
     "section,doc",
     [

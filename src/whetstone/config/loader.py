@@ -21,9 +21,23 @@ CONFIG_NAME = "whetstone.yaml"
 # ${WHETSTONE_PORT} — pass through.
 _ENV_REF = re.compile(r"\$\{[Ee][Nn][Vv]:([A-Za-z_][A-Za-z0-9_]*)\}")
 
-_SECRET_KEYS = frozenset(
-    {"password", "token", "secret", "api_key", "apikey", "private_key"}
+# A key is secret-shaped when its lowercased name CONTAINS one of these tokens.
+# Exact-name matching missed every conventional spelling — `github_token`,
+# `client_secret`, `aws_secret_access_key`, `credentials` all sailed through.
+_SECRET_SUBSTRINGS = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "apikey",
 )
+
+# ...or when its final separator-delimited component is `key`: `api_key`,
+# `private_key`, `signing-key`. A bare `key`, and `key` as a substring, are
+# deliberately NOT enough — `keys`, `keyword`, `monkey` are ordinary config, and
+# a tool that rejects someone's valid config is its own defect.
+_SECRET_KEY_SUFFIX = re.compile(r"[_\-.]key$")
 
 
 def find_config(start: Path) -> Path:
@@ -49,25 +63,38 @@ def load_config(path: Path) -> WhetstoneConfig:
         raise ConfigError(f"{path} must contain a mapping at the top level.")
 
     _reject_literal_secrets(raw, [])
-    resolved = _interpolate(raw)
+    # Interpolation puts real secret values into the tree. Anything that
+    # stringifies that tree afterwards — Pydantic renders `input_value=` verbatim
+    # — would print them, so record what was resolved and scrub it back out.
+    resolved_secrets: dict[str, str] = {}
+    resolved = _interpolate(raw, resolved_secrets)
 
     try:
         return WhetstoneConfig.model_validate(resolved)
     except ValidationError as exc:
-        raise ConfigError(f"{path} is invalid:\n{exc}") from exc
+        raise ConfigError(f"{path} is invalid:\n{_redact(str(exc), resolved_secrets)}") from exc
+
+
+def _is_secret_key(key: object) -> bool:
+    lowered = str(key).lower()
+    return any(token in lowered for token in _SECRET_SUBSTRINGS) or bool(
+        _SECRET_KEY_SUFFIX.search(lowered)
+    )
 
 
 def _reject_literal_secrets(node: Any, trail: list[str]) -> None:
     if isinstance(node, dict):
         for key, value in node.items():
             here = [*trail, str(key)]
-            if (
-                str(key).lower() in _SECRET_KEYS
-                and isinstance(value, str)
-                and not _ENV_REF.fullmatch(value.strip())
+            # A secret-shaped key must hold exactly one ${env:...} string.
+            # Numbers, lists, mappings, booleans, and null are all ways to smuggle
+            # a literal past an `isinstance(value, str)` guard.
+            if _is_secret_key(key) and not (
+                isinstance(value, str) and _ENV_REF.fullmatch(value.strip())
             ):
                 raise LiteralSecretError(
-                    f"{'.'.join(here)} contains a literal value.\n"
+                    f"{'.'.join(here)} must hold a single environment reference, "
+                    f"not {_describe(value)}.\n"
                     "Secrets must be references so they never land in version "
                     'control: use "${env:VAR_NAME}".'
                 )
@@ -77,17 +104,32 @@ def _reject_literal_secrets(node: Any, trail: list[str]) -> None:
             _reject_literal_secrets(value, [*trail, str(index)])
 
 
-def _interpolate(node: Any) -> Any:
+def _describe(value: Any) -> str:
+    """Name the shape of a rejected value without ever echoing it."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, dict):
+        return "a mapping"
+    if isinstance(value, list):
+        return "a list"
+    if isinstance(value, str):
+        return "a literal string"
+    return f"a literal {type(value).__name__}"
+
+
+def _interpolate(node: Any, resolved: dict[str, str]) -> Any:
     if isinstance(node, dict):
-        return {key: _interpolate(value) for key, value in node.items()}
+        return {key: _interpolate(value, resolved) for key, value in node.items()}
     if isinstance(node, list):
-        return [_interpolate(value) for value in node]
+        return [_interpolate(value, resolved) for value in node]
     if isinstance(node, str):
-        return _ENV_REF.sub(_substitute, node)
+        return _ENV_REF.sub(lambda match: _substitute(match, resolved), node)
     return node
 
 
-def _substitute(match: re.Match[str]) -> str:
+def _substitute(match: re.Match[str], resolved: dict[str, str]) -> str:
     name = match.group(1)
     value = os.environ.get(name)
     if value is None:
@@ -95,4 +137,19 @@ def _substitute(match: re.Match[str]) -> str:
             f"Config references ${{env:{name}}} but {name} is not set in the "
             "environment."
         )
+    if value:
+        resolved[value] = f"${{env:{name}}}"
     return value
+
+
+def _redact(text: str, resolved: dict[str, str]) -> str:
+    """Put every resolved environment value back behind its reference.
+
+    Length-descending so a value that contains another is replaced first. Every
+    resolved value is scrubbed regardless of length: short ones make for a
+    noisier message, but guessing which values are "secret enough" is how leaks
+    happen. The Pydantic detail is preserved, so the message still names the key.
+    """
+    for value in sorted(resolved, key=len, reverse=True):
+        text = text.replace(value, resolved[value])
+    return text
