@@ -41,6 +41,52 @@ def test_find_config_reports_clearly_when_absent(tmp_path):
         find_config(tmp_path)
 
 
+def test_find_config_stops_at_the_worktree_root(tmp_path):
+    """Someone else's config in a parent must not supply this run's never_touch."""
+    _write(tmp_path, MINIMAL)
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    with pytest.raises(ConfigError, match="repository root"):
+        find_config(repo / "src")
+
+
+def test_find_config_stops_at_a_dot_git_file(tmp_path):
+    """Inside a worktree or submodule, .git is a file, not a directory."""
+    _write(tmp_path, MINIMAL)
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / ".git").write_text("gitdir: ../.git/worktrees/x\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="repository root"):
+        find_config(repo / "src")
+
+
+def test_find_config_still_finds_one_inside_the_repo(tmp_path):
+    _write(tmp_path, MINIMAL)
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    _write(repo, MINIMAL)
+    assert find_config(repo / "src").parent == repo
+
+
+def test_find_config_checks_the_repo_root_itself(tmp_path):
+    """The walk stops AT the root, not before it."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "deep").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    _write(repo, MINIMAL)
+    assert find_config(repo / "src" / "deep").parent == repo
+
+
+def test_find_config_without_a_repo_keeps_walking(tmp_path):
+    """No repository found means the old behaviour, unchanged."""
+    _write(tmp_path, MINIMAL)
+    nested = tmp_path / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    assert find_config(nested).parent == tmp_path
+
+
 def test_literal_secret_is_rejected(tmp_path):
     path = _write(
         tmp_path,

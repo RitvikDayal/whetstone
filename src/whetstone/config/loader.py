@@ -41,12 +41,30 @@ _SECRET_KEY_SUFFIX = re.compile(r"[_\-.]key$")
 
 
 def find_config(start: Path) -> Path:
-    """Walk up from *start* looking for whetstone.yaml."""
+    """Walk up from *start* looking for whetstone.yaml.
+
+    The walk stops at the git worktree root. Without that stop, a whetstone.yaml
+    in a parent directory or in $HOME silently supplies someone else's
+    `never_touch` write barrier and `state_dir` to this run. When there is no
+    repository the walk continues to the filesystem root as before.
+    """
     start = start.resolve()
     for directory in (start, *start.parents):
         candidate = directory / CONFIG_NAME
         if candidate.is_file():
             return candidate
+        # `.git` is a FILE inside a linked worktree or a submodule, so test for
+        # existence rather than for a directory. Checked after the candidate so
+        # a config sitting at the repo root is still found.
+        if (directory / ".git").exists():
+            raise ConfigError(
+                f"No {CONFIG_NAME} found between {start} and the repository "
+                f"root {directory}.\n"
+                "The search stops there on purpose: a config outside the "
+                "repository would apply another project's write barrier to this "
+                "one.\n"
+                "Run `whetstone init` to create one."
+            )
     raise ConfigError(
         f"No {CONFIG_NAME} found in {start} or any parent directory.\n"
         "Run `whetstone init` to create one."
