@@ -12,7 +12,10 @@ reviews:
 
   auto_review:
     enabled: true
-    drafts: true
+    # Drafts are work in progress. Reviewing them burns review budget on code
+    # that is about to change and trains everyone to skim the comments. A PR
+    # gets reviewed when it is marked ready.
+    drafts: false
     base_branches:
       - main
 
