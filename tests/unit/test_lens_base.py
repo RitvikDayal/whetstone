@@ -36,6 +36,23 @@ def test_dedupe_key_is_stable_and_identity_bearing():
     assert _candidate().dedupe_key != _candidate(rule_id="R2").dedupe_key
 
 
+def test_dedupe_key_is_the_same_on_windows_and_posix():
+    """A rejection recorded on Windows must suppress the same finding on Linux CI."""
+    assert _candidate(subject=r"src\a.py").dedupe_key == _candidate(subject="src/a.py").dedupe_key
+    assert (
+        _candidate(subject=r"src\deep\a.py").dedupe_key
+        == _candidate(subject="src/deep/a.py").dedupe_key
+    )
+
+
+def test_dedupe_key_normalisation_does_not_touch_the_displayed_subject():
+    assert _candidate(subject=r"src\a.py").subject == r"src\a.py"
+
+
+def test_dedupe_key_still_separates_genuinely_different_subjects():
+    assert _candidate(subject="src/a.py").dedupe_key != _candidate(subject="src/b.py").dedupe_key
+
+
 def test_dedupe_key_ignores_cosmetic_fields():
     assert _candidate().dedupe_key == _candidate(title="reworded").dedupe_key
 

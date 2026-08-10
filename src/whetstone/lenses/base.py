@@ -72,8 +72,16 @@ class Candidate:
         `subject` holds file paths, package names, and routes, and a route can
         contain any separator you might pick. Joining on "|" made
         ("a|b", "c", "d") and ("a", "b|c", "d") hash identically.
+
+        Backslashes in `subject` are folded to "/" for hashing only, so that a
+        rejection recorded on Windows suppresses the same finding on Linux CI.
+        This deliberately conflates the two separators: subjects are
+        predominantly paths, and a subject where "\\" and "/" mean different
+        things is rare enough that colliding them beats splitting every finding
+        in a cross-platform project down the middle. `subject` itself is left
+        exactly as the lens gave it, for display.
         """
-        raw = json.dumps([self.lens, self.rule_id, self.subject])
+        raw = json.dumps([self.lens, self.rule_id, self.subject.replace("\\", "/")])
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
