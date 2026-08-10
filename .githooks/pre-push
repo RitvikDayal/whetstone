@@ -1,0 +1,27 @@
+#!/bin/sh
+# Refuse any push to main.
+#
+# GitHub branch protection is unavailable on private repos on the Free plan,
+# so this hook is the enforcement. It is not security — anyone can pass
+# --no-verify — it is a guardrail against the mistake it prevents: pushing
+# work to main instead of opening a pull request.
+#
+# Enabled by: git config core.hooksPath .githooks
+# When the repo goes public (or onto Pro), add the server-side ruleset with
+# scripts/protect-main.sh and keep this hook as belt-and-braces.
+
+protected="refs/heads/main"
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+	if [ "$remote_ref" = "$protected" ]; then
+		echo "pre-push: refusing to push to main." >&2
+		echo "" >&2
+		echo "  main is protected. Open a pull request from your branch instead:" >&2
+		echo "    gh pr create --base main --head \"\$(git branch --show-current)\"" >&2
+		echo "" >&2
+		echo "  CodeRabbit reviews every PR and must be satisfied before merge." >&2
+		exit 1
+	fi
+done
+
+exit 0
