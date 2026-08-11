@@ -13,8 +13,15 @@ command can ever execute. `doctor.py` runs arbitrary user-declared strings
 under `shell=True` by design (see its module docstring), so a whetstone.yaml
 declaring `test: git push origin main` runs under doctor and this guard stays
 green; the scan cannot see through `shell=True` into a runtime string. That
-is the intended boundary: the trust boundary is WHO AUTHORED the string
-(human-written config vs. model-authored), not what the string says.
+is the intended boundary.
+
+Authorship (human-written config vs. model-authored) is the boundary for the
+command STRING, and it is not the boundary for what actually runs: `shell=True`
+with `cwd=project_root` lets cmd.exe resolve a `git.bat` in the project root
+ahead of `git.EXE` on PATH, so even a string nobody would object to can execute
+the repository's own code. doctor.py's module docstring carries the measurement.
+Do not restate the boundary as authorship alone -- this file said that, and it
+was wrong in a way that reads as reassuring.
 """
 
 from __future__ import annotations

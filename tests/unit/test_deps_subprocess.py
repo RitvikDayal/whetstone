@@ -390,6 +390,108 @@ def test_timeout_is_bounded_when_a_grandchild_holds_the_pipe(tmp_path, monkeypat
     ), ctx.skips
 
 
+def test_the_bound_still_holds_when_the_kill_does_not_take(tmp_path, monkeypatch):
+    """`_run_pip_audit` has the same shape doctor.run_command had: the recovery
+    branch leaves the `with subprocess.Popen(...)` block, and `Popen.__exit__`
+    ends in a bare unbounded `self.wait()` for every exit that is not
+    KeyboardInterrupt. `kill_and_reap` being bounded does not make the CALLER
+    bounded, and a kill that takes hides the difference entirely -- which is
+    why the existing timeout test above passes either way.
+    """
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class _RecordingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+
+    def _reap_without_killing(proc):
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.communicate(timeout=2)
+
+    monkeypatch.setattr(deps_module, "kill_and_reap", _reap_without_killing)
+    monkeypatch.setattr(deps_module, "_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(
+        deps_module,
+        "_PIP_AUDIT_ARGV",
+        _fake_tool(tmp_path, "import time\ntime.sleep(60)\n"),
+    )
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    ctx = _ctx(tmp_path)
+
+    started = time.monotonic()
+    try:
+        assert list(DepsDetector().detect(ctx)) == []
+        elapsed = time.monotonic() - started
+    finally:
+        for proc in spawned:
+            with contextlib.suppress(OSError, ValueError):
+                proc.kill()
+
+    assert elapsed < 20, (
+        f"_run_pip_audit outlived its own bound: {elapsed:.1f}s"
+    )
+    assert any(
+        skip.startswith("hygiene/deps: pip-audit failed") for skip in ctx.skips
+    ), ctx.skips
+
+
+def test_a_successful_audit_leaves_no_open_pipes(tmp_path, monkeypatch):
+    """The `with` was adopted to guarantee the pipes close on every exit.
+    Removing it must not remove that."""
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class _RecordingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+    monkeypatch.setattr(
+        deps_module,
+        "_PIP_AUDIT_ARGV",
+        _fake_tool(tmp_path, "import json\nprint(json.dumps({'dependencies': []}))\n"),
+    )
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+
+    assert list(DepsDetector().detect(_ctx(tmp_path))) == []
+
+    assert spawned, "_run_pip_audit did not spawn a process"
+    proc = spawned[0]
+    assert proc.stdout.closed and proc.stderr.closed
+    assert proc.poll() is not None, "the child was left unreaped"
+
+
+def test_a_nonzero_exit_leaves_no_open_pipes(tmp_path, monkeypatch):
+    """The RuntimeError path leaves the function through a raise, not a return."""
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class _RecordingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+    monkeypatch.setattr(
+        deps_module,
+        "_PIP_AUDIT_ARGV",
+        _fake_tool(tmp_path, "import sys\nprint('nope', file=sys.stderr)\nsys.exit(2)\n"),
+    )
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+
+    ctx = _ctx(tmp_path)
+    assert list(DepsDetector().detect(ctx)) == []
+    assert any("nope" in skip for skip in ctx.skips), ctx.skips
+
+    proc = spawned[0]
+    assert proc.stdout.closed and proc.stderr.closed
+
+
 # --- finding 8: the rest of the subprocess contract --------------------------
 
 

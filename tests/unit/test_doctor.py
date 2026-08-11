@@ -1,6 +1,9 @@
+import contextlib
+import subprocess
 import sys
 import time
 
+from whetstone import doctor as doctor_module
 from whetstone.config.model import (
     CommandsConfig,
     EnvironmentConfig,
@@ -63,6 +66,153 @@ def test_timeout_is_bounded_when_a_grandchild_holds_the_pipe(tmp_path):
     assert result.ok is False
     assert "timed out" in result.detail.lower()
     assert elapsed < 20, f"timeout did not bound the run: {elapsed:.1f}s"
+
+
+def test_the_bound_still_holds_when_the_kill_does_not_take(tmp_path, monkeypatch):
+    """The one case `REAP_SECONDS` exists for, measured end to end.
+
+    `kill_and_reap` is bounded, and that was never the question. The question is
+    whether `run_command` is, and it was not: the timeout branch RETURNS from
+    inside `with subprocess.Popen(...)`, so `exc_type is None` and
+    `Popen.__exit__` takes its ordinary path, which ends in a bare unbounded
+    `self.wait()`. CPython 3.11 special-cases only KeyboardInterrupt there.
+
+    Measured against the `with` form, kill neutered, timeout=2s,
+    REAP_SECONDS=15, child sleeping 90s:
+
+        t+ 0.0s  run_command ENTER
+        t+ 2.0s  kill_and_reap ENTER
+        t+17.0s  kill_and_reap EXIT     <- bounded exactly as designed
+        t+90.1s  run_command RETURNED   <- Popen.__exit__'s bare self.wait()
+
+    Neutering the kill is the point: a kill that takes hides the defect
+    completely, because the child is already dead by the time __exit__ waits
+    for it. That is why every existing timeout test passed over this.
+    """
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class _RecordingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+
+    def _reap_without_killing(proc):
+        # kill_tree replaced by a no-op. Everything else kill_and_reap does is
+        # kept, including its bound, so what this measures is the caller.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.communicate(timeout=2)
+
+    monkeypatch.setattr(doctor_module, "kill_and_reap", _reap_without_killing)
+
+    started = time.monotonic()
+    try:
+        result = run_command(
+            "probe", f'"{sys.executable}" -c "import time; time.sleep(60)"', tmp_path, 1
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        # A failure here must not leave a 60s sleeper behind.
+        for proc in spawned:
+            with contextlib.suppress(OSError, ValueError):
+                proc.kill()
+
+    assert result.ok is False
+    assert "timed out" in result.detail.lower()
+    assert elapsed < 20, (
+        "run_command outlived its own bound; the unbounded wait is back: "
+        f"{elapsed:.1f}s"
+    )
+
+
+def test_a_successful_command_leaves_no_open_pipes(tmp_path, monkeypatch):
+    """Dropping the context manager must not drop the guarantee it was adopted
+    for. `communicate()` closes the pipes on the ordinary path; this pins that
+    the ordinary path still ends with them closed."""
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class _RecordingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+
+    result = run_command("probe", f'"{sys.executable}" -c "pass"', tmp_path, 30)
+
+    assert result.ok is True
+    assert spawned, "run_command did not spawn a process"
+    proc = spawned[0]
+    assert proc.stdout.closed and proc.stderr.closed
+    assert proc.poll() is not None, "the child was left unreaped"
+
+
+def test_a_timed_out_command_leaves_no_open_pipes(tmp_path, monkeypatch):
+    """Same guarantee on the path that does not go through communicate()'s own
+    cleanup."""
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class _RecordingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+
+    result = run_command(
+        "probe", f'"{sys.executable}" -c "import time; time.sleep(30)"', tmp_path, 1
+    )
+
+    assert result.ok is False
+    proc = spawned[0]
+    assert proc.stdout.closed and proc.stderr.closed
+
+
+def test_an_interrupt_kills_the_command_and_closes_the_pipes(tmp_path, monkeypatch):
+    """Ctrl-C mid-command must not leave it, or anything it spawned, running."""
+    spawned: list[subprocess.Popen] = []
+    interrupted: list[bool] = []
+    real_popen = subprocess.Popen
+
+    class _InterruptingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+        def communicate(self, *args, **kwargs):
+            # First read only: kill_tree runs taskkill through this same
+            # patched name on Windows.
+            if not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            return super().communicate(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _InterruptingPopen)
+
+    try:
+        try:
+            run_command(
+                "probe",
+                f'"{sys.executable}" -c "import time; time.sleep(60)"',
+                tmp_path,
+                30,
+            )
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError("the interrupt did not reach the caller")
+
+        proc = spawned[0]
+        assert proc.poll() is not None, "the command survived the interrupt"
+        assert proc.stdout.closed and proc.stderr.closed
+    finally:
+        for proc in spawned:
+            with contextlib.suppress(OSError, ValueError):
+                proc.kill()
 
 
 def test_undeclared_commands_are_skipped_not_failed(tmp_path):

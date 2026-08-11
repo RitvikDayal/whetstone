@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from ...._subprocess import kill_and_reap, new_group
+from ...._subprocess import close_pipes, kill_and_reap, new_group
 from ...base import Candidate, Evidence, EvidenceKind, RunContext, Severity
 
 _PYPROJECT = "pyproject.toml"
@@ -192,12 +192,15 @@ def _run_pip_audit(project_root: Path, args: list[str]) -> str:
     outlives its bound, RuntimeError on any other non-success exit.
     """
     argv = [*_PIP_AUDIT_ARGV, "--format", "json", "--progress-spinner", "off", *args]
-    # `with`, so the pipes are closed and the child reaped on every exit, not
-    # just the two this function names. Note that Popen.__exit__ ends in an
-    # UNBOUNDED wait(), which is why the handler below kills the tree first:
-    # the context manager is what guarantees cleanup, the kill is what keeps
-    # that cleanup bounded.
-    with subprocess.Popen(
+    # Not a `with`. The context manager was adopted to guarantee the pipes close
+    # and the child is reaped on every exit, not just the ones this function
+    # names -- and that guarantee is worth keeping. What came attached to it was
+    # `Popen.__exit__`'s bare unbounded `wait()`, which runs on every exit that
+    # is not a KeyboardInterrupt and so undid the bound the kill exists to
+    # provide. Measured with the kill neutered: the reap returned on schedule
+    # and the function returned 73 seconds later. `close_pipes` in the `finally`
+    # is the guarantee without the wait; see `_subprocess.py`'s docstring.
+    proc = subprocess.Popen(
         argv,
         cwd=project_root,
         stdout=subprocess.PIPE,
@@ -216,23 +219,29 @@ def _run_pip_audit(project_root: Path, args: list[str]) -> str:
         # json.loads to sqlite.
         errors="surrogateescape",
         **new_group(),
-    ) as proc:
-        try:
-            raw, err = proc.communicate(timeout=_TIMEOUT_SECONDS)
-        except BaseException:
-            # BaseException, not TimeoutExpired: Ctrl-C in the middle of a slow
-            # audit used to propagate straight past this and leave pip-audit --
-            # and the pip it shelled out to -- running with the pipes still
-            # open. The timeout is not the only way out of a communicate().
-            # `kill_and_reap` kills the tree, then drains what's left of the
-            # pipes with its own bounded timeout, so surfacing the original
-            # exception below cannot be blocked by a reap that never finishes.
-            kill_and_reap(proc)
-            raise
-        # pip-audit exits 1 when it finds vulnerabilities -- success for us.
-        if proc.returncode not in (0, 1):
-            raise RuntimeError((err or "").strip() or f"exit {proc.returncode}")
-        return raw or ""
+    )
+    try:
+        raw, err = proc.communicate(timeout=_TIMEOUT_SECONDS)
+    except BaseException:
+        # BaseException, not TimeoutExpired: Ctrl-C in the middle of a slow
+        # audit used to propagate straight past this and leave pip-audit --
+        # and the pip it shelled out to -- running with the pipes still
+        # open. The timeout is not the only way out of a communicate().
+        # `kill_and_reap` kills the tree, then drains what's left of the
+        # pipes with its own bounded timeout, so surfacing the original
+        # exception below cannot be blocked by a reap that never finishes.
+        kill_and_reap(proc)
+        raise
+    # `communicate()` returned, so the reader threads are done and the pipes are
+    # already closed. `kill_and_reap` handles the paths that do not get here,
+    # and leaves the pipes alone when its own drain hits the bound -- closing
+    # them there blocks on the stuck reader thread, which is the same unbounded
+    # wait by a different route.
+    close_pipes(proc)
+    # pip-audit exits 1 when it finds vulnerabilities -- success for us.
+    if proc.returncode not in (0, 1):
+        raise RuntimeError((err or "").strip() or f"exit {proc.returncode}")
+    return raw or ""
 
 
 class DepsDetector:
