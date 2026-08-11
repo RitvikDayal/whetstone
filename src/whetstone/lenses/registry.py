@@ -49,3 +49,12 @@ def get_lens(name: str) -> LensPack | None:
 def available_lenses() -> list[str]:
     _load_plugins()
     return sorted(_REGISTRY)
+
+
+def _register_builtins() -> None:
+    from .hygiene.pack import HygienePack
+
+    register(HygienePack())
+
+
+_register_builtins()
