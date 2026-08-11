@@ -137,7 +137,62 @@ def test_state_dir_underneath_a_file_is_a_named_error(tmp_path):
     blocker.write_text("not a directory", encoding="utf-8")
     with pytest.raises(StateDirError) as caught:
         state_root(tmp_path, str(blocker / "deep" / "state"))
-    assert str(blocker) in str(caught.value)
+    message = str(caught.value)
+    # The blocker is derived from the override, so it is elided with it. What
+    # the message must still carry is which setting is wrong and why.
+    assert "state_dir" in message
+    assert "is a file, not a directory" in message
+    assert "<elided>" in message
+
+
+# A `state_dir` that resolves from `${env:...}` puts a live credential into every
+# one of these messages. Redaction lives inside load_config, which knows what it
+# resolved; paths.py does not, so it must echo nothing that came from the
+# override. Each case below is a message that used to interpolate one.
+_SECRET = "ghp_R3alSecretValue0000000000000000000000"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["resolved-file", "resolved-under-file", "cloud-synced", "unset-variable"],
+)
+def test_no_error_message_echoes_the_state_dir_override(tmp_path, monkeypatch, case):
+    if case == "resolved-file":
+        target = tmp_path / _SECRET
+        target.write_text("not a directory", encoding="utf-8")
+        override = str(target)
+    elif case == "resolved-under-file":
+        blocker = tmp_path / _SECRET
+        blocker.write_text("not a directory", encoding="utf-8")
+        override = str(blocker / "deep" / "state")
+    elif case == "cloud-synced":
+        override = str(tmp_path / "OneDrive" / _SECRET)
+    else:
+        monkeypatch.delenv(_SECRET, raising=False)
+        override = ("%" + _SECRET + "%\\w") if ON_WINDOWS else ("$" + _SECRET + "/w")
+
+    with pytest.raises((StateDirError, UnsafeStatePathError, ConfigError)) as caught:
+        state_root(tmp_path, override)
+    message = str(caught.value)
+    if case == "unset-variable":
+        # This one names the VARIABLE on purpose -- a reference, not a value, and
+        # the whole actionable content of the error.
+        assert message.count(_SECRET) == 2, message
+    else:
+        assert _SECRET not in message, message
+        assert "<elided>" in message
+    assert "state_dir" in message
+
+
+def test_the_default_state_path_is_still_printed_in_full(tmp_path, monkeypatch):
+    """Elision is for override-derived paths only; the default has no secret in it."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / ".whetstone").write_text("not a directory", encoding="utf-8")
+    with pytest.raises(StateDirError) as caught:
+        state_root(tmp_path / "proj")
+    message = str(caught.value)
+    assert str(tmp_path / ".whetstone") in message
+    assert "<elided>" not in message
 
 
 @pytest.mark.parametrize("empty", ["", "   "])

@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from ..severity import Severity
 
@@ -146,4 +146,14 @@ class WhetstoneConfig(_Strict):
     sinks: list[SinkConfig] = Field(
         default_factory=lambda: [SinkConfig(kind="dashboard")]
     )
-    state_dir: str | None = None
+    # SecretStr rather than `Field(repr=False)`. `state_dir` may be written
+    # `${env:...}`, and the loader resolves it to the real value before it lands
+    # here, so this attribute holds a plaintext credential whenever someone
+    # points state at a path built from one. `repr=False` would cover repr() and
+    # nothing else, leaving model_dump(), model_dump_json() and every log line or
+    # HTML report built from them exposed -- and serialising the config is
+    # precisely what M1 adds. SecretStr masks repr(), str(), and JSON dumps at
+    # once, and forces the one consumer to say get_secret_value(), which reads
+    # as the marker it is. Whetstone's own default path never passes through
+    # here: `state_dir` unset means None.
+    state_dir: SecretStr | None = None

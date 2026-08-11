@@ -58,8 +58,37 @@ _POSIX_UNEXPANDED_VAR = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 _WINDOWS_UNEXPANDED_VAR = re.compile(r"%([A-Za-z_][A-Za-z0-9_()]*)%")
 
 
-def assert_not_cloud_synced(path: Path) -> None:
-    """Raise if *path* looks like it lives inside a cloud-sync root."""
+# How an override-derived path is rendered in an error message, and why it is
+# not rendered at all.
+#
+# `state_dir` may be written `${env:...}`, and loader.py resolves that to the
+# real value before paths.py is ever handed it. Redaction lives inside
+# load_config, which holds the registry of what it resolved; nothing here has
+# that registry, so the only rendering guaranteed to carry no credential is one
+# that echoes no characters. The user still learns WHICH setting is wrong, which
+# is the actionable half -- the value is theirs to look up.
+#
+# A path with no override behind it is Whetstone's own `~/.whetstone/<digest>`
+# and cannot hold anything the user did not already know, so it prints in full.
+# That is the common case; only a configured `state_dir` is elided.
+_ELIDED = "<elided>"
+
+_ELISION_NOTE = (
+    "\nThe path is shown as <elided> because `state_dir` can hold a resolved "
+    "${env:...} value. Check the setting and the variable it names."
+)
+
+
+def _shown(path: Path, override: str | None) -> str:
+    return str(path) if override is None else _ELIDED
+
+
+def assert_not_cloud_synced(path: Path, *, override: str | None = None) -> None:
+    """Raise if *path* looks like it lives inside a cloud-sync root.
+
+    *override* is the configured `state_dir` that produced *path*, passed only so
+    the message knows whether it may echo the path. Its own text is never used.
+    """
     lowered = str(path).lower().replace("\\", "/")
     matched = next((m for m in _CLOUD_MARKERS if m in lowered), None)
     if matched is None:
@@ -67,10 +96,12 @@ def assert_not_cloud_synced(path: Path) -> None:
         matched = next((m for m in _CLOUD_COMPONENTS if m in components), None)
     if matched is not None:
         raise UnsafeStatePathError(
-            f"State path {path} looks cloud-synced (matched {matched!r}).\n"
+            f"State path {_shown(path, override)} looks cloud-synced "
+            f"(matched {matched!r}).\n"
             "SQLite write-ahead-log files are torn by sync clients that replace "
             "whole files, and the corruption is silent.\n"
             "Set `state_dir` in whetstone.yaml to a local path."
+            + (_ELISION_NOTE if override is not None else "")
         )
 
 
@@ -92,7 +123,7 @@ def state_root(project_root: Path, override: str | None = None) -> Path:
         if not root.is_absolute():
             root = project_root / root
     root = root.resolve()
-    assert_not_cloud_synced(root)
+    assert_not_cloud_synced(root, override=override)
     _make_dir(root, override)
     return root
 
@@ -115,9 +146,12 @@ def _root_from_override(override: str) -> Path:
     expanded = os.path.expandvars(override)
     leftover = _unexpanded_variable(expanded)
     if leftover is not None:
+        # The override itself is NOT echoed -- see _ELIDED. The variable name is,
+        # because it is the whole actionable content of this error and it is a
+        # reference rather than a value.
         raise ConfigError(
-            f"`state_dir` is {override!r} but {leftover.group(1)} is not set in "
-            "the environment.\n"
+            f"`state_dir` in whetstone.yaml references {leftover.group(1)}, "
+            "which is not set in the environment.\n"
             f"Creating it would make a directory literally named "
             f"{leftover.group(0)!r}."
         )
@@ -140,26 +174,34 @@ def _make_dir(root: Path, override: str | None) -> None:
 
 
 def _state_dir_message(root: Path, override: str | None, exc: OSError) -> str:
+    # `state_dir: {override}` used to be interpolated here, and the blocker and
+    # the resolved root are both derived from it, so all three are elided
+    # together when there is an override behind them.
     source = (
-        f"`state_dir: {override}` in whetstone.yaml"
+        "`state_dir` in whetstone.yaml"
         if override is not None
         else "the default state directory"
     )
+    shown = _shown(root, override)
+    note = _ELISION_NOTE if override is not None else ""
     blocker = _first_non_directory(root)
     if blocker == root:
         return (
-            f"{source} resolves to {root}, which is an existing file.\n"
+            f"{source} resolves to {shown}, which is an existing file.\n"
             "State needs a directory. This is usually a typo — point `state_dir` "
-            "at a directory, or move the file out of the way."
+            "at a directory, or move the file out of the way." + note
         )
     if blocker is not None:
         return (
-            f"{source} resolves to {root}, but {blocker} is a file, not a "
-            "directory.\n"
+            f"{source} resolves to {shown}, but "
+            f"{_shown(blocker, override)} is a file, not a directory.\n"
             "A directory cannot be created underneath it. Point `state_dir` "
-            "somewhere else."
+            "somewhere else." + note
         )
-    return f"{source} resolves to {root}, which could not be created: {exc}"
+    # `exc` carries the offending filename in its own text, so it is elided with
+    # everything else rather than trusted to be harmless.
+    detail = exc.strerror if override is not None else str(exc)
+    return f"{source} resolves to {shown}, which could not be created: {detail}"
 
 
 def _first_non_directory(root: Path) -> Path | None:

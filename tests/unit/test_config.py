@@ -505,6 +505,37 @@ def test_scrub_runs_takes_out_shorter_copies_sharing_a_start_offset():
     assert run < 8, f"a {run}-character run survived: {scrubbed}"
 
 
+def test_a_resolved_state_dir_is_not_exposed_by_the_config_model(tmp_path, monkeypatch):
+    """`state_dir` holds a plaintext secret the moment it is written `${env:...}`.
+
+    Redaction lives inside load_config's error path; a VALID config never goes
+    near it, so the resolved value sits on the model and every default renderer
+    prints it. M1 serialises the config into the state store and the report,
+    which is when this stops being latent.
+    """
+    secret = "ghp_R3alSecretValue0000000000000000000000"
+    monkeypatch.setenv("DEMO_STATE", str(tmp_path / secret))
+    cfg = load_config(
+        _write(
+            tmp_path,
+            """
+            version: 1
+            project: { name: demo }
+            state_dir: "${env:DEMO_STATE}"
+            """,
+        )
+    )
+    for where, text in {
+        "repr": repr(cfg),
+        "str": str(cfg),
+        "model_dump_json": cfg.model_dump_json(),
+        "repr(model_dump)": repr(cfg.model_dump()),
+    }.items():
+        assert secret not in text, f"the resolved state_dir reached {where}"
+    # It is still reachable on purpose, by a name that says what it is.
+    assert cfg.state_dir.get_secret_value().endswith(secret)
+
+
 def test_scrub_runs_leaves_text_that_merely_resembles_the_secret(tmp_path):
     """Over-redaction passes every leak assertion, so pin the other side too."""
     value = _nonperiodic_secret(40, seed=7)
