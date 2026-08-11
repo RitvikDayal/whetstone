@@ -394,6 +394,132 @@ def test_is_write_forbidden_matches_a_case_variant_of_never_touch(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "secrets.env.",
+        "secrets.env ",
+        "SECRETS.ENV.",
+        "secrets.env...",
+        "secrets.env. ",
+        "secrets.env .",
+    ],
+    ids=[
+        "trailing-dot",
+        "trailing-space",
+        "case-variant-with-dot",
+        "multi-dot",
+        "dot-then-space",
+        "space-then-dot",
+    ],
+)
+def test_is_write_forbidden_rejects_trailing_dot_or_space_on_a_file(tmp_path, shape):
+    """`secrets.env.` is the file `secrets.env` once Windows has stripped it.
+
+    `Path.resolve()` canonicalises only the prefix that already exists on disk,
+    so for a file `never_touch` is protecting *before it is created* -- a
+    secrets file, a lockfile, a CI workflow -- the barrier matched one spelling
+    and the OS wrote another. Case folding does not rescue it either: the folded
+    name still carries the decoration.
+    """
+    boundaries = BoundariesConfig(never_touch=["secrets.env"])
+    assert is_write_forbidden(Path(shape), boundaries, project_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        ".github./workflows/deploy.yml",
+        ".github /workflows/deploy.yml",
+        ".github/workflows./deploy.yml",
+    ],
+    ids=["dir-dot", "dir-space", "mid-path-dot"],
+)
+def test_is_write_forbidden_rejects_a_decorated_directory_component(tmp_path, shape):
+    """The decoration does not have to be on the last component to defeat the
+    match -- a directory `never_touch` protects need not exist yet either."""
+    boundaries = BoundariesConfig(never_touch=[".github/workflows/**"])
+    assert is_write_forbidden(Path(shape), boundaries, project_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["secrets.env::$DATA", "secrets.env:hidden", ".github/workflows:x/deploy.yml"],
+    ids=["main-stream", "named-stream", "stream-on-a-directory"],
+)
+def test_is_write_forbidden_rejects_an_alternate_data_stream(tmp_path, shape):
+    """Found by inverting the trailing-dot case, and the same defect.
+
+    `:` opens an NTFS alternate data stream. `secrets.env::$DATA` writes
+    straight to the main stream of `secrets.env` -- a full overwrite of the
+    protected file -- and `secrets.env:hidden` creates that file too. Neither
+    spelling is what `resolve()` hands back, so the barrier matched the
+    decorated name and missed.
+    """
+    boundaries = BoundariesConfig(never_touch=["secrets.env", ".github/workflows/**"])
+    assert is_write_forbidden(Path(shape), boundaries, project_root=tmp_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="alternate data streams are NTFS-only")
+def test_alternate_data_stream_really_writes_the_protected_file(tmp_path):
+    """The filesystem proof behind the rule above, not an assertion about it."""
+    (tmp_path / "secrets.env::$DATA").write_text("PWNED", encoding="utf-8")
+    landed = tmp_path / "secrets.env"
+    assert landed.is_file()
+    assert landed.read_text(encoding="utf-8") == "PWNED"
+
+
+def test_is_write_forbidden_rejects_a_dots_only_component(tmp_path):
+    """`...` is not `..`; it is a name the filesystem strips to nothing."""
+    assert is_write_forbidden(
+        Path(".../secrets.env"), BoundariesConfig(), project_root=tmp_path
+    )
+
+
+def test_is_write_forbidden_rejects_decoration_with_never_touch_empty(tmp_path):
+    """Same class as a path that escapes the root: the barrier cannot say where
+    the write lands, so it refuses -- whatever `never_touch` says."""
+    assert is_write_forbidden(
+        Path("secrets.env."), BoundariesConfig(), project_root=tmp_path
+    )
+
+
+def test_is_write_forbidden_still_allows_an_undecorated_path(tmp_path):
+    """The new rule must not swallow ordinary names. `..` and `.` are legitimate
+    components and are not decoration."""
+    boundaries = BoundariesConfig(never_touch=["secrets.env"])
+    assert not is_write_forbidden(Path("src/app.py"), boundaries, project_root=tmp_path)
+    assert not is_write_forbidden(
+        Path("src/../src/app.py"), boundaries, project_root=tmp_path
+    )
+    assert not is_write_forbidden(
+        Path("./src/app.py"), boundaries, project_root=tmp_path
+    )
+
+
+def test_is_write_forbidden_control_decorated_path_under_an_existing_dir(tmp_path):
+    """The case that already held, kept so the suite proves the new rule rather
+    than the old accident: `infra/` exists, so `infra/**` matched the decorated
+    name on the strength of the directory glob alone."""
+    (tmp_path / "infra").mkdir()
+    assert is_write_forbidden(
+        Path("infra/new.tf."), _NEVER_TOUCH, project_root=tmp_path
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows strips trailing dots/spaces")
+def test_trailing_dot_really_collapses_on_this_filesystem(tmp_path):
+    """Why the rule exists, proved against the filesystem rather than asserted.
+
+    The barrier rule itself is unconditional so the Linux CI leg still catches a
+    regression; this test only pins the platform behaviour that motivates it.
+    """
+    (tmp_path / "secrets.env.").write_text("PWNED", encoding="utf-8")
+    landed = tmp_path / "secrets.env"
+    assert landed.is_file()
+    assert landed.read_text(encoding="utf-8") == "PWNED"
+
+
 def test_deleted_tracked_files_are_filtered_out(repo):
     """A file removed from the working tree but still in the index has nothing
     to read. It is dropped from the analysis set -- whether it was deleted

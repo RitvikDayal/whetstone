@@ -199,6 +199,30 @@ def is_write_forbidden(
     except ValueError:
         return True
 
+    # A component the filesystem will rename out from under the match. Windows
+    # strips trailing dots and spaces at the syscall, so `secrets.env.` is the
+    # file `secrets.env` once it lands -- but `Path.resolve()` canonicalises
+    # only the prefix that already EXISTS on disk, so a never_touch entry
+    # guarding a file that has yet to be created (a secrets file, a lockfile, a
+    # CI workflow -- the barrier's main purpose) was matched against one
+    # spelling while the OS wrote another. Case folding does not rescue it; the
+    # folded name carries the same decoration. Unconditional, not `os.name ==
+    # "nt"`: a rule that only fires on Windows leaves the Linux CI leg unable to
+    # catch a regression, and over-forbidding a legitimately-spaced POSIX name
+    # costs one refused write where under-forbidding costs the barrier.
+    # `:` is the NTFS alternate-data-stream separator and the same defect found
+    # by inverting the case above: `secrets.env::$DATA` writes straight to the
+    # main stream of `secrets.env`, and `secrets.env:hidden` creates that file
+    # too. `resolve()` keeps the whole spelling as one component, so the barrier
+    # compared `secrets.env::$DATA` against `secrets.env` and let it through.
+    # Illegal in a Windows filename anyway, and a drive-relative path was
+    # already refused above, so nothing legitimate reaches here carrying one.
+    for part in relative.parts:
+        if part in (".", ".."):
+            continue
+        if part != part.rstrip(" .") or ":" in part:
+            return True
+
     if not boundaries.never_touch:
         return False
 
