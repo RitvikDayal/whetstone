@@ -1,10 +1,11 @@
+import random
 import textwrap
 import traceback
 from pathlib import Path
 
 import pytest
 
-from whetstone.config.loader import CONFIG_NAME, find_config, load_config
+from whetstone.config.loader import CONFIG_NAME, _scrub_runs, find_config, load_config
 from whetstone.config.model import OnCeiling, Tier, Trust
 from whetstone.errors import ConfigError, LiteralSecretError
 from whetstone.lenses.base import Severity, severity_at_least
@@ -385,6 +386,130 @@ def test_redaction_does_not_depend_on_a_top_level_handler(tmp_path, monkeypatch)
         printed = traceback.format_exc()
     assert secret not in printed
     assert "ValidationError" not in printed
+
+
+_SECRET_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def _nonperiodic_secret(length: int = 300, seed: int = 20260810) -> str:
+    """A deterministic secret with no internal repetition.
+
+    THE NON-PERIODICITY IS THE POINT, and a periodic secret makes every test
+    below worthless. An earlier attempt at this exploit built its secret by
+    repeating a 62-character alphabet. Every elided copy of a periodic value
+    contains the same fragments as every other, so scrubbing any ONE copy
+    scrubbed the rest by coincidence, the surviving-run assertion came back
+    clean, and the bug read as absent while it was wide open. Seeded random
+    keeps the test reproducible without buying that coincidence back.
+    """
+    rng = random.Random(seed)
+    return "ghp_" + "".join(rng.choice(_SECRET_ALPHABET) for _ in range(length - 4))
+
+
+def _three_references(*paddings: str, suffix: bool) -> str:
+    """A config whose three bad keys each render the same secret at a different offset.
+
+    Pydantic elides a long value to `head + "..." + tail`, so padding a reference
+    by one more character shifts which slice of the secret survives elision. Three
+    references therefore produce three overlapping copies at consecutive offsets --
+    a family, not a queue. Scrubbing that consumed one copy and skipped past the
+    rest left the others standing.
+    """
+    lines = ["version: 1", "project:", "  name: demo"]
+    for index, pad in enumerate(paddings):
+        body = f"${{env:DEMO_GH_TOKEN}}{pad}" if suffix else f"{pad}${{env:DEMO_GH_TOKEN}}"
+        lines.append(f'typo{index}: "{body}"')
+    return "\n".join(lines) + "\n"
+
+
+def _rendered_error(tmp_path, monkeypatch, secret: str, doc: str) -> str:
+    monkeypatch.setenv("DEMO_GH_TOKEN", secret)
+    path = tmp_path / CONFIG_NAME
+    path.write_text(doc, encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    return str(caught.value)
+
+
+def test_three_references_leak_no_run_of_the_secret_suffix_variant(
+    tmp_path, monkeypatch
+):
+    """Three elided renderings of one secret; scrubbing used to skip two of them.
+
+    Asserting `secret not in rendered` is the weak check that let all three
+    previous leaks through -- Pydantic elides the middle, so the whole value is
+    never present while both ends print verbatim. Assert on the longest surviving
+    RUN instead. This shape leaked 21 consecutive characters into plain
+    `str(exc)`, which every downstream surface inherits.
+    """
+    secret = _nonperiodic_secret()
+    rendered = _rendered_error(
+        tmp_path, monkeypatch, secret, _three_references("", "Z", "ZZ", suffix=True)
+    )
+    run = _longest_surviving_run(rendered, secret)
+    assert run < 8, f"a {run}-character run of the secret survived"
+    # ...and the message still names the keys and the reference to fix.
+    assert "${env:DEMO_GH_TOKEN}" in rendered
+    assert "typo1" in rendered
+
+
+def test_three_references_leak_no_run_of_the_secret_prefix_variant(
+    tmp_path, monkeypatch
+):
+    """Padding in front shifts the HEAD, which is the identifying half.
+
+    The suffix variant leaks tail entropy; this one leaked 22 characters
+    including the `ghp_` prefix that says which service the credential is for.
+    """
+    secret = _nonperiodic_secret()
+    rendered = _rendered_error(
+        tmp_path, monkeypatch, secret, _three_references("", "Z", "ZZ", suffix=False)
+    )
+    run = _longest_surviving_run(rendered, secret)
+    assert run < 8, f"a {run}-character run of the secret survived"
+    assert secret[:8] not in rendered, "the identifying head survived"
+    assert "${env:DEMO_GH_TOKEN}" in rendered
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 6, 10, 16])
+def test_no_number_of_references_leaks_a_run(tmp_path, monkeypatch, count):
+    """Three references was where it was found, not where it stops.
+
+    Ten prefix-padded references defeated the one-line cursor fix that closed the
+    three-reference case: the copies differ in LENGTH as well as offset, and
+    replacing the one maximal run leaves the shorter ones sharing its start.
+    """
+    secret = _nonperiodic_secret()
+    paddings = tuple("Z" * i for i in range(count))
+    for suffix in (True, False):
+        rendered = _rendered_error(
+            tmp_path, monkeypatch, secret, _three_references(*paddings, suffix=suffix)
+        )
+        run = _longest_surviving_run(rendered, secret)
+        assert run < 8, f"{count} refs, suffix={suffix}: a {run}-character run survived"
+
+
+def test_scrub_runs_takes_out_shorter_copies_sharing_a_start_offset():
+    """The defect that survived both cursor rules, isolated from Pydantic.
+
+    `text.replace(value[start:end], ...)` removes only the copies of that EXACT
+    length. Here three copies of the head share offset 0 at three lengths; the
+    greedy pass took the 20 and no cursor over the value's offsets ever came back
+    for the 9 and the 12. Pydantic's elision rule is an internal that can change,
+    so this states the invariant directly against the scrubber.
+    """
+    value = _nonperiodic_secret(40, seed=99)
+    text = f"a={value[:20]!r} b={value[:9]!r} c={value[:12]!r}"
+    scrubbed = _scrub_runs(text, value, "${env:DEMO_GH_TOKEN}")
+    run = _longest_surviving_run(scrubbed, value)
+    assert run < 8, f"a {run}-character run survived: {scrubbed}"
+
+
+def test_scrub_runs_leaves_text_that_merely_resembles_the_secret(tmp_path):
+    """Over-redaction passes every leak assertion, so pin the other side too."""
+    value = _nonperiodic_secret(40, seed=7)
+    text = "budget.tier: input should be 'quick', 'standard' or 'deep'"
+    assert _scrub_runs(text, value, "${env:DEMO_GH_TOKEN}") == text
 
 
 @pytest.mark.parametrize(

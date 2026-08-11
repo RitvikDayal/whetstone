@@ -248,15 +248,43 @@ _MIN_LEAKED_RUN = 8
 
 
 def _scrub_runs(text: str, value: str, reference: str) -> str:
-    """Replace every run of *value* at least _MIN_LEAKED_RUN long left in *text*."""
-    start = 0
-    while start <= len(value) - _MIN_LEAKED_RUN:
-        if value[start : start + _MIN_LEAKED_RUN] not in text:
-            start += 1
+    """Replace every run of *value* at least _MIN_LEAKED_RUN long left in *text*.
+
+    Scans TEXT, not the value, and rebuilds the message instead of editing it.
+    Three fixes walked the VALUE, advanced a cursor over its offsets, and asked
+    `str.replace` to take out the one maximal run found at each -- and each
+    leaked, because renderings of one secret overlap rather than queue up.
+    Pydantic elides every rendering at its own offset, so a family of references
+    puts many DIFFERENT-LENGTH copies of the same head or tail in one message.
+    `text.replace(value[start:end], ...)` takes out only the copies of that exact
+    length; the shorter ones starting at the same offset are invisible to it, and
+    no cursor rule over the value's offsets revisits them. Advancing to `end`
+    left 21 characters of a 300-character token standing; advancing by one still
+    left 11, including the identifying `ghp_` head.
+
+    Walking the text has no cursor to get wrong. At every position either the
+    next _MIN_LEAKED_RUN characters are a substring of the secret -- in which
+    case the longest such run is consumed whole and replaced -- or the single
+    character is copied. So for any copied position the following
+    _MIN_LEAKED_RUN characters are provably NOT a substring of the value, which
+    is the property the whole function exists to establish. It is a single
+    left-to-right pass, so it cannot loop, and replacements are written to a
+    fresh buffer, so no replacement can be rescanned into another one.
+    """
+    if len(value) < _MIN_LEAKED_RUN:
+        return text
+    out: list[str] = []
+    index = 0
+    last_start = len(text) - _MIN_LEAKED_RUN
+    while index <= last_start:
+        if text[index : index + _MIN_LEAKED_RUN] not in value:
+            out.append(text[index])
+            index += 1
             continue
-        end = start + _MIN_LEAKED_RUN
-        while end < len(value) and value[start : end + 1] in text:
+        end = index + _MIN_LEAKED_RUN
+        while end < len(text) and text[index : end + 1] in value:
             end += 1
-        text = text.replace(value[start:end], reference)
-        start = end
-    return text
+        out.append(reference)
+        index = end
+    out.append(text[index:])
+    return "".join(out)
