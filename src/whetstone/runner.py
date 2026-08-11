@@ -40,7 +40,8 @@ def _report_unsupported_sinks(cfg: WhetstoneConfig, result: RunResult) -> None:
         if sink.kind not in _IMPLEMENTED_SINKS:
             result.skips.append(
                 f"sink '{sink.kind}': not implemented in this version; findings "
-                "were NOT published there."
+                "were NOT published there. Only the built-in local sink is "
+                "available."
             )
 
 
@@ -110,6 +111,12 @@ def execute_run(
                 )
                 continue
 
+            # `skips=result.skips` -- not a fresh list later merged in -- so
+            # `ctx.skip()` writes straight into the run's own skip list. A
+            # lens that skips, yields a candidate, and then raises used to
+            # lose the skip: the merge lived at the bottom of this loop body,
+            # past the point an exception unwinds through. Sharing the list
+            # makes that loss structurally impossible rather than handled.
             ctx = RunContext(
                 project_root=project_root,
                 state_root=state_root,
@@ -117,13 +124,13 @@ def execute_run(
                 tier=tier,
                 lens_options=lens_cfg.model_dump(exclude_none=True),
                 run_id=run_id,
+                skips=result.skips,
             )
             for candidate in pack.run(ctx):
                 if upsert(conn, candidate, run_id, _now()):
                     result.new += 1
                 else:
                     result.seen += 1
-            result.skips.extend(ctx.skips)
 
         _report_unsupported_sinks(cfg, result)
     except Exception:
