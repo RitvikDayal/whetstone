@@ -62,10 +62,54 @@ class DepsDetector:
             ctx.skip(f"hygiene/deps: pip-audit returned unparseable JSON ({exc}).")
             return
 
-        for dependency in payload.get("dependencies", []):
+        # `json.loads` succeeding only proves the output was *some* valid
+        # JSON, not that it has pip-audit's expected shape. Validate before
+        # walking it, so a malformed entry skips rather than raising out of
+        # `detect()` and taking the whole run down.
+        if not isinstance(payload, dict):
+            ctx.skip(
+                "hygiene/deps: pip-audit returned unexpected JSON "
+                f"({type(payload).__name__}, expected an object); "
+                "advisories not checked."
+            )
+            return
+
+        dependencies = payload.get("dependencies", [])
+        if not isinstance(dependencies, list):
+            ctx.skip(
+                "hygiene/deps: pip-audit's 'dependencies' field was "
+                f"{type(dependencies).__name__}, not a list; advisories not checked."
+            )
+            return
+
+        for dependency in dependencies:
+            if not isinstance(dependency, dict):
+                ctx.skip(
+                    "hygiene/deps: pip-audit returned a dependency entry that "
+                    f"was not an object ({type(dependency).__name__}); skipped "
+                    "that entry."
+                )
+                continue
+
             name = dependency.get("name", "unknown")
             version = dependency.get("version", "unknown")
-            for vuln in dependency.get("vulns", []):
+            vulns = dependency.get("vulns", [])
+            if not isinstance(vulns, list):
+                ctx.skip(
+                    f"hygiene/deps: {name}'s 'vulns' field was "
+                    f"{type(vulns).__name__}, not a list; that dependency was "
+                    "skipped."
+                )
+                continue
+
+            for vuln in vulns:
+                if not isinstance(vuln, dict):
+                    ctx.skip(
+                        f"hygiene/deps: {name} has a vulnerability entry that "
+                        f"was not an object ({type(vuln).__name__}); skipped."
+                    )
+                    continue
+
                 fixes = vuln.get("fix_versions") or []
                 fix_text = (
                     f"Fixed in {', '.join(fixes)}."

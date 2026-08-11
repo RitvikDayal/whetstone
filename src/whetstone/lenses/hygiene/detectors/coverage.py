@@ -20,7 +20,21 @@ class CoverageDetector:
     id = "coverage"
 
     def detect(self, ctx: RunContext) -> Iterator[Candidate]:
-        floor = int(ctx.lens_options.get("coverage_floor", DEFAULT_FLOOR))
+        floor_raw = ctx.lens_options.get("coverage_floor", DEFAULT_FLOOR)
+        try:
+            # Deliberately not int()-truncated: int(59.9) == 59 would loosen a
+            # fractional floor and let a real regression through silently. A
+            # floor is only safe to round in the strict direction, and the
+            # simplest strict choice is to not round at all -- keep whatever
+            # precision the option was given.
+            floor = float(floor_raw)
+        except (TypeError, ValueError):
+            ctx.skip(
+                "hygiene/coverage: coverage_floor option is not a number "
+                f"({floor_raw!r}); coverage was not evaluated."
+            )
+            return
+
         artifact = self._find_artifact(ctx.project_root)
         if artifact is None:
             ctx.skip(
@@ -40,20 +54,21 @@ class CoverageDetector:
         if measured >= floor:
             return
 
+        floor_display = f"{floor:g}"  # 60.0 -> "60", 59.9 -> "59.9"
         yield Candidate(
             lens="hygiene",
             rule_id="coverage-below-floor",
             subject=artifact.name,
-            title=f"Line coverage is {measured}%, below the {floor}% floor",
+            title=f"Line coverage is {measured}%, below the {floor_display}% floor",
             detail=(
                 f"{artifact} reports {measured}% line coverage against a configured "
-                f"floor of {floor}%. Raise the floor deliberately or add tests; a "
-                "floor nobody meets is a floor nobody reads."
+                f"floor of {floor_display}%. Raise the floor deliberately or add "
+                "tests; a floor nobody meets is a floor nobody reads."
             ),
             severity=Severity.medium,
             evidence=Evidence(
                 kind=EvidenceKind.metric,
-                summary=f"line-rate {measured}% < floor {floor}%",
+                summary=f"line-rate {measured}% < floor {floor_display}%",
                 data={"measured": measured, "floor": floor, "source": artifact.name},
                 artifacts=(str(artifact),),
             ),
