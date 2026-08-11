@@ -538,6 +538,24 @@ def test_scrub_runs_leaves_text_that_merely_resembles_the_secret(tmp_path):
         # A trailing qualifier must not launder the secret word.
         "github_token_v2",
         "db.password",
+        # A version or an index is the same word again, not a second word that
+        # demotes `token` to a qualifier. All three were accepted outright:
+        # `[a-z0-9]+` swallowed the digits, so `token2` was one word nobody had
+        # put in the set, and `token_v2` split to ['token', 'v2'] where `token`
+        # collected the head-position discount.
+        "token2",
+        "token_v2",
+        "token_v10",
+        "2token",
+        "password2",
+        "apiKey2",
+        # `key` in company with a credential qualifier stays a credential.
+        "signing_key",
+        "access_key",
+        "encryption_key",
+        "master_key",
+        "client_key",
+        "session_key",
     ],
 )
 def test_secret_shaped_keys_reject_literals(tmp_path, key):
@@ -581,6 +599,24 @@ def test_secret_shaped_keys_reject_literals(tmp_path, key):
         "token_budget",
         "secret_scanning",
         "token_limit",
+        # `key` on its own names a lookup, not a credential, and these are
+        # ordinary inside the free-form dicts (`app.ready_when`, `app.auth`,
+        # `model.stages`). Rejecting them made a valid config unloadable with no
+        # escape hatch, which is the same defect as the substring matching that
+        # came before.
+        "sort_key",
+        "primary_key",
+        "foreign_key",
+        "cache_key",
+        "partition_key",
+        "idempotency_key",
+        "key_id",
+        "api_keys",
+        # Digits split off as their own word now; that must not turn ordinary
+        # names into one-word secrets.
+        "sha256",
+        "oauth2",
+        "max_tokens2",
     ],
 )
 def test_innocent_keys_are_not_treated_as_secrets(tmp_path, key):

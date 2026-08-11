@@ -46,10 +46,47 @@ _SECRET_WORDS = frozenset(
     }
 )
 
+# Words that qualify a trailing `key` into a credential. On its own `key` is how
+# mappings, caches, and indexes are described everywhere: `cache_key`,
+# `sort_key`, `primary_key`, `foreign_key`, `partition_key` are ordinary config,
+# and the free-form dicts -- `app.ready_when`, `app.auth`, `model.stages` -- are
+# full of them. Rejecting those is the over-matching this module already paid for
+# once, and there is no escape hatch when it happens: the key MUST hold an
+# ${env:...} reference or the config will not load at all.
+#
+# So `key` names a secret only in company -- beside one of these, or beside
+# another word from _SECRET_WORDS, which is what catches `secret_key`. An
+# unrecognised qualifier is ACCEPTED on purpose: `widget_key` is not how anyone
+# spells a credential, and refusing to load a valid config is the worse failure.
+# That is the same trade the whole-word rule above already makes.
+_KEY_QUALIFIERS = frozenset(
+    {
+        "api",
+        "private",
+        "signing",
+        "encryption",
+        "access",
+        "auth",
+        "master",
+        "client",
+        "consumer",
+        "license",
+        "session",
+        "shared",
+        "subscription",
+    }
+)
+
 # Splits a key into words. Separators (`_`, `-`, `.`) fall away; camelCase and
-# ACRONYMCase split on the case boundary. `sessionSecret` -> session, Secret;
-# `AWS_SECRET_ACCESS_KEY` -> AWS, SECRET, ACCESS, KEY.
-_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+# ACRONYMCase split on the case boundary; a run of digits is its own word.
+# `sessionSecret` -> session, Secret; `AWS_SECRET_ACCESS_KEY` -> AWS, SECRET,
+# ACCESS, KEY; `token2` -> token, 2.
+#
+# Digits used to be swallowed into the adjacent word, and that let two real
+# credentials through. `token2` came out as ONE word, which is not in
+# _SECRET_WORDS, so it was accepted outright. `2token` came out as one word too.
+# Splitting them off is only half the fix -- see _drop_version_suffix.
+_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+|[0-9]+")
 
 
 def find_config(start: Path) -> Path:
@@ -132,21 +169,48 @@ def load_config(path: Path) -> WhetstoneConfig:
     raise ConfigError(f"{path} is invalid:\n{detail}")
 
 
+def _drop_version_suffix(words: list[str]) -> list[str]:
+    """Strip a trailing version or index so it cannot qualify the word before it.
+
+    `token2` and `token_v2` are a token. Left intact, the trailing `2` made
+    `token` the HEAD of a two-word name and handed it the head-position discount
+    below, so both were accepted as ordinary config and a real credential loaded
+    unguarded. A version is not a second word; it is the same word, again.
+    """
+    if words and words[-1].isdigit():
+        words = words[:-1]
+        # `v` only ever appeared as the version marker it was attached to.
+        if words and words[-1] == "v":
+            words = words[:-1]
+    return words
+
+
 def _is_secret_key(key: object) -> bool:
     """True when the key names a secret value, judged word by word."""
-    words = [word.lower() for word in _WORDS.findall(str(key))]
+    words = _drop_version_suffix([word.lower() for word in _WORDS.findall(str(key))])
     if not words:
         return False
     # A secret word after the head names the value itself: `github_token`,
-    # `aws_secret_access_key`, `sessionSecret`, `github_token_v2`. In head
-    # position the same word qualifies what follows instead of naming it —
-    # `token_budget` is a budget, `secret_scanning` a feature — so it does not
-    # count there. `secret_key` and `api_key` are still caught, by `key`.
-    if any(word in _SECRET_WORDS for word in words[1:]):
+    # `aws_secret_access_key`, `sessionSecret`, `github_token_v2`, `2token`. In
+    # head position the same word qualifies what follows instead of naming it --
+    # `token_budget` is a budget, `secret_scanning` a feature -- so it does not
+    # count there. `key` is deliberately not judged here; it needs company.
+    if any(word != "key" and word in _SECRET_WORDS for word in words[1:]):
         return True
-    # A one-word key names the value directly: `password`, `credentials`.
-    # `key` is the exception in every position: `key`/`keys` are how mappings
-    # are described everywhere, and rejecting them would be over-matching again.
+    # `api_key`, `secret_key`, `private_key`, `signing-key` are credentials;
+    # `cache_key`, `sort_key`, `primary_key`, `foreign_key` are lookups. The only
+    # thing that separates them is the company `key` keeps -- see
+    # _KEY_QUALIFIERS, which is also where the choice to accept the unknown ones
+    # is argued.
+    if "key" in words[1:] and any(
+        word in _KEY_QUALIFIERS or word in _SECRET_WORDS
+        for word in words
+        if word != "key"
+    ):
+        return True
+    # A one-word key names the value directly: `password`, `credentials`,
+    # `token2` once its version is stripped. `key` alone is exempt for the same
+    # reason it is exempt above: `key` and `keys` are how mappings are described.
     return len(words) == 1 and words[0] != "key" and words[0] in _SECRET_WORDS
 
 
