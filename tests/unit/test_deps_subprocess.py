@@ -16,6 +16,8 @@ through three reviews. Only a genuine index or network failure skips, and
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -58,11 +60,26 @@ AMBIENT_ONLY = frozenset(
 # target that does not exist, an option the tool rejects -- is a Whetstone-side
 # regression and must fail. Getting this line wrong turns the regression test
 # for the Critical back into a test that quietly never runs.
+#
+# INVARIANT: every alternative below is a multi-word phrase or a distinctive
+# compound identifier. The text being matched embeds the full argv, which
+# embeds a filesystem path, so a bare word here is a false positive waiting for
+# the right temp directory. That is not hypothetical -- an earlier version of
+# this pattern had `\b50[234]\b`, which matches pytest's own `pytest-503`
+# basetemp, and bare `ssl`, `proxy`, `connection` and `timeout`, all of which
+# are ordinary path components. Any of them would have downgraded a genuine
+# Whetstone regression to a silent skip. Keep the spaces.
 _ENVIRONMENT_FAILURE = re.compile(
-    r"timed out|timeout|connection|network|temporary failure|name resolution|"
-    r"getaddrinfo|max retries|failed to establish|ssl|certificate|proxy|"
-    r"no matching distribution|could not find a version|"
-    r"\b50[234]\b|\btemporarily unavailable\b",
+    r"timed out|read timed out|"
+    r"connection (?:refused|reset|aborted|error)|"
+    r"failed to establish a new connection|network is unreachable|"
+    r"temporary failure in name resolution|getaddrinfo failed|"
+    r"max retries exceeded|"
+    r"certificate verify failed|sslcertverificationerror|ssl error|"
+    r"proxy error|proxyerror|"
+    r"5(?:02|03|04) server error|service unavailable|bad gateway|"
+    r"gateway time-?out|temporarily unavailable|"
+    r"no matching distribution found|could not find a version",
     re.IGNORECASE,
 )
 
@@ -99,6 +116,37 @@ def _fake_tool(tmp_path: Path, body: str) -> tuple[str, ...]:
     script = tmp_path / "fake_pip_audit.py"
     script.write_text(body, encoding="utf-8")
     return (sys.executable, str(script))
+
+
+# One advisory, so a recording run still produces a Candidate to assert on.
+_ONE_ADVISORY = (
+    "{'dependencies': [{'name': 'seen', 'version': '1.0', 'vulns': "
+    "[{'id': 'X', 'fix_versions': [], 'description': 'placeholder'}]}]}"
+)
+
+
+def _argv_recording_tool(
+    tmp_path: Path, record: Path, payload: str = "{'dependencies': []}"
+) -> tuple[str, ...]:
+    """A fake pip-audit that writes its argv to *record* as a JSON list.
+
+    JSON, not newline-joined text: the point of these tests is to assert on
+    argv ELEMENTS rather than on a flattened string, and a format that can be
+    flattened invites exactly the substring assertion that broke CI. An
+    argument may contain a path separator, a space, or a hyphen; it is never
+    equal to "-r" unless it IS "-r".
+    """
+    return _fake_tool(
+        tmp_path,
+        "import json, pathlib, sys\n"
+        f"pathlib.Path(r'{record}').write_text("
+        "json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+        f"print(json.dumps({payload}))\n",
+    )
+
+
+def _recorded_argv(record: Path) -> list[str]:
+    return json.loads(record.read_text(encoding="utf-8"))
 
 
 def _requires_real_pip_audit() -> None:
@@ -199,29 +247,34 @@ def test_setup_cfg_only_project_skips_loudly(tmp_path):
 
 
 def test_pyproject_wins_over_requirements_when_both_declare(tmp_path, monkeypatch):
-    """Which manifest was audited has to be visible, not guessed at."""
+    """Which manifest was audited is a property of the ARGV, not of the prose.
+
+    This used to substring-search the finding's `detail` for "-r". The detail
+    embeds the project path, and GitHub's runner temp path
+    (`/pytest-of-runner/pytest-0/...`) contains "-r" inside "of-runner", so all
+    four CI legs failed on a test that passed here only because this machine's
+    temp paths happen not to contain those two characters. A path can contain
+    "-r"; an argv element is never equal to "-r" unless it IS the flag.
+    """
+    record = tmp_path / "argv.json"
     monkeypatch.setattr(
         deps_module,
         "_PIP_AUDIT_ARGV",
-        _fake_tool(
-            tmp_path,
-            "import json, sys\n"
-            "print(json.dumps({'dependencies': [\n"
-            "    {'name': 'seen', 'version': '1.0', 'vulns': [\n"
-            "        {'id': 'X', 'fix_versions': [], 'description': ' '.join(sys.argv[1:])}\n"
-            "    ]}\n"
-            "]}))\n",
-        ),
+        _argv_recording_tool(tmp_path, record, _ONE_ADVISORY),
     )
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = []\n',
         encoding="utf-8",
     )
     (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+
     found = list(DepsDetector().detect(_ctx(tmp_path)))
-    assert len(found) == 1
-    assert "-r" not in found[0].detail
-    assert found[0].evidence.data["audited"] == "pyproject.toml"
+
+    argv = _recorded_argv(record)
+    assert "-r" not in argv, argv
+    assert os.fspath(tmp_path) in argv, argv
+    assert not any(Path(arg).name == "requirements.txt" for arg in argv), argv
+    assert [c.evidence.data["audited"] for c in found] == ["pyproject.toml"]
 
 
 # --- finding 2: a dependency pip-audit declined to audit ---------------------
@@ -311,7 +364,12 @@ def test_timeout_is_bounded_when_a_grandchild_holds_the_pipe(tmp_path, monkeypat
     elapsed = time.monotonic() - started
 
     assert elapsed < 45, f"timeout did not bound the run: {elapsed:.1f}s"
-    assert any("pip-audit failed" in skip for skip in ctx.skips), ctx.skips
+    # startswith, not `in`: this skip interpolates the TimeoutExpired message,
+    # which carries the whole argv and therefore a filesystem path. The prefix
+    # is ours and sits before anything interpolated.
+    assert any(
+        skip.startswith("hygiene/deps: pip-audit failed") for skip in ctx.skips
+    ), ctx.skips
 
 
 # --- finding 8: the rest of the subprocess contract --------------------------
@@ -399,25 +457,15 @@ def test_argv_carries_the_project_and_no_ambient_fallback(tmp_path, monkeypatch)
     """Argv-level proof of finding 1: the audit target must be in the argv.
     `cwd=project_root` alone changes nothing, because pip-audit takes its
     target as an argument and defaults to the ambient interpreter."""
-    recorded = tmp_path / "argv.txt"
+    record = tmp_path / "argv.json"
     monkeypatch.setattr(
-        deps_module,
-        "_PIP_AUDIT_ARGV",
-        _fake_tool(
-            tmp_path,
-            "import json, pathlib, sys\n"
-            f"pathlib.Path(r'{recorded}').write_text("
-            "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
-            "print(json.dumps({'dependencies': []}))\n",
-        ),
+        deps_module, "_PIP_AUDIT_ARGV", _argv_recording_tool(tmp_path, record)
     )
     (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
     list(DepsDetector().detect(_ctx(tmp_path)))
-    argv = recorded.read_text(encoding="utf-8").splitlines()
-    assert "-r" in argv
-    assert any(
-        Path(arg).name == "requirements.txt" for arg in argv
-    ), argv
+    argv = _recorded_argv(record)
+    assert "-r" in argv, argv
+    assert any(Path(arg).name == "requirements.txt" for arg in argv), argv
 
 
 def test_subprocess_module_is_actually_used(tmp_path):
@@ -684,3 +732,52 @@ def test_an_unparseable_pyproject_still_falls_through_to_requirements(tmp_path):
     plan = deps_module._plan_audit(tmp_path)
     assert not isinstance(plan, str)
     assert plan.source == "requirements.txt"
+
+
+# --- gate round 3: assertions must not depend on the shape of a temp path ----
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # pytest's own basetemp counter reaches 503 on any long-lived machine.
+        # An earlier classifier matched \b50[234]\b and would have called this
+        # a network failure, silently skipping a real regression.
+        "hygiene/deps: pip-audit failed (Command '['pip-audit', '-r', "
+        "'/tmp/pytest-of-runner/pytest-503/test_x0/requirements.txt']' exit 2)",
+        # Ordinary directory names that used to match bare alternatives.
+        "hygiene/deps: pip-audit failed (exit 2) auditing "
+        r"C:\src\ssl-proxy-connection-timeout\project",
+        "hygiene/deps: pip-audit failed (couldn't find a supported project "
+        "file in /home/runner/work/network-certificate-ssl/proj)",
+    ],
+)
+def test_a_path_shaped_string_does_not_masquerade_as_a_network_failure(text):
+    """The classifier reads a string that embeds the argv, and the argv embeds
+    a path. A bare word in that pattern is a false positive waiting for the
+    right directory name, and a false positive here downgrades a Whetstone
+    regression to a skip."""
+    assert not _is_environment_failure(text)
+
+
+def test_no_assertion_in_this_file_substring_searches_a_hyphen_flag():
+    """Guards the fix rather than the symptom.
+
+    `assert "-r" not in <string>` is the defect that reddened all four CI legs:
+    a two-character flag searched inside prose that embeds a temp path. Flags
+    are argv ELEMENTS. If one shows up in an `in` comparison against something
+    that is not obviously a list, it is the same bug again.
+    """
+    source = Path(__file__).read_text(encoding="utf-8")
+    # Real assert statements only. Prose that quotes the defect -- this
+    # docstring, for one -- is not the defect.
+    offenders = [
+        f"{number}: {line.strip()}"
+        for number, line in enumerate(source.splitlines(), start=1)
+        if line.lstrip().startswith("assert ")
+        and re.search(r"""["']-[a-zA-Z]["']\s+(?:not\s+)?in\s+(?!argv)""", line)
+    ]
+    assert not offenders, (
+        "a command-line flag is being searched for inside something that is "
+        "not the recorded argv list:\n" + "\n".join(offenders)
+    )
