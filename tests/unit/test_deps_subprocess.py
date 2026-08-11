@@ -566,6 +566,47 @@ def test_an_interrupt_mid_read_kills_the_child_and_closes_the_pipes(
                 proc.kill()
 
 
+def test_a_failing_kill_does_not_replace_the_original_exception(
+    tmp_path, monkeypatch
+):
+    """`_kill_tree` runs on the way out of a failed read, and the caller
+    re-raises the original exception immediately after it. An OSError escaping
+    the final `proc.kill()` -- it sits in a `finally`, outside the suppression
+    covering taskkill/killpg -- masks that exception with itself, and the
+    bounded reap after it never runs either. The interrupt is what the user
+    needs to see, not the cleanup's own complaint."""
+    real_popen = subprocess.Popen
+    interrupted: list[bool] = []
+    killed: list[bool] = []
+
+    class _HostilePopen(real_popen):
+        def communicate(self, *args, **kwargs):
+            if not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            return super().communicate(*args, **kwargs)
+
+        def kill(self):
+            # The shape Popen.kill() raises when the platform refuses for a
+            # reason other than the already-dead race it suppresses itself.
+            killed.append(True)
+            super().kill()
+            raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(subprocess, "Popen", _HostilePopen)
+    monkeypatch.setattr(
+        deps_module, "_PIP_AUDIT_ARGV", _fake_tool(tmp_path, "import time\ntime.sleep(60)\n")
+    )
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+
+    # KeyboardInterrupt, not OSError. Anchored on the type, because the whole
+    # point is which exception reaches the caller.
+    with pytest.raises(KeyboardInterrupt):
+        list(DepsDetector().detect(_ctx(tmp_path)))
+
+    assert killed, "_kill_tree never reached the direct-child kill"
+
+
 # --- gate round 2: surrogates must not escape the detector -------------------
 #
 # `errors="surrogateescape"` stops a non-UTF-8 byte from killing the reader
@@ -930,7 +971,13 @@ def test_the_opt_out_must_be_exactly_one(tmp_path, monkeypatch):
     monkeypatch.setenv(_OFFLINE_OPT_OUT, "0")
     monkeypatch.setattr(deps_module, "_PIP_AUDIT_ARGV", _offline_tool(tmp_path))
     (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
-    with pytest.raises(Failed):
+    # Anchored to the offline message, not to `Failed`. `_audit_or_skip` has a
+    # second pytest.fail for a failure that is NOT classified as environmental,
+    # so a bare `raises(Failed)` would still pass if `_is_environment_failure`
+    # stopped matching the retry message `_offline_tool` prints -- and would
+    # then prove nothing about the opt-out value. The guard going quiet is the
+    # same failure this guard exists to prevent, one layer up.
+    with pytest.raises(Failed, match="regression proof for the ambient"):
         _audit_or_skip(_ctx(tmp_path))
 
 

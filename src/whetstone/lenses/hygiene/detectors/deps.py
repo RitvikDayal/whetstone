@@ -205,6 +205,13 @@ def _kill_tree(proc: subprocess.Popen[str]) -> None:
     Killing only the direct child leaves a grandchild holding the inherited
     stdout pipe, so the read that follows never sees EOF. pip-audit shells out
     to pip, so this is the ordinary case, not an exotic one.
+
+    Cannot raise. This is best-effort cleanup on an exception path, and the
+    caller re-raises the original exception straight after calling it -- a
+    KeyboardInterrupt or a TimeoutExpired the user needs to see. A cleanup
+    error escaping from here replaces that with itself and the `raise` never
+    runs, so the reap below it is skipped too. `Popen.kill()` suppresses the
+    already-dead race on both platforms, but not every OSError it can raise.
     """
     try:
         if os.name == "nt":
@@ -220,7 +227,8 @@ def _kill_tree(proc: subprocess.Popen[str]) -> None:
         # child so the caller is never left waiting on a live process.
         pass
     finally:
-        proc.kill()
+        with contextlib.suppress(OSError):
+            proc.kill()
 
 
 def _run_pip_audit(project_root: Path, args: list[str]) -> str:
