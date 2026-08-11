@@ -38,6 +38,27 @@ class LensScope(StrEnum):
     project = "project"
 
 
+def lens_scope_declaration(pack: LensPack) -> tuple[LensScope, str | None]:
+    """A pack's scope, plus the reason an invalid declaration was ignored.
+
+    Not declaring a scope and declaring a broken one both end at `file`, and
+    they are not the same event. A pack written before `scope` existed is
+    behaving correctly; a pack declaring `scope = "projet"` has been silently
+    overruled, and the boundaries advisory it should have produced is missing
+    with nothing saying why. The runner records the reason so the second case
+    is visible.
+    """
+    declared = getattr(pack, "scope", LensScope.file)
+    try:
+        return LensScope(declared), None
+    except ValueError:
+        return LensScope.file, (
+            f"{getattr(pack, 'name', 'lens')}: declared scope {declared!r} is not "
+            f"one of {', '.join(s.value for s in LensScope)}; the declaration was "
+            "ignored and the lens was treated as file-scoped."
+        )
+
+
 def lens_scope(pack: LensPack) -> LensScope:
     """A pack's declared scope, defaulting to file-scoped.
 
@@ -53,10 +74,7 @@ def lens_scope(pack: LensPack) -> LensScope:
     missing advisory line for a project-scoped pack whose author did not
     declare it.
     """
-    try:
-        return LensScope(getattr(pack, "scope", LensScope.file))
-    except ValueError:
-        return LensScope.file
+    return lens_scope_declaration(pack)[0]
 
 
 class EvidenceKind(StrEnum):

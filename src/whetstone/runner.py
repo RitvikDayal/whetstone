@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .config.model import BoundariesConfig, LensConfig, WhetstoneConfig
-from .lenses.base import LensPack, LensScope, RunContext, lens_scope
+from .lenses.base import LensPack, LensScope, RunContext, lens_scope_declaration
 from .lenses.registry import get_lens
 from .scope.resolver import resolve_files
 from .severity import severity_at_least
@@ -80,6 +80,10 @@ def execute_run(
     # resolve_files does. That is the intended shape: neither failure leaves a
     # run to report against, and both mean the run never started.
     plan: list[tuple[str, LensConfig, LensPack]] = []
+    # Resolved once per pack rather than re-derived at each use: an invalid
+    # declaration must be reported exactly once, not once per question asked
+    # about it. Keyed by lens name, which config guarantees is unique.
+    scopes: dict[str, LensScope] = {}
     skips: list[str] = []
     for name, lens_cfg in cfg.lenses.items():
         if not lens_cfg.enabled:
@@ -101,9 +105,13 @@ def execute_run(
             )
             continue
 
+        scope, scope_reason = lens_scope_declaration(pack)
+        if scope_reason is not None:
+            skips.append(scope_reason)
+        scopes[name] = scope
         plan.append((name, lens_cfg, pack))
 
-    file_scoped = [name for name, _, pack in plan if lens_scope(pack) is LensScope.file]
+    file_scoped = [name for name, _, _ in plan if scopes[name] is LensScope.file]
     if file_scoped:
         # Raises GitError on no merge base or undecodable tracked paths inside
         # the boundaries. Deliberately left to propagate rather than swallowed
@@ -134,8 +142,8 @@ def execute_run(
             )
 
     if _boundaries_are_narrowed(cfg.boundaries):
-        for name, _, pack in plan:
-            if lens_scope(pack) is LensScope.project:
+        for name, _, _ in plan:
+            if scopes[name] is LensScope.project:
                 skips.append(
                     f"{name}: project-scoped. It reads fixed project artifacts "
                     "and never consults boundaries.include/exclude, so those "
@@ -160,7 +168,16 @@ def execute_run(
     # mid-iteration -- must close it out with finished_at and a terminal
     # status. A row stuck at status='running' forever is its own kind of
     # silent skip: nothing ever tells the user the run didn't finish.
-    status = "complete"
+    #
+    # Pessimistic by default, and `complete` is set by the one normal exit
+    # below rather than cleared by an `except`. `except Exception: status =
+    # "failed"` looked equivalent and was not: KeyboardInterrupt, SystemExit
+    # and GeneratorExit are BaseException, so Ctrl-C during a slow lens --
+    # hygiene shells out to pip-audit, so that is the ordinary case, not an
+    # exotic one -- wrote status='complete' on a run holding only the findings
+    # recorded before the interrupt. An incomplete run that reads as clean is
+    # the exact failure this module exists to prevent.
+    status = "failed"
     try:
         for name, lens_cfg, pack in plan:
             # `ctx.skips` stays private to this lens (the RunContext default,
@@ -211,9 +228,7 @@ def execute_run(
                     )
 
         _report_unsupported_sinks(cfg, result)
-    except Exception:
-        status = "failed"
-        raise
+        status = "complete"
     finally:
         conn.execute(
             "UPDATE runs SET finished_at = ?, status = ?, skipped_json = ? "

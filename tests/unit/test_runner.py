@@ -273,6 +273,93 @@ def test_skip_before_raise_is_not_lost(tmp_path, monkeypatch):
     assert findings[0].subject == "file0.py"
 
 
+class _Interrupted:
+    """Yields one candidate, then takes the BaseException exit that Ctrl-C
+    takes. `except Exception` never sees this."""
+
+    name = "interrupted"
+    max_autonomy = 3
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        ctx.skip("interrupted: recorded before the interrupt")
+        yield Candidate(
+            lens="interrupted",
+            rule_id="R0",
+            subject="file0.py",
+            title="t",
+            detail="d",
+            severity=Severity.low,
+            evidence=Evidence(EvidenceKind.metric, "s", {}),
+        )
+        raise KeyboardInterrupt
+
+
+class _SystemExited:
+    name = "exited"
+    max_autonomy = 3
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        raise SystemExit(1)
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
+@pytest.mark.parametrize(
+    "pack,exc",
+    [(_Interrupted, KeyboardInterrupt), (_SystemExited, SystemExit)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_a_baseexception_exit_does_not_record_the_run_as_complete(
+    tmp_path, monkeypatch, pack, exc
+):
+    """Ctrl-C mid-run must not close the row as if everything succeeded.
+
+    `status` started at 'complete' and was downgraded by `except Exception`.
+    KeyboardInterrupt, SystemExit and GeneratorExit are BaseException, so they
+    walked past that clause into the `finally` and wrote status='complete' on a
+    run holding only the findings recorded before the interrupt. The hygiene
+    lens shells out to pip-audit, so an interrupt during a slow audit is the
+    ordinary case. An incomplete run that reads as clean is the one outcome
+    this module exists to prevent.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(pack())
+    conn = connect(tmp_path)
+    cfg = _cfg(**{pack.name: {}})
+
+    with pytest.raises(exc):
+        execute_run(conn, cfg, tmp_path, tmp_path, tier="quick", changed_only=False)
+
+    row = conn.execute("SELECT * FROM runs").fetchone()
+    assert row["status"] == "failed"
+    assert row["finished_at"] is not None
+
+
+def test_an_interrupt_still_records_the_skips_taken_before_it(tmp_path, monkeypatch):
+    """Downgrading the status must not cost the trail: what the run did manage
+    to record before the interrupt is still the honest partial answer."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Interrupted())
+    conn = connect(tmp_path)
+
+    with pytest.raises(KeyboardInterrupt):
+        execute_run(
+            conn, _cfg(interrupted={}), tmp_path, tmp_path, tier="quick",
+            changed_only=False,
+        )
+
+    row = conn.execute("SELECT * FROM runs").fetchone()
+    assert "interrupted: recorded before the interrupt" in json.loads(
+        row["skipped_json"]
+    )
+    assert len(list_findings(conn)) == 1
+
+
 def test_a_lens_clearing_its_own_skips_cannot_erase_another_lenss(tmp_path, monkeypatch):
     """A lens's private skip list must stay private. Sharing result.skips
     directly with every RunContext (an earlier fix for the raise-after-skip
@@ -337,6 +424,22 @@ class _HighAndLow:
             )
 
 
+class _MisdeclaredScope:
+    """Declares a scope that is not a LensScope. Typo, or a value from a
+    future version of the enum."""
+
+    name = "misdeclared"
+    max_autonomy = 3
+    scope = "projet"
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        return
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
 def _boom_resolve(*args, **kwargs):
     raise AssertionError("resolve_files must not run for a project-scoped run")
 
@@ -384,6 +487,39 @@ def test_a_project_scoped_lens_reports_that_it_ignored_boundaries(
     assert any(
         "wide" in skip and "did NOT narrow" in skip for skip in result.skips
     ), result.skips
+
+
+def test_an_invalid_scope_declaration_is_reported_not_silently_defaulted(
+    tmp_path, monkeypatch
+):
+    """`scope = "projet"` and no `scope` at all both end at file-scoped, and
+    they are not the same event. The pack that never declared one is behaving
+    correctly; the pack with the typo has been overruled, its boundaries
+    advisory is missing, and nothing said why."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_MisdeclaredScope())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(misdeclared={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert any(
+        "misdeclared" in skip and "projet" in skip and "file-scoped" in skip
+        for skip in result.skips
+    ), result.skips
+    # Reported once, not once per question the runner asks about the scope.
+    assert sum("projet" in skip for skip in result.skips) == 1, result.skips
+
+
+def test_a_pack_that_declares_no_scope_is_not_reported(tmp_path, monkeypatch):
+    """The counterweight: silence for the packs written before `scope` existed,
+    or the advisory becomes a line on every honest lens and nobody reads it."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert not any("declared scope" in skip for skip in result.skips), result.skips
 
 
 def test_default_boundaries_do_not_produce_a_noise_line(tmp_path, monkeypatch):
@@ -516,3 +652,10 @@ def test_without_the_option_the_default_floor_still_applies(tmp_path):
     )
     assert result.new == 0
     assert list_findings(conn) == []
+    # Silence only proves the default floor if the detector actually ran. A
+    # missing coverage.xml, an `only` filter that stopped matching, and a
+    # detector raising into HygienePack's guard all produce this same empty
+    # result -- and each of the three records a `hygiene/coverage:` skip.
+    assert not any(
+        skip.startswith("hygiene/coverage") for skip in result.skips
+    ), result.skips
