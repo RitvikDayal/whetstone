@@ -170,7 +170,18 @@ def _make_dir(root: Path, override: str | None) -> None:
     try:
         root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise StateDirError(_state_dir_message(root, override, exc)) from exc
+        message = _state_dir_message(root, override, exc)
+    else:
+        return
+    # Raised OUTSIDE the `except` block on purpose, matching config/loader.py.
+    # Inside it, Python attaches the caught OSError as __context__ (and `from
+    # exc` would also attach it as __cause__), and that OSError's own text and
+    # `.filename` carry the unredacted resolved state_dir. The default
+    # traceback hook, `logging.exception`, and `traceback.format_exception` all
+    # walk the chain and print it directly above the elided message. Once the
+    # except block exits, the OSError is no longer being handled, so nothing
+    # chains it and the elided text is the only rendering that exists.
+    raise StateDirError(message)
 
 
 def _state_dir_message(root: Path, override: str | None, exc: OSError) -> str:

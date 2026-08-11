@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 import pytest
@@ -152,6 +153,27 @@ def test_state_dir_underneath_a_file_is_a_named_error(tmp_path):
 _SECRET = "ghp_R3alSecretValue0000000000000000000000"
 
 
+def _assert_chain_is_broken(exc):
+    """`from exc` (or a bare `raise` inside an `except`) keeps the caught OSError
+    reachable as `__cause__`/`__context__`, and `traceback.format_exception`,
+    `logging.exception`, and the default excepthook all walk the chain and print
+    it -- past whatever redaction the top-level message applied. The only
+    rendering guaranteed clean is one where nothing is chained at all.
+    """
+    assert exc.__cause__ is None, exc.__cause__
+    assert exc.__context__ is None, exc.__context__
+
+
+def _assert_secret_is_unreachable(exc, secret):
+    """The secret must not survive in any rendering of *exc*, including the chain."""
+    rendered = "".join(traceback.format_exception(exc))
+    assert secret not in str(exc), str(exc)
+    assert secret not in repr(exc), repr(exc)
+    assert all(secret not in str(arg) for arg in exc.args), exc.args
+    assert secret not in rendered, rendered
+    _assert_chain_is_broken(exc)
+
+
 @pytest.mark.parametrize(
     "case",
     ["resolved-file", "resolved-under-file", "cloud-synced", "unset-variable"],
@@ -176,12 +198,67 @@ def test_no_error_message_echoes_the_state_dir_override(tmp_path, monkeypatch, c
     message = str(caught.value)
     if case == "unset-variable":
         # This one names the VARIABLE on purpose -- a reference, not a value, and
-        # the whole actionable content of the error.
+        # the whole actionable content of the error. The chain must still be
+        # broken; it just isn't the route being tested for secret absence here.
         assert message.count(_SECRET) == 2, message
+        _assert_chain_is_broken(caught.value)
     else:
         assert _SECRET not in message, message
         assert "<elided>" in message
+        _assert_secret_is_unreachable(caught.value, _SECRET)
     assert "state_dir" in message
+
+
+def test_state_dir_as_an_existing_file_breaks_the_exception_chain(tmp_path):
+    """Trigger 1: mkdir raises FileExistsError because the override names a file.
+
+    This is the exact reproduction from the bug report: a `state_dir` override
+    ending in a credential-shaped token, pointed at a path that already exists
+    as a file.
+    """
+    target = tmp_path / _SECRET
+    target.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(StateDirError) as caught:
+        state_root(tmp_path, str(target))
+    assert _SECRET not in str(caught.value)
+    _assert_secret_is_unreachable(caught.value, _SECRET)
+
+
+@windows_only
+def test_state_dir_at_a_reserved_device_name_breaks_the_exception_chain(tmp_path):
+    """Trigger 2: mkdir raises a *different* OSError subclass (FileNotFoundError,
+    WinError 3) for an illegal path -- a reserved Windows device name as an
+    intermediate component. Confirmed to leak the same way, by the same route,
+    as the FileExistsError in trigger 1.
+    """
+    override = str(tmp_path / "NUL" / _SECRET)
+    with pytest.raises(StateDirError) as caught:
+        state_root(tmp_path, override)
+    assert _SECRET not in str(caught.value)
+    _assert_secret_is_unreachable(caught.value, _SECRET)
+
+
+@posix_only
+def test_state_dir_under_an_unwritable_directory_breaks_the_exception_chain(
+    tmp_path,
+):
+    """POSIX sibling of the reserved-device-name trigger: PermissionError, a
+    third OSError subclass, from a parent directory with no write permission.
+    Skipped if the host lets root (or an ACL) bypass the permission bit.
+    """
+    blocker = tmp_path / "unwritable"
+    blocker.mkdir()
+    blocker.chmod(0o500)
+    override = str(blocker / _SECRET)
+    try:
+        state_root(tmp_path, override)
+    except StateDirError as caught:
+        assert _SECRET not in str(caught)
+        _assert_secret_is_unreachable(caught, _SECRET)
+    else:
+        pytest.skip("host does not enforce the permission bit (likely running as root)")
+    finally:
+        blocker.chmod(0o700)
 
 
 def test_the_default_state_path_is_still_printed_in_full(tmp_path, monkeypatch):
