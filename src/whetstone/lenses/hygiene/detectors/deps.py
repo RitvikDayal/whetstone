@@ -104,6 +104,37 @@ def _unstorable(value: object) -> bool:
     return False
 
 
+def _as_text(value: object) -> str | None:
+    """The value when it is text, otherwise None.
+
+    Deliberately not `str(value)`. Container types are validated below, and the
+    scalars pulled out of them were not: `{"name": 42}` or `{"id": {"a": 1}}`
+    passes every shape check, and `_unstorable` returns False for anything that
+    is neither str nor sequence. The value then reaches `Candidate.subject`,
+    whose `dedupe_key` calls `.replace()` on it, and `upsert` binds it to
+    sqlite -- both in runner.py, OUTSIDE the per-detector guard in pack.py, so
+    the run ends `failed` with no skip line. Exactly the path the surrogate
+    comment above describes. Coercing instead of refusing would invent an
+    identity that then feeds the dedupe key.
+
+    Same long-term home as `_SURROGATE`: `Candidate` refusing unusable values
+    at construction, so every lens inherits it -- see issue #14.
+    """
+    return value if isinstance(value, str) else None
+
+
+def _as_versions(value: object) -> list[str] | None:
+    """A list of version strings, otherwise None.
+
+    A bare string passes `_unstorable`, and then `', '.join("2.0")` renders
+    `2, ., 0` while `evidence.data["fix_versions"]` stores a string where every
+    consumer expects a list.
+    """
+    if isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+        return list(value)
+    return None
+
+
 def _storable(text: str) -> str:
     """Replace unencodable characters with a visible escape.
 
@@ -199,7 +230,12 @@ def _run_pip_audit(project_root: Path, args: list[str]) -> str:
     outlives its bound, RuntimeError on any other non-success exit.
     """
     argv = [*_PIP_AUDIT_ARGV, "--format", "json", "--progress-spinner", "off", *args]
-    proc = subprocess.Popen(
+    # `with`, so the pipes are closed and the child reaped on every exit, not
+    # just the two this function names. Note that Popen.__exit__ ends in an
+    # UNBOUNDED wait(), which is why the handler below kills the tree first:
+    # the context manager is what guarantees cleanup, the kill is what keeps
+    # that cleanup bounded.
+    with subprocess.Popen(
         argv,
         cwd=project_root,
         stdout=subprocess.PIPE,
@@ -218,22 +254,26 @@ def _run_pip_audit(project_root: Path, args: list[str]) -> str:
         # json.loads to sqlite.
         errors="surrogateescape",
         **_new_group(),
-    )
-    try:
-        raw, err = proc.communicate(timeout=_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc)
-        # The tree is dead; if the reader threads still have not closed, they
-        # are not worth waiting on further. Surfacing the original timeout is
-        # what matters, and this wait is bounded so it cannot reintroduce the
-        # unbounded one it exists to fix.
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.communicate(timeout=_REAP_SECONDS)
-        raise
-    # pip-audit exits 1 when it finds vulnerabilities -- that is success for us.
-    if proc.returncode not in (0, 1):
-        raise RuntimeError((err or "").strip() or f"exit {proc.returncode}")
-    return raw or ""
+    ) as proc:
+        try:
+            raw, err = proc.communicate(timeout=_TIMEOUT_SECONDS)
+        except BaseException:
+            # BaseException, not TimeoutExpired: Ctrl-C in the middle of a slow
+            # audit used to propagate straight past this and leave pip-audit --
+            # and the pip it shelled out to -- running with the pipes still
+            # open. The timeout is not the only way out of a communicate().
+            _kill_tree(proc)
+            # The tree is dead; if the reader threads still have not closed,
+            # they are not worth waiting on further. Surfacing the original
+            # exception is what matters, and this wait is bounded so it cannot
+            # reintroduce the unbounded one it exists to fix.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=_REAP_SECONDS)
+            raise
+        # pip-audit exits 1 when it finds vulnerabilities -- success for us.
+        if proc.returncode not in (0, 1):
+            raise RuntimeError((err or "").strip() or f"exit {proc.returncode}")
+        return raw or ""
 
 
 class DepsDetector:
@@ -303,8 +343,16 @@ class DepsDetector:
                 )
                 continue
 
-            name = dependency.get("name", "unknown")
-            version = dependency.get("version", "unknown")
+            name = _as_text(dependency.get("name", "unknown"))
+            version = _as_text(dependency.get("version", "unknown"))
+            if name is None or version is None:
+                ctx.skip(
+                    "hygiene/deps: pip-audit reported a dependency whose name or "
+                    f"version was not text (name={dependency.get('name')!r}, "
+                    f"version={dependency.get('version')!r}); it cannot be stored "
+                    "or acted on, so its advisories were NOT recorded."
+                )
+                continue
 
             # Identity and remedy have to be representable or the finding is
             # not one anybody can act on: you cannot `pip install --upgrade` a
@@ -352,8 +400,16 @@ class DepsDetector:
                     )
                     continue
 
-                advisory = vuln.get("id", "unknown-advisory")
-                fixes = vuln.get("fix_versions") or []
+                advisory = _as_text(vuln.get("id", "unknown-advisory"))
+                fixes = _as_versions(vuln.get("fix_versions") or [])
+                if advisory is None or fixes is None:
+                    ctx.skip(
+                        f"hygiene/deps: {name} has an advisory whose id or fix "
+                        f"versions were not text (id={vuln.get('id')!r}, "
+                        f"fix_versions={vuln.get('fix_versions')!r}); it was NOT "
+                        "recorded."
+                    )
+                    continue
 
                 # Same rule as the package name: the advisory id is the finding's
                 # identity and the fix versions are the remedy, so neither can be
@@ -366,8 +422,21 @@ class DepsDetector:
                     )
                     continue
 
-                description = vuln.get("description", "No description provided.")
-                if _unstorable(description):
+                description = _as_text(
+                    vuln.get("description", "No description provided.")
+                )
+                if description is None:
+                    # Prose, unlike identity, is not what the user acts on, so
+                    # a wrong-typed description does not cost a real advisory
+                    # the way a wrong-typed id does. Say what was dropped.
+                    ctx.skip(
+                        f"hygiene/deps: {name} advisory {advisory} had a "
+                        f"description that was not text "
+                        f"({type(vuln.get('description')).__name__}); the finding "
+                        "was recorded without it."
+                    )
+                    description = "No description provided."
+                elif _unstorable(description):
                     # Unlike identity, prose is not what the user acts on. A
                     # real advisory is not worth discarding over one bad byte in
                     # its text, so the text is escaped and the substitution is
