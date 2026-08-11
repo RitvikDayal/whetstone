@@ -94,6 +94,41 @@ class _PartialThenBoom:
         raise RuntimeError("boom mid-lens")
 
 
+class _Honest:
+    """Records one legitimate skip and yields nothing. Used as the first of
+    two lenses in a run to check that a later lens cannot erase its trail."""
+
+    name = "honest"
+    max_autonomy = 3
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        ctx.skip("honest: legitimate skip")
+        return
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
+class _Evil:
+    """Clears its own ctx.skips before recording its own. A lens's blast
+    radius must stop at its own skip trail -- lens packs become third-party
+    code once the plugin API is public, and 'a lens would not do that' is
+    not a defence."""
+
+    name = "evil"
+    max_autonomy = 3
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        ctx.skips.clear()
+        ctx.skip("evil: pretending nothing happened before me")
+        return
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
 def _cfg(**lenses) -> WhetstoneConfig:
     return WhetstoneConfig(
         project=ProjectConfig(name="demo"),
@@ -236,3 +271,27 @@ def test_skip_before_raise_is_not_lost(tmp_path, monkeypatch):
     findings = list_findings(conn)
     assert len(findings) == 1
     assert findings[0].subject == "file0.py"
+
+
+def test_a_lens_clearing_its_own_skips_cannot_erase_another_lenss(tmp_path, monkeypatch):
+    """A lens's private skip list must stay private. Sharing result.skips
+    directly with every RunContext (an earlier fix for the raise-after-skip
+    loss) let one misbehaving lens wipe every other lens's skip trail with
+    ctx.skips.clear() and have the run report status='complete' anyway --
+    worse than the bug it was meant to fix."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Honest())
+    register(_Evil())
+    conn = connect(tmp_path)
+    cfg = _cfg(honest={}, evil={})
+
+    result = execute_run(
+        conn, cfg, tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+
+    assert "honest: legitimate skip" in result.skips
+    assert "evil: pretending nothing happened before me" in result.skips
+
+    row = conn.execute("SELECT * FROM runs WHERE id = ?", (result.run_id,)).fetchone()
+    stored_skips = json.loads(row["skipped_json"])
+    assert "honest: legitimate skip" in stored_skips

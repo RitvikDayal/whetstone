@@ -111,12 +111,17 @@ def execute_run(
                 )
                 continue
 
-            # `skips=result.skips` -- not a fresh list later merged in -- so
-            # `ctx.skip()` writes straight into the run's own skip list. A
-            # lens that skips, yields a candidate, and then raises used to
-            # lose the skip: the merge lived at the bottom of this loop body,
-            # past the point an exception unwinds through. Sharing the list
-            # makes that loss structurally impossible rather than handled.
+            # `ctx.skips` stays private to this lens (the RunContext default,
+            # not result.skips itself): a lens that clears its own list --
+            # ctx.skips.clear(), or ctx.skips[:] = [] -- must only be able to
+            # erase its own trail. Lens packs are third-party code once the
+            # plugin API is public, so a shared list let one misbehaving lens
+            # wipe every other lens's skips too; tried that, reverted it.
+            #
+            # The merge back into result.skips runs in `finally` rather than
+            # after the loop, so a lens that skips, yields a candidate, and
+            # then raises still gets its skip recorded -- the loss the shared
+            # list was originally reaching for, without the blast radius.
             ctx = RunContext(
                 project_root=project_root,
                 state_root=state_root,
@@ -124,13 +129,15 @@ def execute_run(
                 tier=tier,
                 lens_options=lens_cfg.model_dump(exclude_none=True),
                 run_id=run_id,
-                skips=result.skips,
             )
-            for candidate in pack.run(ctx):
-                if upsert(conn, candidate, run_id, _now()):
-                    result.new += 1
-                else:
-                    result.seen += 1
+            try:
+                for candidate in pack.run(ctx):
+                    if upsert(conn, candidate, run_id, _now()):
+                        result.new += 1
+                    else:
+                        result.seen += 1
+            finally:
+                result.skips.extend(ctx.skips)
 
         _report_unsupported_sinks(cfg, result)
     except Exception:
