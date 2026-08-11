@@ -61,6 +61,16 @@ Pack-specific settings go under `options`. Everything above it is a key the
 core understands, and a typo there fails validation rather than being accepted
 as a setting that does nothing.
 
+`coverage_floor` must be a number greater than 0 and no greater than 100. `0`
+is rejected because a floor nothing can fall below is the check turned off
+while looking exactly like a clean project. Because `options` is pack-specific
+the core cannot type it at load time, so an out-of-range, non-numeric, or
+boolean value loads fine and is reported as a skip when the run executes —
+coverage is not evaluated at all in that case.
+
+`only` names detectors: `deps` and `coverage`. An entry matching neither is
+reported as a skip rather than silently selecting nothing.
+
 ### Boundaries do not apply to this lens
 
 `boundaries.include` and `boundaries.exclude` narrow the files a **file-scoped**
