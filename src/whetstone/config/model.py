@@ -113,6 +113,18 @@ class LensConfig(_Strict):
     # to validate here and surface much later as a bare KeyError inside
     # severity_at_least.
     severity_floor: Severity | None = None
+    # Pack-specific options, reached by a lens as `RunContext.options`.
+    #
+    # A free mapping rather than a field per option on purpose. `extra="forbid"`
+    # above is what makes a typo in a spine key fail loudly, and it also made
+    # every pack option unwritable: `coverage_floor` was read by the coverage
+    # detector and rejected by this model, so the floor was permanently 60 and
+    # a user who wrote the option could not load their config at all. Adding
+    # `coverage_floor` here would fix the one built-in pack and nothing else --
+    # lenses arrive through an entry point, so the spine cannot know their
+    # vocabulary. Giving packs their own sub-mapping keeps the spine strict
+    # where it can be and honest about where it cannot.
+    options: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("autonomy")
     @classmethod
