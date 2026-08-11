@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from ..errors import StoreError
 from ..lenses.base import Candidate
 
 
@@ -65,7 +66,14 @@ def _existing_id(conn: sqlite3.Connection, key: str) -> str | None:
 def _refresh(
     conn: sqlite3.Connection, candidate: Candidate, run_id: str, now: str, key: str
 ) -> None:
-    conn.execute(
+    """Update the stored row for *key*. Exactly one row must match.
+
+    The backstop for the narrowed IntegrityError handler below. Both callers
+    have already established that the row exists, so a zero-row UPDATE means the
+    candidate has been dropped and the caller is about to report it as seen --
+    the silent-loss failure this store must never produce.
+    """
+    cursor = conn.execute(
         "UPDATE findings SET evidence_json = ?, title = ?, detail = ?, "
         "severity = ?, last_seen_run = ?, updated_at = ? WHERE dedupe_key = ?",
         (
@@ -78,6 +86,12 @@ def _refresh(
             key,
         ),
     )
+    if cursor.rowcount != 1:
+        raise StoreError(
+            f"refreshing finding {key} updated {cursor.rowcount} rows, expected "
+            "exactly 1. The row was there when it was checked for and is not "
+            "there now, so this candidate would have been silently discarded."
+        )
 
 
 def upsert(
@@ -126,7 +140,16 @@ def upsert(
                 now,
             ),
         )
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as exc:
+        # Only the dedupe-key conflict means "someone else inserted this row".
+        # Every NOT NULL violation is an IntegrityError too, and `Candidate` is
+        # frozen but unvalidated, so a lens returning None for `detail` used to
+        # land here, be reported as already seen, and vanish. Both the current
+        # sqlite phrasing ("UNIQUE constraint failed: findings.dedupe_key") and
+        # the legacy one ("column dedupe_key is not unique") are accepted.
+        message = str(exc)
+        if "dedupe_key" not in message or "UNIQUE" not in message.upper():
+            raise
         _refresh(conn, candidate, run_id, now, key)
         return False
 

@@ -1,10 +1,15 @@
+import sqlite3
+from dataclasses import replace
+
 import pytest
 
+from whetstone.errors import StoreError
 from whetstone.lenses.base import Candidate, Evidence, EvidenceKind, Severity
 from whetstone.store.db import SCHEMA_VERSION, connect
 from whetstone.store.findings import count_by_state, list_findings, upsert
 
 NOW = "2026-08-10T10:00:00+00:00"
+LATER = "2026-08-10T11:00:00+00:00"
 
 
 def _candidate(subject: str = "requests", rule_id: str = "CVE-2026-1") -> Candidate:
@@ -189,3 +194,57 @@ def test_connect_refuses_a_mismatched_schema_version(tmp_path):
 
     with pytest.raises(SchemaVersionError):
         connect(tmp_path)
+
+
+@pytest.mark.parametrize("field", ["lens", "rule_id", "title", "detail"])
+def test_a_missing_required_field_raises_instead_of_reporting_seen(tmp_path, field):
+    """`Candidate` is frozen but unvalidated, so a lens returning None for one
+    field is a NOT NULL violation -- which is also an `sqlite3.IntegrityError`.
+    A handler written for the dedupe-key race used to swallow it, report the
+    finding as already seen, and drop it on the floor.
+    """
+    conn = connect(tmp_path)
+    candidate = replace(_candidate(), **{field: None})
+    with pytest.raises(sqlite3.IntegrityError):
+        upsert(conn, candidate, "run-1", NOW)
+    assert count_by_state(conn) == {}
+    assert list_findings(conn) == []
+    conn.close()
+
+
+def test_upsert_race_applies_the_refresh(tmp_path, monkeypatch):
+    """The race path must do everything the normal update path does: report
+    `False` AND land the new wording and severity on the stored row."""
+    import whetstone.store.findings as findings_module
+
+    conn = connect(tmp_path)
+    upsert(conn, _candidate(), "run-1", NOW)
+    monkeypatch.setattr(findings_module, "_existing_id", lambda conn, key: None)
+
+    reworded = replace(
+        _candidate(), title="reworded", detail="new detail", severity=Severity.critical
+    )
+    assert upsert(conn, reworded, "run-2", LATER) is False
+
+    found = list_findings(conn)[0]
+    assert found.title == "reworded"
+    assert found.detail == "new detail"
+    assert found.severity == "critical"
+    assert found.last_seen_run == "run-2"
+    assert found.updated_at == LATER
+    conn.close()
+
+
+def test_a_refresh_that_matches_no_row_raises(tmp_path, monkeypatch):
+    """The backstop. If the existence check says a row is there and the UPDATE
+    finds nothing, the candidate has been silently discarded -- exactly the
+    outcome the narrowed handler above exists to prevent, arrived at by a
+    different route."""
+    import whetstone.store.findings as findings_module
+
+    conn = connect(tmp_path)
+    monkeypatch.setattr(findings_module, "_existing_id", lambda conn, key: "phantom")
+    with pytest.raises(StoreError):
+        upsert(conn, _candidate(), "run-1", NOW)
+    assert list_findings(conn) == []
+    conn.close()

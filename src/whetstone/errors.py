@@ -32,6 +32,14 @@ class SchemaVersionError(WhetstoneError):
     """
 
 
+class StoreError(WhetstoneError):
+    """The findings store reached a state its own invariants forbid.
+
+    Distinct from sqlite3's errors: those say the database refused a statement,
+    this says the statement succeeded and touched the wrong number of rows.
+    """
+
+
 class GitError(WhetstoneError):
     """A git invocation failed."""
 
