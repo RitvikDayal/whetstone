@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -5,7 +6,15 @@ from pathlib import Path
 import pytest
 
 from whetstone.errors import ConfigError, StateDirError, UnsafeStatePathError
-from whetstone.paths import assert_not_cloud_synced, state_root
+from whetstone.paths import (
+    _unexpanded_variable,
+    assert_not_cloud_synced,
+    state_root,
+)
+
+ON_WINDOWS = os.name == "nt"
+windows_only = pytest.mark.skipif(not ON_WINDOWS, reason="Windows path semantics")
+posix_only = pytest.mark.skipif(ON_WINDOWS, reason="POSIX path semantics")
 
 
 @pytest.mark.parametrize(
@@ -138,6 +147,7 @@ def test_empty_state_dir_does_not_silently_fall_back(tmp_path, empty):
         state_root(tmp_path, empty)
 
 
+@posix_only
 def test_unset_variable_in_state_dir_is_refused(tmp_path, monkeypatch):
     """loader._substitute errors on an unset ${env:VAR}; this must match."""
     monkeypatch.delenv("WHETSTONE_NOT_SET_ANYWHERE", raising=False)
@@ -145,8 +155,78 @@ def test_unset_variable_in_state_dir_is_refused(tmp_path, monkeypatch):
         state_root(tmp_path, "$WHETSTONE_NOT_SET_ANYWHERE/w")
 
 
+@windows_only
+def test_unset_percent_variable_in_state_dir_is_refused(tmp_path, monkeypatch):
+    """`%VAR%` is the spelling a Windows user writes, and ntpath leaves it literal."""
+    monkeypatch.delenv("LOCALAPPDAT", raising=False)
+    with pytest.raises(ConfigError, match="LOCALAPPDAT"):
+        state_root(tmp_path, r"%LOCALAPPDAT%\whetstone")
+
+
+@windows_only
+def test_set_percent_variable_in_state_dir_is_expanded(tmp_path, monkeypatch):
+    monkeypatch.setenv("WHETSTONE_TEST_BASE", str(tmp_path))
+    result = state_root(tmp_path, r"%WHETSTONE_TEST_BASE%\w")
+    assert result == (tmp_path / "w").resolve()
+    assert result.is_dir()
+
+
+@windows_only
+def test_a_dollar_sign_is_a_legal_windows_directory_name(tmp_path):
+    """`$Recycle.Bin` is a real Windows directory. Refusing it is the same bug."""
+    target = tmp_path / "$Recycle.Bin" / "w"
+    result = state_root(tmp_path, str(target))
+    assert result.is_dir()
+
+
+@posix_only
+def test_a_percent_sign_is_a_legal_posix_directory_name(tmp_path):
+    """`%` never expands on POSIX, so it is an ordinary filename character."""
+    target = tmp_path / "%LOCALAPPDAT%" / "w"
+    result = state_root(tmp_path, str(target))
+    assert result.is_dir()
+
+
 def test_set_variable_in_state_dir_is_expanded(tmp_path, monkeypatch):
     monkeypatch.setenv("WHETSTONE_TEST_BASE", str(tmp_path))
     result = state_root(tmp_path, "${WHETSTONE_TEST_BASE}/w")
     assert result == (tmp_path / "w").resolve()
     assert result.is_dir()
+
+
+# Both branches of the platform guard, exercised on either host. The end-to-end
+# tests above can only run on their own platform; these keep the other branch
+# from rotting silently in CI.
+@pytest.mark.parametrize(
+    "windows,text,expected",
+    [
+        (False, "$XDG_STATE_HOME/w", "XDG_STATE_HOME"),
+        (False, "${XDG_STATE_HOME}/w", "XDG_STATE_HOME"),
+        (False, "/home/x/%LOCALAPPDAT%/w", None),
+        (False, "/home/x/50%-off/w", None),
+        (True, r"%LOCALAPPDAT%\w", "LOCALAPPDAT"),
+        (True, r"%ProgramFiles(x86)%\w", "ProgramFiles(x86)"),
+        (True, r"C:\Users\x\$Recycle.Bin\w", None),
+        (True, r"C:\Users\x\$WINDOWS.~BT\w", None),
+        (True, r"C:\Users\x\.whetstone\w", None),
+    ],
+)
+def test_unexpanded_variable_detection_is_platform_specific(windows, text, expected):
+    found = _unexpanded_variable(text, windows=windows)
+    assert (found.group(1) if found else None) == expected
+
+
+def test_relative_state_dir_resolves_against_the_project_not_the_cwd(
+    tmp_path, monkeypatch
+):
+    """The config is found by walking up, so the CWD is not the project root."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    result = state_root(project, ".whetstone-state")
+
+    assert result == (project / ".whetstone-state").resolve()
+    assert not (elsewhere / ".whetstone-state").exists()

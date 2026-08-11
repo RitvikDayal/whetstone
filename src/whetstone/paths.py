@@ -39,10 +39,23 @@ _CLOUD_MARKERS = (
 _CLOUD_COMPONENTS = frozenset({"mega"})
 
 # An unexpanded variable left over after os.path.expandvars — the name was not
-# set in the environment. Only the $VAR and ${VAR} forms are checked: they are
-# the cross-platform spelling, and %VAR% is never expanded on POSIX, so treating
-# it as an error there would reject legal path characters.
-_UNEXPANDED_VAR = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
+# set in the environment, and creating the path would make a directory named
+# after the reference. WHICH spellings count is platform-specific, because which
+# ones are legal in a path is platform-specific.
+#
+# POSIX: `$VAR` and `${VAR}` are the only forms expandvars touches, and `%` is
+# an ordinary filename character. Flagging `%VAR%` here would reject legal paths.
+#
+# Windows: `%VAR%` is the native spelling and the one a Windows user writes, and
+# ntpath.expandvars leaves it literal when the name is unset. `$` is deliberately
+# NOT flagged there: it is a legal filename character that real system
+# directories use — `$Recycle.Bin`, `$WINDOWS.~BT` — so treating `$Recycle` as a
+# failed expansion rejects valid paths, which is the same defect pointed the
+# other way. ntpath.expandvars still expands `$VAR` when the name IS set; only
+# the unset case goes unreported on Windows, and it is not the spelling anyone
+# writes there.
+_POSIX_UNEXPANDED_VAR = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+_WINDOWS_UNEXPANDED_VAR = re.compile(r"%([A-Za-z_][A-Za-z0-9_()]*)%")
 
 
 def assert_not_cloud_synced(path: Path) -> None:
@@ -70,6 +83,14 @@ def state_root(project_root: Path, override: str | None = None) -> Path:
         root = Path.home() / ".whetstone" / digest
     else:
         root = _root_from_override(override)
+        # A relative `state_dir` is relative to the PROJECT, not to wherever the
+        # user happened to be standing. find_config walks up to locate the
+        # config, so the CWD is routinely somewhere below project_root — or, for
+        # a tool pointed at someone else's repository, somewhere else entirely.
+        # Resolving against the CWD would scatter a project's state across every
+        # directory it was ever invoked from.
+        if not root.is_absolute():
+            root = project_root / root
     root = root.resolve()
     assert_not_cloud_synced(root)
     _make_dir(root, override)
@@ -92,16 +113,23 @@ def _root_from_override(override: str) -> Path:
             f"{Path.home() / '.whetstone'}."
         )
     expanded = os.path.expandvars(override)
-    leftover = _UNEXPANDED_VAR.search(expanded)
+    leftover = _unexpanded_variable(expanded)
     if leftover is not None:
-        name = leftover.group(0).lstrip("$").strip("{}")
         raise ConfigError(
-            f"`state_dir` is {override!r} but {name} is not set in the "
-            "environment.\n"
+            f"`state_dir` is {override!r} but {leftover.group(1)} is not set in "
+            "the environment.\n"
             f"Creating it would make a directory literally named "
             f"{leftover.group(0)!r}."
         )
     return Path(expanded).expanduser()
+
+
+def _unexpanded_variable(
+    expanded: str, *, windows: bool = os.name == "nt"
+) -> re.Match[str] | None:
+    """Find a variable reference that expandvars left behind, per platform."""
+    pattern = _WINDOWS_UNEXPANDED_VAR if windows else _POSIX_UNEXPANDED_VAR
+    return pattern.search(expanded)
 
 
 def _make_dir(root: Path, override: str | None) -> None:
