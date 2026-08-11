@@ -13,6 +13,13 @@ from ..lenses.base import Candidate
 
 @dataclass(frozen=True)
 class Finding:
+    """The stored form of a Candidate.
+
+    `evidence` is a plain dict decoded from the stored JSON, not the
+    `Evidence` dataclass `Candidate` carries — reaching for `.evidence.kind`
+    here raises `AttributeError`; use `.evidence["kind"]`.
+    """
+
     id: str
     dedupe_key: str
     lens: str
@@ -48,48 +55,81 @@ def _row_to_finding(row: sqlite3.Row) -> Finding:
     )
 
 
+def _existing_id(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute(
+        "SELECT id FROM findings WHERE dedupe_key = ?", (key,)
+    ).fetchone()
+    return row["id"] if row is not None else None
+
+
+def _refresh(
+    conn: sqlite3.Connection, candidate: Candidate, run_id: str, now: str, key: str
+) -> None:
+    conn.execute(
+        "UPDATE findings SET evidence_json = ?, title = ?, detail = ?, "
+        "severity = ?, last_seen_run = ?, updated_at = ? WHERE dedupe_key = ?",
+        (
+            candidate.evidence.to_json(),
+            candidate.title,
+            candidate.detail,
+            str(candidate.severity),
+            run_id,
+            now,
+            key,
+        ),
+    )
+
+
 def upsert(
     conn: sqlite3.Connection, candidate: Candidate, run_id: str, now: str
 ) -> bool:
     """Persist *candidate*. Returns True when it had not been seen before.
 
-    A finding already in the table keeps its state — a rejection must never be
-    undone by re-running. Only the evidence and last_seen_run are refreshed.
+    Wording and severity are refreshed on every re-run: `Candidate.dedupe_key`
+    deliberately excludes title, detail, and severity so a reworded or
+    re-scored candidate is still recognised as the same finding, and that is
+    only useful if the new wording and score then reach the stored row.
+    `state` is never touched here — a finding already in the table keeps its
+    state, so a rejection can never be undone by re-running.
+
+    The existence check and the insert are two separate statements, so two
+    callers can race: both miss the SELECT, then both attempt the INSERT. The
+    loser's INSERT hits the UNIQUE constraint on dedupe_key; that is caught
+    here, treated as "the row exists after all", and handled via the same
+    refresh path used by the normal update branch.
     """
     key = candidate.dedupe_key
-    existing = conn.execute(
-        "SELECT id FROM findings WHERE dedupe_key = ?", (key,)
-    ).fetchone()
 
-    if existing is not None:
-        conn.execute(
-            "UPDATE findings SET evidence_json = ?, last_seen_run = ?, "
-            "updated_at = ? WHERE dedupe_key = ?",
-            (candidate.evidence.to_json(), run_id, now, key),
-        )
+    if _existing_id(conn, key) is not None:
+        _refresh(conn, candidate, run_id, now, key)
         return False
 
-    conn.execute(
-        "INSERT INTO findings (id, dedupe_key, lens, rule_id, subject, title, "
-        "detail, severity, evidence_json, state, first_seen_run, last_seen_run, "
-        "created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
-        (
-            uuid.uuid4().hex,
-            key,
-            candidate.lens,
-            candidate.rule_id,
-            candidate.subject,
-            candidate.title,
-            candidate.detail,
-            str(candidate.severity),
-            candidate.evidence.to_json(),
-            run_id,
-            run_id,
-            now,
-            now,
-        ),
-    )
+    try:
+        conn.execute(
+            "INSERT INTO findings (id, dedupe_key, lens, rule_id, subject, title, "
+            "detail, severity, evidence_json, state, first_seen_run, last_seen_run, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+            (
+                uuid.uuid4().hex,
+                key,
+                candidate.lens,
+                candidate.rule_id,
+                candidate.subject,
+                candidate.title,
+                candidate.detail,
+                str(candidate.severity),
+                candidate.evidence.to_json(),
+                run_id,
+                run_id,
+                now,
+                now,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        _refresh(conn, candidate, run_id, now, key)
+        return False
+
     return True
 
 

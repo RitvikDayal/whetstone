@@ -23,6 +23,15 @@ class StateDirError(WhetstoneError):
     """The state directory could not be created, or is not a directory."""
 
 
+class SchemaVersionError(WhetstoneError):
+    """The database on disk was stamped by a different schema version.
+
+    There is no migration path yet, so this is refused loudly rather than
+    letting CREATE TABLE IF NOT EXISTS no-op against a shape it doesn't
+    recognise.
+    """
+
+
 class GitError(WhetstoneError):
     """A git invocation failed."""
 
