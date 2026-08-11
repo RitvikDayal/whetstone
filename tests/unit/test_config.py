@@ -382,6 +382,16 @@ def test_redaction_does_not_depend_on_a_top_level_handler(tmp_path, monkeypatch)
         "private_key",
         "apikey",
         "passwd",
+        # camelCase and SCREAMING_CASE are the same key in a different coat.
+        "sessionSecret",
+        "PASSWORD",
+        "apiKey",
+        "AWS_SECRET_ACCESS_KEY",
+        "signing-key",
+        "credential",
+        # A trailing qualifier must not launder the secret word.
+        "github_token_v2",
+        "db.password",
     ],
 )
 def test_secret_shaped_keys_reject_literals(tmp_path, key):
@@ -401,7 +411,31 @@ def test_secret_shaped_keys_reject_literals(tmp_path, key):
 
 @pytest.mark.parametrize(
     "key",
-    ["kind", "keyword", "keys", "base_branch", "viewports", "monkey", "key"],
+    [
+        "kind",
+        "keyword",
+        "keys",
+        "base_branch",
+        "viewports",
+        "monkey",
+        "key",
+        "monkey_patch",
+        # Words that CONTAIN a secret token. Substring matching rejected every
+        # one of these, which is the regression this list exists to catch.
+        "tokenizer",
+        "secretary",
+        "credentialing",
+        "passwordless",
+        "keychain_path",
+        # Plurals name a quantity or a collection, not one secret value.
+        "max_tokens",
+        "passwords_enabled",
+        # A secret word in head position qualifies what follows; it does not
+        # name the value. `token_budget` is a budget, not a token.
+        "token_budget",
+        "secret_scanning",
+        "token_limit",
+    ],
 )
 def test_innocent_keys_are_not_treated_as_secrets(tmp_path, key):
     """Over-matching would reject valid config in someone else's repository."""
@@ -416,6 +450,33 @@ def test_innocent_keys_are_not_treated_as_secrets(tmp_path, key):
         """,
     )
     assert load_config(path).environment.app.auth[key] == "plainvalue"
+
+
+def test_per_stage_model_settings_load(tmp_path):
+    """`model.stages` is typed for exactly this, so Whetstone's own config uses it.
+
+    Substring matching made `max_tokens` a secret-shaped key, which made this
+    document unloadable with no escape hatch.
+    """
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        model:
+          provider: anthropic
+          stages:
+            triage: { max_tokens: 4096, token_budget: 200000, tokenizer: cl100k }
+            repair: { max_tokens: 16384 }
+        environment:
+          app:
+            auth: { kind: form, token_url: "https://example.test/oauth/token" }
+        """,
+    )
+    cfg = load_config(path)
+    assert cfg.model.stages["triage"]["max_tokens"] == 4096
+    assert cfg.model.stages["repair"]["max_tokens"] == 16384
+    assert cfg.environment.app.auth["token_url"].endswith("/token")
 
 
 @pytest.mark.parametrize(

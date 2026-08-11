@@ -21,23 +21,35 @@ CONFIG_NAME = "whetstone.yaml"
 # ${WHETSTONE_PORT} — pass through.
 _ENV_REF = re.compile(r"\$\{[Ee][Nn][Vv]:([A-Za-z_][A-Za-z0-9_]*)\}")
 
-# A key is secret-shaped when its lowercased name CONTAINS one of these tokens.
-# Exact-name matching missed every conventional spelling — `github_token`,
-# `client_secret`, `aws_secret_access_key`, `credentials` all sailed through.
-_SECRET_SUBSTRINGS = (
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "credential",
-    "apikey",
+# Words that name a secret. Matched as whole WORDS, never as substrings.
+# Substring matching caught every conventional spelling and a pile of ordinary
+# config with it — `max_tokens`, `tokenizer`, `secretary`, `credentialing`,
+# `passwords_enabled` were all rejected, and a tool that will not load someone's
+# valid config is its own defect.
+#
+# Plurals are deliberately absent, `credentials` excepted. A plural names a
+# quantity or a collection rather than one secret value: `max_tokens` is an LLM
+# setting, `passwords_enabled` a feature flag. Demanding `${env:...}` there
+# makes ordinary documents unloadable with no escape hatch. `credentials` stays
+# because that is simply how the thing is spelled — nobody writes `credential:`
+# for an auth blob.
+_SECRET_WORDS = frozenset(
+    {
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "credentials",
+        "apikey",
+        "key",
+    }
 )
 
-# ...or when its final separator-delimited component is `key`: `api_key`,
-# `private_key`, `signing-key`. A bare `key`, and `key` as a substring, are
-# deliberately NOT enough — `keys`, `keyword`, `monkey` are ordinary config, and
-# a tool that rejects someone's valid config is its own defect.
-_SECRET_KEY_SUFFIX = re.compile(r"[_\-.]key$")
+# Splits a key into words. Separators (`_`, `-`, `.`) fall away; camelCase and
+# ACRONYMCase split on the case boundary. `sessionSecret` -> session, Secret;
+# `AWS_SECRET_ACCESS_KEY` -> AWS, SECRET, ACCESS, KEY.
+_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 
 
 def find_config(start: Path) -> Path:
@@ -121,10 +133,21 @@ def load_config(path: Path) -> WhetstoneConfig:
 
 
 def _is_secret_key(key: object) -> bool:
-    lowered = str(key).lower()
-    return any(token in lowered for token in _SECRET_SUBSTRINGS) or bool(
-        _SECRET_KEY_SUFFIX.search(lowered)
-    )
+    """True when the key names a secret value, judged word by word."""
+    words = [word.lower() for word in _WORDS.findall(str(key))]
+    if not words:
+        return False
+    # A secret word after the head names the value itself: `github_token`,
+    # `aws_secret_access_key`, `sessionSecret`, `github_token_v2`. In head
+    # position the same word qualifies what follows instead of naming it —
+    # `token_budget` is a budget, `secret_scanning` a feature — so it does not
+    # count there. `secret_key` and `api_key` are still caught, by `key`.
+    if any(word in _SECRET_WORDS for word in words[1:]):
+        return True
+    # A one-word key names the value directly: `password`, `credentials`.
+    # `key` is the exception in every position: `key`/`keys` are how mappings
+    # are described everywhere, and rejecting them would be over-matching again.
+    return len(words) == 1 and words[0] != "key" and words[0] in _SECRET_WORDS
 
 
 def _reject_literal_secrets(node: Any, trail: list[str]) -> None:
