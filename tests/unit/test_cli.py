@@ -34,9 +34,14 @@ def test_version_flag_exits_clean():
     assert whetstone.__version__ in result.output
 
 
-def test_bare_invocation_shows_help():
+def test_bare_invocation_shows_help_and_exits_zero():
+    """`no_args_is_help` short-circuits in Click and exits 2, which reads as a
+    usage error. Running the tool with no arguments is not an error; it is how
+    someone finds out what it does."""
     result = runner.invoke(app, [])
     assert "whetstone" in result.output.lower()
+    assert "init" in result.output
+    assert result.exit_code == 0
 
 
 @pytest.mark.parametrize("command", ["init", "doctor", "run", "findings", "report"])

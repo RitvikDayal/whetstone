@@ -12,11 +12,15 @@ import typer
 
 from . import __version__
 
+# `no_args_is_help` is deliberately NOT set. Click implements it inside
+# parse_args, which short-circuits before the callback runs and exits 2 — the
+# usage-error code — making the `invoked_subcommand is None` branch below dead
+# code. Running the tool with no arguments is how someone finds out what it
+# does, not a usage error, so the callback handles it and exits 0.
 app = typer.Typer(
     name="whetstone",
     help="Evidence-gated project improvement. It never merges and never deploys.",
     add_completion=False,
-    no_args_is_help=True,
 )
 
 _PLANNED = {
