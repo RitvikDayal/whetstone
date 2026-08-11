@@ -531,7 +531,7 @@ def test_an_interrupt_mid_read_kills_the_child_and_closes_the_pipes(
             created.append(self)
 
         def communicate(self, *args, **kwargs):
-            # First read only. `_kill_tree` runs `taskkill` through
+            # First read only. `_subprocess.kill_tree` runs `taskkill` through
             # subprocess.run on Windows, which builds a Popen of its own
             # through this same patched name.
             if not interrupted:
@@ -569,7 +569,7 @@ def test_an_interrupt_mid_read_kills_the_child_and_closes_the_pipes(
 def test_a_failing_kill_does_not_replace_the_original_exception(
     tmp_path, monkeypatch
 ):
-    """`_kill_tree` runs on the way out of a failed read, and the caller
+    """`_subprocess.kill_tree` runs on the way out of a failed read, and the caller
     re-raises the original exception immediately after it. An OSError escaping
     the final `proc.kill()` -- it sits in a `finally`, outside the suppression
     covering taskkill/killpg -- masks that exception with itself, and the
@@ -604,7 +604,7 @@ def test_a_failing_kill_does_not_replace_the_original_exception(
     with pytest.raises(KeyboardInterrupt):
         list(DepsDetector().detect(_ctx(tmp_path)))
 
-    assert killed, "_kill_tree never reached the direct-child kill"
+    assert killed, "kill_tree never reached the direct-child kill"
 
 
 # --- gate round 2: surrogates must not escape the detector -------------------

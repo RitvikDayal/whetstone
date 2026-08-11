@@ -8,18 +8,28 @@ On shell=True: these commands come from the user's own config, authored by a
 human, and need `&&`, pipes, and PATH resolution to be usable. Model-authored
 commands are a different category entirely and get exact-match allowlisting in
 M1's policy gate. Do not conflate the two.
+
+Scope of `tests/unit/test_invariants.py`'s merge/push/deploy guard: that test
+is a static scan of source TEXT, proving Whetstone's own code contains no
+literal invocation of the handful of merge, push, and deploy commands it
+names (see that file for the exact list). It cannot see through `shell=True`
+into a string that only exists at runtime, so a whetstone.yaml `test:` (or
+`build:`, `lint:`, ...) entry built from one of those same words still runs
+here, and the guard stays green -- that is the intended boundary, not a gap
+the guard failed to catch. The trust boundary is WHO AUTHORED the string, not
+what it says: a human's own config is theirs to write and run. A
+model-authored command is a different category, and gets exact-match
+allowlisting in M1's policy gate instead of running free-form.
 """
 
 from __future__ import annotations
 
-import contextlib
-import os
 import shutil
-import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._subprocess import kill_and_reap, new_group
 from .config.model import WhetstoneConfig
 from .errors import UnsafeStatePathError
 from .paths import assert_not_cloud_synced
@@ -31,11 +41,6 @@ _VERIFIABLE_COMMANDS = ("install", "test", "lint", "build")
 
 _TIMEOUTS = {"install": 600, "test": 900, "lint": 300, "build": 900}
 
-# How long to wait for a killed process tree to release its pipes. Bounded, so
-# the kill that exists to bound a hung command cannot itself reintroduce an
-# unbounded wait -- same rationale as lenses/hygiene/detectors/deps.py:_REAP_SECONDS.
-_REAP_SECONDS = 15
-
 
 @dataclass
 class CheckResult:
@@ -45,58 +50,19 @@ class CheckResult:
     skipped: bool = False
 
 
-def _new_group() -> dict[str, object]:
-    """Popen keywords that make the child's whole process tree killable as one
-    unit. Mirrors lenses/hygiene/detectors/deps.py: a declared `test`, `build`,
-    or `lint` command routinely shells out to further children (npm, pnpm,
-    pytest-xdist workers), and killing only the direct shell process leaves
-    them holding the stdout/stderr pipes open forever.
-    """
-    if os.name == "nt":
-        # `taskkill /T` walks the parent/child chain directly from the PID, so
-        # no group flag is needed here.
-        return {}
-    return {"start_new_session": True}
-
-
-def _kill_tree(proc: subprocess.Popen[str]) -> None:
-    """Kill the child AND anything it started.
-
-    Killing only the direct child leaves a grandchild holding the inherited
-    stdout/stderr pipes, so any further read on them never sees EOF. Cannot
-    raise: this runs on an exception path and the caller re-raises or returns
-    right after it.
-    """
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-                timeout=_REAP_SECONDS,
-            )
-        else:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (OSError, subprocess.SubprocessError):
-        # Already gone, or the platform refused. Fall through to the direct
-        # child so the caller is never left waiting on a live process.
-        pass
-    finally:
-        with contextlib.suppress(OSError):
-            proc.kill()
-
-
 def run_command(label: str, command: str, cwd: Path, timeout: int) -> CheckResult:
     """Run *command* through the shell and prove it actually ran.
 
-    Uses Popen with a bounded reap rather than `subprocess.run(timeout=...)`.
-    That helper's own timeout handling kills only the direct child and then,
-    on Windows, calls `communicate()` a SECOND time with no timeout at all to
-    collect the rest of the output -- and that call hangs forever if a
-    grandchild the command spawned still holds the stdout/stderr pipes open.
-    `pytest` and `npm test` both routinely spawn children, so this is the
-    ordinary case, not an exotic one. See lenses/hygiene/detectors/deps.py,
-    which hit and fixed the identical defect running pip-audit under a
-    timeout; `_new_group`/`_kill_tree` above are the same fix applied here.
+    Uses Popen with a bounded reap (`._subprocess.kill_and_reap`/`new_group`)
+    rather than `subprocess.run(timeout=...)`. That helper's own timeout
+    handling kills only the direct child and then, on Windows, calls
+    `communicate()` a SECOND time with no timeout at all to collect the rest
+    of the output -- and that call hangs forever if a grandchild the command
+    spawned still holds the stdout/stderr pipes open. `pytest` and `npm test`
+    both routinely spawn children, so this is the ordinary case, not an
+    exotic one. `lenses/hygiene/detectors/deps.py` hit and fixed the identical
+    defect running pip-audit under a timeout; `_subprocess.py` is that fix,
+    shared by both call sites.
     """
     with subprocess.Popen(
         command,
@@ -111,16 +77,15 @@ def run_command(label: str, command: str, cwd: Path, timeout: int) -> CheckResul
         # text is only ever displayed, never parsed or stored, so there is no
         # downstream identity or dedupe key that a lost byte could corrupt.
         errors="replace",
-        **_new_group(),
+        **new_group(),
     ) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            _kill_tree(proc)
-            # Bounded, so a reap that does not take cannot reintroduce the
-            # unbounded wait this whole function exists to avoid.
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=_REAP_SECONDS)
+            # `kill_and_reap` kills the whole tree and then drains what's left
+            # of the pipes with its own bounded timeout, so this cannot
+            # reintroduce the unbounded wait it exists to avoid.
+            kill_and_reap(proc)
             return CheckResult(
                 name=f"command: {label}",
                 ok=False,
@@ -129,9 +94,7 @@ def run_command(label: str, command: str, cwd: Path, timeout: int) -> CheckResul
         except BaseException:
             # KeyboardInterrupt included: a Ctrl-C mid-command must not leave
             # it, or anything it spawned, running with the pipes still open.
-            _kill_tree(proc)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=_REAP_SECONDS)
+            kill_and_reap(proc)
             raise
 
     if proc.returncode == 0:

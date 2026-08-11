@@ -6,6 +6,15 @@ for the commands themselves and for the argument-list spellings a subprocess
 call would use.
 
 This file names every forbidden string, so it scans src/ only and never itself.
+
+Scope: this is a static scan of source TEXT. It proves Whetstone's own code
+contains no literal call to these commands -- it does NOT prove no such
+command can ever execute. `doctor.py` runs arbitrary user-declared strings
+under `shell=True` by design (see its module docstring), so a whetstone.yaml
+declaring `test: git push origin main` runs under doctor and this guard stays
+green; the scan cannot see through `shell=True` into a runtime string. That
+is the intended boundary: the trust boundary is WHO AUTHORED the string
+(human-written config vs. model-authored), not what the string says.
 """
 
 from __future__ import annotations
