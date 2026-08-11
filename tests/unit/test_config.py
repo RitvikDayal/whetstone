@@ -839,3 +839,56 @@ def test_unknown_key_in_a_nested_section_is_rejected(tmp_path, section, doc):
     path = _write(tmp_path, doc)
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+def test_lens_options_accept_pack_specific_keys(tmp_path):
+    """`extra="forbid"` made every pack option unwritable, so a floor the
+    coverage detector read could not be set at all. Options get their own
+    sub-mapping; the spine's own keys stay strict."""
+    path = _write(
+        tmp_path,
+        """\
+        version: 1
+        project:
+          name: demo
+        lenses:
+          hygiene:
+            options:
+              coverage_floor: 80
+              something_a_third_party_pack_invented: [a, b]
+        """,
+    )
+    options = load_config(path).lenses["hygiene"].options
+    assert options["coverage_floor"] == 80
+    assert options["something_a_third_party_pack_invented"] == ["a", "b"]
+
+
+def test_lens_options_default_to_an_empty_mapping(tmp_path):
+    path = _write(
+        tmp_path,
+        """\
+        version: 1
+        project:
+          name: demo
+        lenses:
+          hygiene: { enabled: true }
+        """,
+    )
+    assert load_config(path).lenses["hygiene"].options == {}
+
+
+def test_an_unknown_lens_key_outside_options_is_still_rejected(tmp_path):
+    """The escape hatch must not become a reason to stop catching typos in the
+    keys the core does understand."""
+    path = _write(
+        tmp_path,
+        """\
+        version: 1
+        project:
+          name: demo
+        lenses:
+          hygiene: { enabled: true, coverage_floor: 80 }
+        """,
+    )
+    with pytest.raises(ConfigError, match="coverage_floor"):
+        load_config(path)
