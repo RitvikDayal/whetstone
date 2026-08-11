@@ -3,6 +3,7 @@ import json
 import sys
 
 import yaml
+from rich.console import Console
 
 from whetstone import doctor as doctor_module
 from whetstone.config.loader import load_config
@@ -17,16 +18,30 @@ def test_build_config_marks_unverified_commands_out(tmp_path):
         package_manager="uv",
         commands={"test": "uv run pytest", "lint": "uv run ruff check ."},
     )
-    cfg = build_config(
-        tmp_path, detection, name="demo", verified={"test": True, "lint": False}
-    )
+    cfg = build_config(detection, name="demo", verified={"test": True, "lint": False})
     assert cfg.environment.commands.test == "uv run pytest"
     assert cfg.environment.commands.lint is None
 
 
+def test_the_header_does_not_claim_dev_was_executed(tmp_path):
+    """`dev` is recorded without being launched, so a blanket "every command
+    below was executed and exited 0" is false for exactly that line -- and it
+    was the line carrying `npm dev`, which could never have exited 0."""
+    detection = Detection(
+        languages=["javascript"], package_manager="npm", commands={"dev": "npm run dev"}
+    )
+    cfg = build_config(detection, name="demo", verified={"dev": True})
+    text = render_config(cfg)
+
+    assert "dev: npm run dev" in text
+    header = text.split("version:")[0]
+    assert "except `dev`" in header
+    assert "never launched" in header
+
+
 def test_rendered_config_is_valid_and_commented(tmp_path):
     detection = Detection(languages=["python"], package_manager="uv", commands={})
-    cfg = build_config(tmp_path, detection, name="demo", verified={})
+    cfg = build_config(detection, name="demo", verified={})
     text = render_config(cfg)
     assert text.lstrip().startswith("#")
     parsed = yaml.safe_load(text)
@@ -59,7 +74,7 @@ def test_verified_command_that_fails_is_not_written(tmp_path):
         package_manager="pip",
         commands={"test": f'"{sys.executable}" -c "import sys; sys.exit(1)"'},
     )
-    cfg = build_config(tmp_path, detection, name="demo", verified={"test": False})
+    cfg = build_config(detection, name="demo", verified={"test": False})
     assert cfg.environment.commands.test is None
 
 
@@ -76,8 +91,56 @@ def test_wizard_tells_the_user_about_unused_polyglot_commands(tmp_path, capsys):
     run_wizard(tmp_path, assume_yes=True)
 
     out = capsys.readouterr().out
-    assert "pnpm test" in out
+    assert "pnpm run test" in out
     assert "not used" in out
+
+
+def test_wizard_says_what_it_is_about_to_execute(tmp_path, monkeypatch):
+    """`init --yes` runs the project's own commands in a repo the user may have
+    cloned minutes ago and not read. shell=True with cwd=project_root means
+    cmd.exe resolves from the working directory before PATH on a default
+    Windows box, so `npm install` can be a `npm.bat` sitting in the clone.
+
+    Nothing here can stop that -- running the commands IS what init does. What
+    it can do is not be quiet about it: name the commands before running them,
+    and name the directory they run in.
+    """
+    detection = Detection(
+        languages=["javascript"],
+        package_manager="npm",
+        commands={"install": "npm install", "test": "npm run test"},
+    )
+    monkeypatch.setattr("whetstone.initialize.wizard.detect_stack", lambda root: detection)
+    monkeypatch.setattr(
+        "whetstone.initialize.wizard.run_command",
+        lambda label, command, cwd, timeout: CheckResult(
+            name=f"command: {label}", ok=True, detail="stub"
+        ),
+    )
+
+    # An explicit wide Console, not capsys: rich wraps to the terminal width and
+    # a wrapped temp path would make this assert about the wrap, not the notice.
+    console = Console(file=io.StringIO(), width=300)
+    run_wizard(tmp_path, console=console, assume_yes=True)
+
+    out = console.file.getvalue()
+    assert "npm install" in out
+    assert "npm run test" in out
+    # The directory is half the warning: what runs depends on where it runs.
+    assert str(tmp_path) in out
+    assert "about to execute" in out.lower()
+
+
+def test_wizard_says_nothing_scary_when_there_is_nothing_to_run(tmp_path, monkeypatch):
+    """A warning that appears when no command will run is noise, and noise is
+    how a warning stops being read."""
+    monkeypatch.setattr(
+        "whetstone.initialize.wizard.detect_stack",
+        lambda root: Detection(languages=[], package_manager=None, commands={}),
+    )
+    console = Console(file=io.StringIO(), width=200)
+    run_wizard(tmp_path, console=console, assume_yes=True)
+    assert "about to execute" not in console.file.getvalue().lower()
 
 
 def test_wizard_uses_doctors_per_label_timeouts(tmp_path, monkeypatch):
