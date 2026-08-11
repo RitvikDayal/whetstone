@@ -16,6 +16,7 @@ through three reviews. Only a genuine index or network failure skips, and
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -164,8 +165,17 @@ def _requires_real_pip_audit() -> None:
     )
 
 
+# Only two tests run the real pip-audit, and both are the proof of the
+# ambient-environment Critical. On a runner that cannot reach PyPI or OSV they
+# both skipped, the suite went green, and NOTHING said the proof had not run --
+# the same inert-proof mechanism that let that defect survive three reviews,
+# arrived at from a different direction. A host that genuinely has no index has
+# to say so out loud, once, by setting this.
+_OFFLINE_OPT_OUT = "WHETSTONE_ALLOW_OFFLINE_AUDIT"
+
+
 def _audit_or_skip(ctx: RunContext):
-    """Run the detector. Skip only for a genuine environment failure."""
+    """Run the detector. Skip only for a genuine, declared environment failure."""
     found = list(DepsDetector().detect(ctx))
     failures = [
         s
@@ -174,6 +184,14 @@ def _audit_or_skip(ctx: RunContext):
     ]
     for failure in failures:
         if _is_environment_failure(failure):
+            if os.environ.get(_OFFLINE_OPT_OUT) != "1":
+                pytest.fail(
+                    "pip-audit could not reach its index, so the regression "
+                    "proof for the ambient-environment defect did not run. A "
+                    "skip here is indistinguishable from a pass and that is "
+                    f"the whole problem. Set {_OFFLINE_OPT_OUT}=1 to allow it "
+                    f"deliberately:\n{failure}"
+                )
             pytest.skip(f"pip-audit could not reach its index here: {failure}")
         pytest.fail(
             "pip-audit failed for a reason that is not a network or index "
@@ -468,10 +486,84 @@ def test_argv_carries_the_project_and_no_ambient_fallback(tmp_path, monkeypatch)
     assert any(Path(arg).name == "requirements.txt" for arg in argv), argv
 
 
-def test_subprocess_module_is_actually_used(tmp_path):
+def test_run_pip_audit_actually_spawns_a_process(tmp_path, monkeypatch):
     """Guards the guard: if `_run_pip_audit` ever stops shelling out, these
-    tests would keep passing while proving nothing about a subprocess."""
-    assert deps_module.subprocess is subprocess
+    tests would keep passing while proving nothing about a subprocess.
+
+    This used to assert `deps_module.subprocess is subprocess`, which proves
+    the module has an import. Delete the whole body of `_run_pip_audit` and
+    that still passed. Assert the call instead.
+    """
+    calls: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    class _RecordingPopen(real_popen):
+        def __init__(self, argv, *args, **kwargs):
+            calls.append(list(argv))
+            super().__init__(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+    monkeypatch.setattr(
+        deps_module, "_PIP_AUDIT_ARGV", _fake_tool(tmp_path, "print('{}')\n")
+    )
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+
+    list(DepsDetector().detect(_ctx(tmp_path)))
+
+    assert calls, "_run_pip_audit did not spawn a process"
+    assert any("--format" in argv and "json" in argv for argv in calls), calls
+
+
+def test_an_interrupt_mid_read_kills_the_child_and_closes_the_pipes(
+    tmp_path, monkeypatch
+):
+    """`except subprocess.TimeoutExpired` was the only recovery path, so any
+    other exit from communicate() -- Ctrl-C being the ordinary one -- walked
+    straight out leaving pip-audit and the pip it shelled out to alive with the
+    pipes still open. The timeout is not the only way out of a read."""
+    created: list[subprocess.Popen] = []
+    interrupted: list[bool] = []
+    real_popen = subprocess.Popen
+
+    class _InterruptingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+        def communicate(self, *args, **kwargs):
+            # First read only. `_kill_tree` runs `taskkill` through
+            # subprocess.run on Windows, which builds a Popen of its own
+            # through this same patched name.
+            if not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            return super().communicate(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _InterruptingPopen)
+    monkeypatch.setattr(
+        deps_module,
+        "_PIP_AUDIT_ARGV",
+        _fake_tool(
+            tmp_path,
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "time.sleep(60)\n",
+        ),
+    )
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            list(DepsDetector().detect(_ctx(tmp_path)))
+
+        audit = created[0]
+        assert audit.poll() is not None, "pip-audit survived the interrupt"
+        assert audit.stdout.closed and audit.stderr.closed
+    finally:
+        # Belt and braces: a failure here must not leave a 60s sleeper behind.
+        for proc in created:
+            with contextlib.suppress(OSError, ValueError):
+                proc.kill()
 
 
 # --- gate round 2: surrogates must not escape the detector -------------------
@@ -589,9 +681,14 @@ def test_a_bad_byte_in_a_declined_dependency_does_not_kill_the_run(
 
 
 def test_a_lone_surrogate_escape_in_valid_json_is_contained(tmp_path, monkeypatch):
-    """No byte is malformed here: the JSON carries an explicit \ud800 escape,
+    r"""No byte is malformed here: the JSON carries an explicit \ud800 escape,
     which json.loads decodes into a lone surrogate. That is why the guard is
-    wider than the resolver's surrogateescape-only range."""
+    wider than the resolver's surrogateescape-only range.
+
+    Raw, so this docstring describes the escape instead of containing a lone
+    surrogate that no UTF-8 stream can print. A report plugin or a failure
+    banner rendering it would have raised UnicodeEncodeError out of the test
+    file itself."""
     from whetstone.store.findings import list_findings
 
     payload = (
@@ -623,6 +720,106 @@ def test_clean_output_records_no_encoding_skip(tmp_path, monkeypatch):
     assert not any(
         "UTF-8" in skip or "verbatim" in skip for skip in result.skips
     ), result.skips
+
+
+# --- CodeRabbit round: the leaf types, not just the container types ----------
+#
+# `detect` validated that payload, dependencies, each dependency, vulns and
+# each vuln were the right CONTAINER. The scalars pulled out of them were used
+# as-is, and `_unstorable` returns False for everything that is neither str nor
+# sequence -- so `{"name": 42}` passed every guard, reached `Candidate.subject`,
+# and died in `upsert`. That call site is in runner.py, outside HygienePack's
+# per-detector guard, so the run ended `failed` with no skip line: the same
+# path the surrogate comment in deps.py describes, arrived at by type rather
+# than by encoding. Issue #14 is the general fix at Candidate construction.
+
+
+def test_a_non_text_package_name_does_not_kill_the_run(tmp_path, monkeypatch):
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        b'{"dependencies":[{"name":42,"version":"1.0","vulns":'
+        b'[{"id":"X-5","fix_versions":[],"description":"plain"}]}]}'
+    )
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    assert list_findings(conn) == []
+    assert any(
+        "not text" in skip and "NOT recorded" in skip for skip in result.skips
+    ), result.skips
+
+
+def test_a_non_text_advisory_id_does_not_kill_the_run(tmp_path, monkeypatch):
+    """A nested object where the id belongs. json.dumps in the dedupe key
+    swallows it happily; sqlite does not."""
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        b'{"dependencies":[{"name":"plainpkg","version":"1.0","vulns":'
+        b'[{"id":{"nested":1},"fix_versions":[],"description":"plain"}]}]}'
+    )
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    assert list_findings(conn) == []
+    assert any(
+        "not text" in skip and "NOT recorded" in skip for skip in result.skips
+    ), result.skips
+
+
+def test_bare_string_fix_versions_is_refused_not_rendered_per_character(
+    tmp_path, monkeypatch
+):
+    """`', '.join("2.0")` renders `2, ., 0`, and evidence.data holds a string
+    where every consumer expects a list. `_unstorable` accepted both."""
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        b'{"dependencies":[{"name":"plainpkg","version":"1.0","vulns":'
+        b'[{"id":"X-6","fix_versions":"2.0","description":"plain"}]}]}'
+    )
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    assert list_findings(conn) == []
+    assert any("fix_versions" in skip for skip in result.skips), result.skips
+
+
+def test_a_non_text_description_still_records_the_advisory(tmp_path, monkeypatch):
+    """Identity is intact, so the advisory is real. Prose is not what the user
+    acts on -- same split as the bad-byte case -- but the loss is reported."""
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        b'{"dependencies":[{"name":"plainpkg","version":"1.0","vulns":'
+        b'[{"id":"X-7","fix_versions":["2.0"],"description":{"text":"nested"}}]}]}'
+    )
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    assert [f.rule_id for f in list_findings(conn)] == ["X-7"]
+    assert any(
+        "description that was not text" in skip for skip in result.skips
+    ), result.skips
+
+
+def test_well_typed_output_records_no_leaf_type_skip(tmp_path, monkeypatch):
+    """The counterweight: the guard must not fire on the ordinary shape, or it
+    becomes a line on every run and nobody reads the list."""
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        b'{"dependencies":[{"name":"plainpkg","version":"1.0","vulns":'
+        b'[{"id":"X-8","fix_versions":["2.0"],"description":"plain"}]}]}'
+    )
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    findings = list_findings(conn)
+    assert [f.rule_id for f in findings] == ["X-8"]
+    assert "Fixed in 2.0." in findings[0].detail
+    assert not any("not text" in skip for skip in result.skips), result.skips
 
 
 # --- gate round 2: the skip/fail split, and pip-audit's availability ---------
@@ -695,20 +892,45 @@ def test_a_regressed_audit_target_fails_rather_than_skips(tmp_path, monkeypatch)
         _audit_or_skip(_ctx(tmp_path))
 
 
-def test_a_network_failure_still_skips(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        deps_module,
-        "_PIP_AUDIT_ARGV",
-        _fake_tool(
-            tmp_path,
-            "import sys\n"
-            "print('Max retries exceeded with url: /simple/requests/', "
-            "file=sys.stderr)\n"
-            "sys.exit(2)\n",
-        ),
+def _offline_tool(tmp_path: Path) -> tuple[str, ...]:
+    return _fake_tool(
+        tmp_path,
+        "import sys\n"
+        "print('Max retries exceeded with url: /simple/requests/', "
+        "file=sys.stderr)\n"
+        "sys.exit(2)\n",
     )
+
+
+def test_a_network_failure_skips_only_when_the_offline_opt_out_is_declared(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(_OFFLINE_OPT_OUT, "1")
+    monkeypatch.setattr(deps_module, "_PIP_AUDIT_ARGV", _offline_tool(tmp_path))
     (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
     with pytest.raises(Skipped, match="could not reach its index"):
+        _audit_or_skip(_ctx(tmp_path))
+
+
+def test_an_undeclared_offline_run_fails_rather_than_skipping(tmp_path, monkeypatch):
+    """The two real-tool tests are the entire proof of the ambient-environment
+    Critical. An offline runner made both skip, all four legs went green, and
+    nothing recorded that the proof was inert. A skip that can silently become
+    permanent on a host is not a passing test."""
+    monkeypatch.delenv(_OFFLINE_OPT_OUT, raising=False)
+    monkeypatch.setattr(deps_module, "_PIP_AUDIT_ARGV", _offline_tool(tmp_path))
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    with pytest.raises(Failed, match="regression proof for the ambient"):
+        _audit_or_skip(_ctx(tmp_path))
+
+
+def test_the_opt_out_must_be_exactly_one(tmp_path, monkeypatch):
+    """"0", "false", or an empty value are how people turn a flag OFF. Any of
+    them re-enabling the silent skip would put the hole straight back."""
+    monkeypatch.setenv(_OFFLINE_OPT_OUT, "0")
+    monkeypatch.setattr(deps_module, "_PIP_AUDIT_ARGV", _offline_tool(tmp_path))
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    with pytest.raises(Failed):
         _audit_or_skip(_ctx(tmp_path))
 
 
