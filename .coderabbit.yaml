@@ -1,0 +1,71 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-GB
+early_access: false
+
+reviews:
+  profile: assertive
+  request_changes_workflow: true
+  high_level_summary: true
+  review_status: true
+  poem: false
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    # Drafts are work in progress. Reviewing them burns review budget on code
+    # that is about to change and trains everyone to skim the comments. A PR
+    # gets reviewed when it is marked ready.
+    drafts: false
+    base_branches:
+      - main
+
+  path_instructions:
+    - path: "src/whetstone/**/*.py"
+      instructions: |
+        Whetstone is a tool that acts on other people's repositories, so a
+        defect here damages someone else's codebase. Review accordingly.
+
+        Hard invariants — flag any violation as blocking:
+        - Nothing under src/ may invoke `git merge`, `git push`, `gh pr merge`,
+          or any deploy tool. The tool has no merge command and no deploy
+          command by design; their absence is a feature, not an oversight.
+        - Writes must stay inside the resolved worktree. `never_touch` globs
+          and `.git/` are enforced in code, never merely requested in a prompt.
+        - Secrets are references (`${env:VAR}`), never literals. A config value
+          under a secret-shaped key holding a literal is a hard failure.
+        - Any code path that declines to do work must record a human-readable
+          reason that reaches the user. Silent truncation reads to the user as
+          a clean result and is treated as a defect here.
+        - A model's self-assessment is never trusted. Claims with a physical
+          referent are recomputed from the world, not from the model payload.
+
+        Compatibility:
+        - Python floor is 3.11. Flag `PurePath.full_match` (3.13+),
+          `itertools.batched` (3.12+), and any other newer-than-3.11 API.
+        - Windows-first and cross-platform. Flag POSIX-only assumptions,
+          hardcoded `/` separators, and anything that assumes a case-sensitive
+          filesystem.
+
+    - path: "tests/**/*.py"
+      instructions: |
+        Flag tests that assert nothing, that restate the implementation's own
+        constants rather than its behaviour, or that would pass if the
+        implementation were deleted. Flag fixtures encoding a data shape the
+        real system never produces — a long-green test built on a fictional
+        fixture locks in the illusion of correctness.
+
+        A skipped test is not a passing test. Flag any skip that could silently
+        become permanent on a given platform.
+
+    - path: ".github/workflows/**"
+      instructions: |
+        Flag any workflow step that could merge, deploy, publish a package, or
+        push to a protected branch. Flag secrets referenced but not scoped, and
+        third-party actions pinned by tag rather than commit SHA.
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+
+chat:
+  auto_reply: true

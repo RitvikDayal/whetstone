@@ -1,0 +1,8 @@
+# CodeRabbit reviews every pull request.
+#
+# Note: "required" review enforcement lives in branch protection, which needs
+# GitHub Pro on a private repo or for the repo to be public. Until then this
+# file requests the review; it cannot yet block a merge without it. See
+# scripts/protect-main.sh.
+
+* @coderabbitai

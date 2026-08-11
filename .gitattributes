@@ -1,0 +1,11 @@
+# Whetstone is developed on Windows and runs on Linux CI. Anything a shell or
+# a hook executes must be LF, or it fails on Linux with a confusing
+# "bad interpreter: /bin/sh^M".
+* text=auto eol=lf
+
+*.sh        text eol=lf
+.githooks/* text eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
