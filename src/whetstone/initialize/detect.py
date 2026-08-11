@@ -96,22 +96,38 @@ def _detect_node(root: Path, detection: Detection) -> None:
         return
 
     manager = "npm"
+    manager_evidence = "no Node lockfile found; assuming npm"
     for lockfile, name in _NODE_LOCKFILES.items():
         if (root / lockfile).is_file():
-            manager = name
-            detection.evidence["package_manager"] = f"found {lockfile}"
+            manager, manager_evidence = name, f"found {lockfile}"
             break
-    else:
-        detection.evidence["package_manager"] = (
-            "no Node lockfile found; assuming npm"
-        )
 
-    # Node wins the package_manager slot only when Python did not claim it.
-    if detection.package_manager is None or "python" not in detection.languages:
-        detection.package_manager = manager
-
-    detection.commands.setdefault("install", f"{manager} install")
+    node_commands = {"install": f"{manager} install"}
     # Never invent a script the project does not declare.
     for label in ("test", "lint", "build", "dev"):
         if label in scripts:
-            detection.commands[label] = f"{manager} {label}"
+            node_commands[label] = f"{manager} {label}"
+
+    if detection.package_manager is None:
+        # No other language has claimed the command slots yet, so Node's own
+        # commands are the ones that get verified and written.
+        detection.package_manager = manager
+        detection.evidence["package_manager"] = manager_evidence
+        detection.commands.update(node_commands)
+        return
+
+    # A polyglot repo: Python was detected first and already owns the single
+    # command slot per label (`CommandsConfig` has one `test`/`lint`/... field,
+    # not one per language). Writing Node's commands on top here would
+    # silently replace Python's with no trace, and setting
+    # evidence["package_manager"] would describe a value this branch did not
+    # produce -- the exact defect this function used to have. Record what was
+    # found and left unused instead of guessing which language's commands the
+    # user wants.
+    unused = ", ".join(f"{label} = `{cmd}`" for label, cmd in sorted(node_commands.items()))
+    detection.evidence["javascript_commands_unused"] = (
+        f"Node scripts found ({manager_evidence}) but not used: {unused}. "
+        f"{detection.package_manager} (Python) already claimed these command "
+        "slots -- a project can declare only one command per label today. Add "
+        "the Node commands to whetstone.yaml by hand if you need them."
+    )

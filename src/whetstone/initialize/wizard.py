@@ -22,10 +22,15 @@ from ..config.model import (
     ProjectConfig,
     WhetstoneConfig,
 )
-from ..doctor import run_command
+from ..doctor import _TIMEOUTS, run_command
 from .detect import Detection, detect_stack
 
-_VERIFY_TIMEOUT = 300
+# Per-label timeouts come from doctor._TIMEOUTS rather than a value copied
+# here. `doctor` and `init` verify the same commands; a second, differently
+# tuned timeout would let a legitimately slow install that `doctor` accepts
+# time out during `init` and be silently left out -- the two tools would then
+# disagree about the same command, which is exactly the confusion `init`
+# exists to prevent.
 
 # Paths that are almost always someone else's to change. Proposed, not imposed.
 _DEFAULT_NEVER_TOUCH = [
@@ -100,6 +105,7 @@ def run_wizard(
     if detection.commands:
         console.print("\n[bold]Verifying declared commands by running them...[/bold]")
         table = Table("command", "result", "detail")
+        stdin_closed = False
         for label, command in sorted(detection.commands.items()):
             if label == "dev":
                 # Long-running. Recorded but not launched -- M2 verifies it with
@@ -107,11 +113,27 @@ def run_wizard(
                 verified[label] = True
                 table.add_row(label, "recorded", "long-running; not launched")
                 continue
-            if not assume_yes and not _confirm(console, f"Run `{command}`?"):
-                verified[label] = False
-                table.add_row(label, "[yellow]skipped[/yellow]", "declined")
-                continue
-            result = run_command(label, command, project_root, _VERIFY_TIMEOUT)
+            if not assume_yes:
+                if stdin_closed:
+                    verified[label] = False
+                    table.add_row(label, "[yellow]skipped[/yellow]", "stdin closed; declined")
+                    continue
+                try:
+                    confirmed = _confirm(console, f"Run `{command}`?")
+                except EOFError:
+                    # No stdin to ask -- e.g. `init` run in CI or piped without
+                    # `--yes`. An unverified command is one the wizard already
+                    # leaves out, so a closed stdin is treated the same way as
+                    # a declined prompt rather than crashing with a traceback.
+                    stdin_closed = True
+                    verified[label] = False
+                    table.add_row(label, "[yellow]skipped[/yellow]", "stdin closed; declined")
+                    continue
+                if not confirmed:
+                    verified[label] = False
+                    table.add_row(label, "[yellow]skipped[/yellow]", "declined")
+                    continue
+            result = run_command(label, command, project_root, _TIMEOUTS[label])
             verified[label] = result.ok
             table.add_row(
                 label,
@@ -119,6 +141,11 @@ def run_wizard(
                 result.detail[:80],
             )
         console.print(table)
+        if stdin_closed:
+            console.print(
+                "[yellow]stdin is closed; remaining commands were declined "
+                "unattended. Pass --yes to verify automatically instead.[/yellow]"
+            )
 
     cfg = build_config(
         project_root, detection, name=project_root.name, verified=verified
@@ -153,6 +180,11 @@ def _print_detection(console: Console, detection: Detection) -> None:
     for label, command in sorted(detection.commands.items()):
         table.add_row(f"command: {label}", command, "from project manifest")
     console.print(table)
+    # A polyglot repo can detect commands it then does not use -- see
+    # detect.py's `_detect_node`. Told, not silently dropped.
+    for key, note in sorted(detection.evidence.items()):
+        if key.endswith("_commands_unused"):
+            console.print(f"[yellow]{note}[/yellow]")
 
 
 def _confirm(console: Console, question: str) -> bool:
