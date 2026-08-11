@@ -295,3 +295,224 @@ def test_a_lens_clearing_its_own_skips_cannot_erase_another_lenss(tmp_path, monk
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (result.run_id,)).fetchone()
     stored_skips = json.loads(row["skipped_json"])
     assert "honest: legitimate skip" in stored_skips
+
+
+# --- finding 6: boundaries, lens scope, and lazy file resolution -------------
+
+
+class _ProjectScoped:
+    """Reads fixed artifacts, never ctx.files."""
+
+    name = "wide"
+    max_autonomy = 3
+    scope = "project"
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        return
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
+class _HighAndLow:
+    """One candidate per severity, for the severity_floor tests."""
+
+    name = "graded"
+    max_autonomy = 3
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        for rule, severity in (("LOW", Severity.low), ("HIGH", Severity.high)):
+            yield Candidate(
+                lens="graded",
+                rule_id=rule,
+                subject=f"{rule}.py",
+                title="t",
+                detail="d",
+                severity=severity,
+                evidence=Evidence(EvidenceKind.metric, "s", {}),
+            )
+
+
+def _boom_resolve(*args, **kwargs):
+    raise AssertionError("resolve_files must not run for a project-scoped run")
+
+
+def test_a_project_scoped_run_does_not_resolve_files(tmp_path, monkeypatch):
+    """resolve_files gates the whole run, so a non-git project died before any
+    lens started -- even though the only lens shipped today needs no files."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", _boom_resolve)
+    register(_ProjectScoped())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(wide={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert result.file_count == 0
+    assert any(
+        "file resolution was not performed" in skip for skip in result.skips
+    ), result.skips
+
+
+def test_a_file_scoped_lens_still_resolves_files(tmp_path, monkeypatch):
+    """The laziness must not become a way to skip resolution when it matters."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: (Path("a"),))
+    register(_Stub())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert result.file_count == 1
+    assert not any("file resolution" in skip for skip in result.skips)
+
+
+def test_a_project_scoped_lens_reports_that_it_ignored_boundaries(
+    tmp_path, monkeypatch
+):
+    """`exclude: ["coverage.xml"]` still produced a finding about coverage.xml
+    and nothing said the pattern had no effect."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", _boom_resolve)
+    register(_ProjectScoped())
+    conn = connect(tmp_path)
+    cfg = _cfg(wide={})
+    cfg.boundaries.exclude = ["coverage.xml"]
+    result = execute_run(
+        conn, cfg, tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert any(
+        "wide" in skip and "did NOT narrow" in skip for skip in result.skips
+    ), result.skips
+
+
+def test_default_boundaries_do_not_produce_a_noise_line(tmp_path, monkeypatch):
+    """A skip list full of known-true, known-useless lines is one nobody
+    reads."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", _boom_resolve)
+    register(_ProjectScoped())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(wide={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert not any("did NOT narrow" in skip for skip in result.skips)
+
+
+def test_a_disabled_project_scoped_lens_is_not_reported_as_ignoring_boundaries(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_ProjectScoped())
+    conn = connect(tmp_path)
+    cfg = _cfg(wide={"enabled": False})
+    cfg.boundaries.exclude = ["coverage.xml"]
+    result = execute_run(
+        conn, cfg, tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert not any("did NOT narrow" in skip for skip in result.skips)
+
+
+# --- finding 5: severity_floor was validated and read by nothing -------------
+
+
+def test_severity_floor_suppresses_and_says_so(tmp_path, monkeypatch):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_HighAndLow())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn,
+        _cfg(graded={"severity_floor": "high"}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+    assert result.new == 1
+    assert [f.rule_id for f in list_findings(conn)] == ["HIGH"]
+    assert any(
+        "severity_floor" in skip and "suppressed 1" in skip for skip in result.skips
+    ), result.skips
+
+
+def test_no_severity_floor_records_everything(tmp_path, monkeypatch):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_HighAndLow())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(graded={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert result.new == 2
+    assert not any("severity_floor" in skip for skip in result.skips)
+
+
+# --- finding 5: the config path, end to end, with no hand-built RunContext ---
+
+
+def test_a_configured_coverage_floor_reaches_the_detector(tmp_path):
+    """Proof through the real path: YAML -> load_config -> execute_run ->
+    detector -> stored finding. Nothing here builds a RunContext by hand.
+
+    The floor used to be unreachable in production from both directions.
+    LensConfig forbade the key, so writing it made the config fail to load;
+    not writing it left the floor pinned at the 60 default. 70% coverage is
+    above that default and below the 80 configured here, so a finding at all
+    is only possible if the configured value arrived.
+    """
+    from whetstone.config.loader import load_config
+
+    (tmp_path / "coverage.xml").write_text(
+        '<?xml version="1.0"?><coverage line-rate="0.70" version="7.0"/>',
+        encoding="utf-8",
+    )
+    (tmp_path / "whetstone.yaml").write_text(
+        "version: 1\n"
+        "project:\n"
+        "  name: demo\n"
+        "lenses:\n"
+        "  hygiene:\n"
+        "    only: [coverage]\n"
+        "    options:\n"
+        "      coverage_floor: 80\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(tmp_path / "whetstone.yaml")
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, cfg, tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+
+    assert result.new == 1
+    findings = list_findings(conn)
+    assert [f.rule_id for f in findings] == ["coverage-below-floor"]
+    assert findings[0].evidence["data"]["floor"] == 80
+    assert "80% floor" in findings[0].title
+
+
+def test_without_the_option_the_default_floor_still_applies(tmp_path):
+    """The other half: 70% is above the 60 default, so silence here is what
+    proves the previous test measured the configured value and not a
+    permanently-failing check."""
+    from whetstone.config.loader import load_config
+
+    (tmp_path / "coverage.xml").write_text(
+        '<?xml version="1.0"?><coverage line-rate="0.70" version="7.0"/>',
+        encoding="utf-8",
+    )
+    (tmp_path / "whetstone.yaml").write_text(
+        "version: 1\n"
+        "project:\n"
+        "  name: demo\n"
+        "lenses:\n"
+        "  hygiene:\n"
+        "    only: [coverage]\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(tmp_path / "whetstone.yaml")
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, cfg, tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert result.new == 0
+    assert list_findings(conn) == []
