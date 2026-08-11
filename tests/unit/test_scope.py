@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from whetstone.config.model import BoundariesConfig
+from whetstone.errors import GitError
 from whetstone.scope.resolver import is_write_forbidden, resolve_files
 
 
@@ -81,6 +82,75 @@ def test_changed_only_narrows_to_the_diff(repo):
 
 
 def test_results_are_sorted_and_deterministic(repo):
-    first = resolve_files(repo, BoundariesConfig())
-    second = resolve_files(repo, BoundariesConfig())
-    assert first == second == tuple(sorted(first))
+    """Pins the canonical POSIX-string order, not just idempotency.
+
+    Sorting bare `Path` objects case-folds on Windows and compares byte-wise on
+    POSIX, so `sorted(first)` re-run on already-sorted output would pass either
+    way. This asserts the exact expected sequence for mixed-case names, which
+    fails under case-folded ordering.
+    """
+    for rel in ["Zebra.py", "apple.py", "Beta.py"]:
+        (repo / rel).write_text("x", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add mixed-case files", "--no-gpg-sign")
+    boundaries = BoundariesConfig(include=["/Zebra.py", "/apple.py", "/Beta.py"])
+
+    first = resolve_files(repo, boundaries)
+    second = resolve_files(repo, boundaries)
+
+    assert first == second == (Path("Beta.py"), Path("Zebra.py"), Path("apple.py"))
+
+
+def _make_orphan_branch(repo: Path) -> None:
+    """A branch with no shared history with `main` — `merge-base` has nothing to find."""
+    _git(repo, "checkout", "--orphan", "feature")
+    _git(repo, "rm", "-rf", "--cached", ".")
+    (repo / "b.py").write_text("y", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "orphan", "--no-gpg-sign")
+
+
+def test_changed_only_raises_when_orphan_branch_has_clean_tree(repo):
+    """No common ancestor + clean tree used to silently resolve to zero files."""
+    _make_orphan_branch(repo)
+    with pytest.raises(GitError, match="main"):
+        resolve_files(
+            repo,
+            BoundariesConfig(include=["**/*"]),
+            changed_only=True,
+            base_branch="main",
+        )
+
+
+def test_changed_only_raises_when_orphan_branch_has_dirty_tree(repo):
+    """Same missing-ancestor case, but with uncommitted changes present."""
+    _make_orphan_branch(repo)
+    (repo / "b.py").write_text("dirty", encoding="utf-8")
+    with pytest.raises(GitError, match="main"):
+        resolve_files(
+            repo,
+            BoundariesConfig(include=["**/*"]),
+            changed_only=True,
+            base_branch="main",
+        )
+
+
+def test_changed_only_raises_when_base_branch_is_absent(repo):
+    with pytest.raises(GitError, match="does-not-exist"):
+        resolve_files(
+            repo,
+            BoundariesConfig(include=["**/*"]),
+            changed_only=True,
+            base_branch="does-not-exist",
+        )
+
+
+def test_deleted_tracked_files_are_filtered_out(repo):
+    """A file removed from the working tree but still in the index has nothing
+    to read. It is dropped from the analysis set -- whether it was deleted
+    independently or as part of the change under review, there is no content
+    left for a lens to open."""
+    (repo / "src" / "app.py").unlink()
+    files = resolve_files(repo, BoundariesConfig(include=["src/**"]))
+    assert Path("src/app.py") not in files
+    assert Path("src/generated/schema.py") in files
