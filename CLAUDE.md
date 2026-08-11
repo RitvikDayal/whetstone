@@ -14,15 +14,18 @@ Design and plans live in the vault, not here:
 
 - **Never push to `main`.** `.githooks/pre-push` refuses it. Enable the hook with
   `git config core.hooksPath .githooks`. Work goes on a branch and lands via PR.
-- **CodeRabbit does not review drafts.** Open the PR as a draft, finish the work,
-  then mark it ready. That is the signal to review.
-- **Every CodeRabbit comment gets taken seriously.** Disagree in the thread with a
-  reason; never dismiss one silently.
-- **Run an adversarial review locally before marking a PR ready.** The point is to
-  find what CodeRabbit would find, before it has to.
-- **Merge once CodeRabbit reports no remaining issues and CI is green on all four
-  legs.** Both conditions, not either. A clean review over red CI is not a pass.
-  Squash merge, delete the branch.
+- **CodeRabbit cannot run while this repo is private.** Its config and the
+  CODEOWNERS entry are in place and take effect the day the repo goes public.
+  Until then it is not part of the gate, and nothing should wait on it.
+- **The merge gate is: adversarial review clean, and CI green on all four legs.**
+  Both, not either. A clean review over red CI is not a pass. Squash merge,
+  delete the branch.
+- **Run the adversarial review before marking a PR ready.** It is the gate now,
+  not a warm-up for someone else's. Give it the whole branch diff and tell it to
+  assume the work is flawed. It has already caught a critical secret leak that two
+  per-task reviews passed.
+- **When CodeRabbit is live, every comment gets taken seriously.** Disagree in the
+  thread with a reason; never dismiss one silently.
 - **Write PR descriptions with the `humanizer` skill.** Brief, plain, and
   readable. No bolded-header bullet lists, no rule-of-three, no em dashes.
 - **Nothing under `src/` may invoke** `git merge`, `git push`, `gh pr merge`, or
