@@ -177,7 +177,12 @@ def test_coverage_floor_zero_is_rejected(tmp_path):
     )
     ctx = _ctx(tmp_path, coverage_floor=0)
     assert list(CoverageDetector().detect(ctx)) == []
-    assert any("coverage_floor" in skip and "0" in skip for skip in ctx.skips)
+    # `"0" in skip` also matched the 0 inside "100" in the same sentence, so
+    # the assertion passed on any reported value, including a wrong one. The
+    # siblings use -5 and 150, which are distinctive; only 0 needed delimiting.
+    assert any(
+        "coverage_floor" in skip and "out of range (0)" in skip for skip in ctx.skips
+    ), ctx.skips
 
 
 def test_coverage_floor_over_100_is_rejected(tmp_path):
@@ -389,3 +394,83 @@ def test_coverage_xml_without_a_line_rate_skips_loudly(tmp_path):
     ctx = _ctx(tmp_path, coverage_floor=60)
     assert list(CoverageDetector().detect(ctx)) == []
     assert any("unreadable" in skip for skip in ctx.skips), ctx.skips
+
+
+def test_an_oserror_reading_the_artifact_is_the_detectors_own_message(
+    tmp_path, monkeypatch
+):
+    """`_find_artifact` proves the path is a file; the open happens after. A
+    delete, a permission error, or a Windows share-lock in between raises
+    OSError, which the handler did not catch -- the user then read pack.py's
+    generic "raised PermissionError" instead of a sentence about coverage."""
+    import whetstone.lenses.hygiene.detectors.coverage as coverage_module
+
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.72"), encoding="utf-8"
+    )
+
+    def _denied(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(coverage_module.ElementTree, "parse", _denied)
+    ctx = _ctx(tmp_path, coverage_floor=60)
+    assert list(CoverageDetector().detect(ctx)) == []
+    assert any(
+        skip.startswith("hygiene/coverage:") and "unreadable" in skip
+        for skip in ctx.skips
+    ), ctx.skips
+
+
+# --- CodeRabbit round: rounding must not loosen the floor -------------------
+
+
+def test_the_measurement_is_compared_unrounded(tmp_path):
+    """59.9999% is below a floor of 60. Rounding the measurement to 2 decimals
+    before the comparison turned it into 60.0 and passed -- the floor above is
+    deliberately not truncated for exactly this reason, and rounding the other
+    side of the comparison handed the loosening back."""
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.599999"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=60)
+    found = list(CoverageDetector().detect(ctx))
+    assert len(found) == 1, ctx.skips
+    # Display still rounds: the sentence a human reads says 60.0%, and the
+    # finding exists because the unrounded value did not clear the floor.
+    assert found[0].evidence.data["measured"] == 60.0
+
+
+def test_a_measurement_exactly_on_the_floor_still_passes(tmp_path):
+    """The other half: exact equality is not a failure, so the unrounded
+    comparison must not turn a clean project into a finding."""
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.60"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=60)
+    assert list(CoverageDetector().detect(ctx)) == []
+    assert ctx.skips == []
+
+
+# --- CodeRabbit round: an `only` entry that names no detector ---------------
+
+
+def test_an_only_entry_matching_no_detector_is_reported(tmp_path):
+    """`only: [covrage]` disabled both detectors, and each skip line said it
+    was "not in `only`" -- all true, none of them the reason. The config read
+    as applied while it had selected nothing at all."""
+    ctx = _ctx(tmp_path, only=["covrage"])
+    assert list(HygienePack().run(ctx)) == []
+    assert any(
+        "no such detector" in skip and "covrage" in skip for skip in ctx.skips
+    ), ctx.skips
+    # The known ids have to be in the sentence, or the user is told they were
+    # wrong without being told what right looks like.
+    assert any("coverage" in skip and "deps" in skip for skip in ctx.skips), ctx.skips
+
+
+def test_a_valid_only_entry_records_no_unmatched_warning(tmp_path):
+    """The guard must not fire on a correct config, or it becomes a line
+    everybody learns to scroll past."""
+    ctx = _ctx(tmp_path, only=["coverage"], coverage_floor=60)
+    list(HygienePack().run(ctx))
+    assert not any("no such detector" in skip for skip in ctx.skips), ctx.skips

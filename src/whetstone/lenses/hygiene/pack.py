@@ -29,6 +29,19 @@ class HygienePack:
 
     def run(self, ctx: RunContext) -> Iterator[Candidate]:
         only = ctx.lens_options.get("only")
+        if only is not None:
+            # `only: [covrage]` disabled both detectors and each said it was
+            # "not in `only`" -- every line true, and none of them the reason.
+            # The config read as applied while it had selected nothing. Same
+            # silent-no-match shape as issue #10.
+            known = {detector.id for detector in DETECTORS}
+            unknown = [requested for requested in only if requested not in known]
+            if unknown:
+                ctx.skip(
+                    f"hygiene: `only` names no such detector "
+                    f"({', '.join(unknown)}); known detectors are "
+                    f"{', '.join(detector.id for detector in DETECTORS)}."
+                )
         for detector in DETECTORS:
             if only is not None and detector.id not in only:
                 ctx.skip(

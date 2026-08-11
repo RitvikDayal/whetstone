@@ -74,14 +74,26 @@ class CoverageDetector:
             return
 
         try:
+            # OSError too: `_find_artifact` proved the path was a file, and the
+            # open happens after. Deleted in between, locked by the test runner
+            # still writing it, or unreadable -- ElementTree raises OSError, and
+            # without this the user reads pack.py's generic "raised
+            # PermissionError" instead of the detector's own sentence.
             rate = float(ElementTree.parse(artifact).getroot().attrib["line-rate"])
-        except (ElementTree.ParseError, KeyError, ValueError) as exc:
+        except (OSError, ElementTree.ParseError, KeyError, ValueError) as exc:
             ctx.skip(f"hygiene/coverage: {artifact.name} is unreadable ({exc}).")
             return
 
-        measured = round(rate * 100, 2)
-        if measured >= floor:
+        # Compared unrounded. Rounding first moves the measurement in the
+        # loosening direction: line-rate 0.599999 becomes 60.0 and clears a
+        # floor of 60 that real coverage is below. The floor above is
+        # deliberately not truncated for the same reason; rounding the other
+        # side of the comparison gave the loosening back. The rounded value is
+        # for display only.
+        exact = rate * 100
+        if exact >= floor:
             return
+        measured = round(exact, 2)
 
         floor_display = f"{floor:g}"  # 60.0 -> "60", 59.9 -> "59.9"
         yield Candidate(
