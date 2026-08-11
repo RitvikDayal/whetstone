@@ -83,7 +83,18 @@ def kill_tree(proc: subprocess.Popen) -> None:
                 timeout=REAP_SECONDS,
             )
         else:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            group = os.getpgid(proc.pid)
+            # `new_group()` puts the child in a session of its own, so this is
+            # the child's group. A caller that built `Popen` without
+            # `**new_group()` -- or a `start_new_session` the platform did not
+            # honour -- leaves the child in OUR group, and `killpg` then sends
+            # SIGKILL to Whetstone itself, mid-run, with no traceback and no
+            # findings written. The helper is package-public and the invariant
+            # was documented rather than enforced. Fall through to the
+            # direct-child kill in `finally`, which is the correct action for a
+            # child that has no group of its own anyway.
+            if group != os.getpgid(0):
+                os.killpg(group, signal.SIGKILL)
     except (OSError, subprocess.SubprocessError):
         # Already gone, or the platform refused. Fall through to the direct
         # child so the caller is never left waiting on a live process.
