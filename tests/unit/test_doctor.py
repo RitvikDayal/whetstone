@@ -27,14 +27,20 @@ def test_successful_command_passes(tmp_path):
 
 
 def test_failing_command_fails_with_output(tmp_path):
-    result = run_command(
-        "probe",
-        f'"{sys.executable}" -c "import sys; sys.stderr.write(\'boom\'); sys.exit(3)"',
-        tmp_path,
-        30,
+    """The assertion here used to be `"boom" in detail or "3" in detail`, and
+    `detail` opens with the command string itself -- which contains the literal
+    `boom` and the literal `3`. Both operands were satisfied by the echo before
+    the implementation contributed anything. Deleting the `tail` computation in
+    `run_command` left it green. Assert against the detail with the echoed
+    command removed, so only what the implementation ADDED can satisfy it."""
+    command = (
+        f'"{sys.executable}" -c "import sys; sys.stderr.write(\'kaboom\'); sys.exit(3)"'
     )
+    result = run_command("probe", command, tmp_path, 30)
     assert result.ok is False
-    assert "boom" in result.detail or "3" in result.detail
+    reported = result.detail.replace(f"`{command}`", "")
+    assert "exited 3" in reported, result.detail
+    assert "kaboom" in reported, result.detail
 
 
 def test_timeout_is_a_failure_not_a_hang(tmp_path):
@@ -230,12 +236,31 @@ def test_declared_commands_are_actually_executed(tmp_path):
     assert by_name["command: test"].skipped is False
 
 
-def test_dev_command_is_not_executed(tmp_path):
-    """`dev` starts a long-running server; doctor must not launch it."""
+def test_dev_command_is_not_executed(tmp_path, monkeypatch):
+    """`dev` starts a long-running server; doctor must not launch it.
+
+    `skipped is True` alone does not say that. A `run_doctor` that launched the
+    command and then still reported `skipped=True` passed it; the only thing
+    catching a real launch was the 600-second sleep turning the suite into a
+    hang, which is a timing accident and not an assertion. Record the spawns.
+    `run_doctor` reaches no other subprocess on this config -- the git check
+    uses `shutil.which` and a `.exists()` -- so any spawn at all is `dev`.
+    """
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class _RecordingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+
     cfg = _cfg(dev=f'"{sys.executable}" -c "import time; time.sleep(600)"')
     results = run_doctor(cfg, tmp_path, tmp_path)
     by_name = {r.name: r for r in results}
     assert by_name["command: dev"].skipped is True
+    assert not spawned, "doctor launched a process for a config declaring only `dev`"
 
 
 def test_state_path_check_is_present(tmp_path):

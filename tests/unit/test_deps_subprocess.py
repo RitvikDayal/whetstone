@@ -391,12 +391,13 @@ def test_timeout_is_bounded_when_a_grandchild_holds_the_pipe(tmp_path, monkeypat
 
 
 def test_the_bound_still_holds_when_the_kill_does_not_take(tmp_path, monkeypatch):
-    """`_run_pip_audit` has the same shape doctor.run_command had: the recovery
-    branch leaves the `with subprocess.Popen(...)` block, and `Popen.__exit__`
+    """`_run_pip_audit` had the same shape doctor.run_command had: the recovery
+    branch left the `with subprocess.Popen(...)` block, and `Popen.__exit__`
     ends in a bare unbounded `self.wait()` for every exit that is not
     KeyboardInterrupt. `kill_and_reap` being bounded does not make the CALLER
     bounded, and a kill that takes hides the difference entirely -- which is
-    why the existing timeout test above passes either way.
+    why the existing timeout test above passes either way. This test pins the
+    bound on the caller, so the `with` cannot come back unnoticed.
     """
     spawned: list[subprocess.Popen] = []
     real_popen = subprocess.Popen
@@ -458,7 +459,13 @@ def test_a_successful_audit_leaves_no_open_pipes(tmp_path, monkeypatch):
     )
     (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
 
-    assert list(DepsDetector().detect(_ctx(tmp_path))) == []
+    ctx = _ctx(tmp_path)
+    assert list(DepsDetector().detect(ctx)) == []
+    # `[]` is also what a FAILED audit yields, and `close_pipes` runs on the
+    # parse-failure path too, so every assertion below held whether or not this
+    # test exercised the success path its name claims. The skip list is the only
+    # thing that tells the two apart.
+    assert not ctx.skips, ctx.skips
 
     assert spawned, "_run_pip_audit did not spawn a process"
     proc = spawned[0]
