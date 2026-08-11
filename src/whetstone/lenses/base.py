@@ -21,6 +21,44 @@ from ..severity import Severity as Severity
 from ..severity import severity_at_least as severity_at_least
 
 
+class LensScope(StrEnum):
+    """Whether a lens is narrowed by `boundaries`, or reads fixed artifacts.
+
+    `file` means the lens works from `RunContext.files`, so
+    `boundaries.include` and `boundaries.exclude` decide what it examines.
+    `project` means it reads paths it picks itself -- coverage.xml, a
+    dependency manifest -- and those patterns do not apply to it.
+
+    The distinction is not cosmetic: a user who writes
+    `exclude: ["coverage.xml"]` and still gets a finding about coverage.xml
+    has been told something false by silence.
+    """
+
+    file = "file"
+    project = "project"
+
+
+def lens_scope(pack: LensPack) -> LensScope:
+    """A pack's declared scope, defaulting to file-scoped.
+
+    Deliberately NOT a member of the `LensPack` protocol. `runtime_checkable`
+    isinstance() checks every protocol attribute, so requiring `scope` there
+    would make `register()` reject every pack written before this existed --
+    including third-party ones already installed.
+
+    The default is `file` rather than `project` because the two failure modes
+    are not symmetric. Defaulting to `project` puts a "this lens ignored your
+    boundaries" line on every honest file-scoped lens, and a report full of
+    known-false lines is one nobody reads. Defaulting to `file` costs one
+    missing advisory line for a project-scoped pack whose author did not
+    declare it.
+    """
+    try:
+        return LensScope(getattr(pack, "scope", LensScope.file))
+    except ValueError:
+        return LensScope.file
+
+
 class EvidenceKind(StrEnum):
     metric = "metric"      # a measured value crossing a threshold
     repro = "repro"        # an executable artifact that fails before, passes after
@@ -98,6 +136,23 @@ class RunContext:
     lens_options: dict[str, Any]
     run_id: str
     skips: list[str] = field(default_factory=list)
+
+    @property
+    def options(self) -> dict[str, Any]:
+        """Pack-specific options, from `lenses.<name>.options` in the config.
+
+        Spine keys -- `enabled`, `autonomy`, `trust`, `only`, `severity_floor`
+        -- stay at the top level of `lens_options` and are typed by
+        `LensConfig`. Anything a pack invents lives in here instead, because
+        `LensConfig` forbids extra keys (that is what makes a typo in a spine
+        key fail loudly) and cannot possibly enumerate the vocabulary of a
+        third-party lens installed through the entry point.
+
+        Returns an empty mapping when the key is absent or the wrong shape, so
+        a detector can always call `.get()` on it.
+        """
+        value = self.lens_options.get("options")
+        return value if isinstance(value, dict) else {}
 
     def skip(self, reason: str) -> None:
         """Record work not done. A skip that is not reported is a bug."""
