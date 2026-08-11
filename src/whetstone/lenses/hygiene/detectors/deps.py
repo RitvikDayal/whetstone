@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import signal
 import subprocess
 import tomllib
@@ -52,20 +53,64 @@ class _AuditPlan:
     source: str
 
 
-def _declares_pep621_project(path: Path) -> bool:
-    """True when *path* has a `[project]` table pip-audit can resolve.
+def _pyproject_state(path: Path) -> str:
+    """Classify a pyproject.toml: "declares", "no-project", or "unreadable".
 
-    A pyproject.toml holding nothing but `[tool.ruff]` is extremely common and
+    A pyproject holding nothing but `[tool.ruff]` is extremely common and
     declares no dependencies at all; pip-audit refuses it with "pyproject file
-    does not contain `project` section". Checking here lets a project like that
+    does not contain `project` section". Recognising that lets such a project
     fall through to requirements.txt instead of failing.
+
+    "unreadable" is kept separate from "no-project" because they are different
+    problems with different fixes, and reporting a broken file as a missing
+    table sends the user looking in the wrong place.
     """
     try:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError):
-        return False
-    return isinstance(data.get("project"), dict)
+        return "unreadable"
+    return "declares" if isinstance(data.get("project"), dict) else "no-project"
+
+
+# Text that cannot be encoded as UTF-8, so it cannot be stored, printed, or
+# acted on. `errors="surrogateescape"` above is what keeps a non-UTF-8 byte
+# from killing the reader thread, but decoding is only half the job: the
+# resolver pairs it with a containment check (scope/resolver.py:29) precisely
+# so surrogates never travel downstream. This detector had the decode and not
+# the guard, so a bad byte inside a package name or an advisory description
+# reached sqlite as a lone surrogate and killed the whole run with
+# UnicodeEncodeError -- from `runner.upsert`, which is outside the
+# per-detector guard in pack.py and so was not caught by it.
+#
+# Wider than the resolver's `[\udc80-\udcff]` on purpose. That range is exactly
+# what surrogateescape produces from bytes. This input is JSON, which can also
+# carry an explicit `\ud800` escape that json.loads decodes into a lone
+# surrogate without any byte ever being malformed.
+#
+# The right long-term home for this is `Evidence`/`Candidate` refusing
+# unstorable text at construction, so every lens inherits it instead of each
+# one remembering -- see issue #14. Until then this is the second copy, and
+# the comment above names the first.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _unstorable(value: object) -> bool:
+    """True when *value* holds text UTF-8 cannot represent."""
+    if isinstance(value, str):
+        return _SURROGATE.search(value) is not None
+    if isinstance(value, (list, tuple)):
+        return any(_unstorable(item) for item in value)
+    return False
+
+
+def _storable(text: str) -> str:
+    """Replace unencodable characters with a visible escape.
+
+    `backslashreplace` rather than `replace`: `caf\\udce9` says which byte was
+    lost, where `caf?` throws that away too.
+    """
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _plan_audit(project_root: Path) -> _AuditPlan | str:
@@ -79,12 +124,20 @@ def _plan_audit(project_root: Path) -> _AuditPlan | str:
     """
     pyproject = project_root / _PYPROJECT
     requirements = project_root / _REQUIREMENTS
+    state = _pyproject_state(pyproject) if pyproject.is_file() else "absent"
 
-    if pyproject.is_file() and _declares_pep621_project(pyproject):
+    if state == "declares":
         return _AuditPlan([os.fspath(project_root)], _PYPROJECT)
     if requirements.is_file():
         return _AuditPlan(["-r", os.fspath(requirements)], _REQUIREMENTS)
-    if pyproject.is_file():
+    if state == "unreadable":
+        return (
+            f"hygiene/deps: {_PYPROJECT} could not be parsed as TOML, so the "
+            "dependencies it declares could not be read, and no requirements.txt "
+            "is present. Advisories were NOT checked. Fix the file or add a "
+            "requirements.txt."
+        )
+    if state == "no-project":
         return (
             f"hygiene/deps: {_PYPROJECT} has no [project] table, so it declares "
             "no dependencies pip-audit can resolve, and no requirements.txt is "
@@ -158,6 +211,11 @@ def _run_pip_audit(project_root: Path, args: list[str]) -> str:
         # the gate below reads as success, and json.loads(None) raises TypeError
         # rather than the JSONDecodeError the caller catches. scope/resolver.py
         # documents the same defect; this call site did not inherit the fix.
+        #
+        # Decoding is only half of it. Surrogates that survive the decode are
+        # contained before they leave `detect()` -- see `_SURROGATE`. Porting
+        # the decode without the containment just moves the crash from
+        # json.loads to sqlite.
         errors="surrogateescape",
         **_new_group(),
     )
@@ -248,6 +306,20 @@ class DepsDetector:
             name = dependency.get("name", "unknown")
             version = dependency.get("version", "unknown")
 
+            # Identity and remedy have to be representable or the finding is
+            # not one anybody can act on: you cannot `pip install --upgrade` a
+            # name you cannot type, and `subject` feeds the dedupe key. Drop
+            # the whole entry and say so, rather than storing text that kills
+            # the run three frames later inside `upsert`.
+            if _unstorable(name) or _unstorable(version):
+                ctx.skip(
+                    "hygiene/deps: pip-audit reported a dependency whose name "
+                    f"or version is not valid UTF-8 (name={ascii(name)}, "
+                    f"version={ascii(version)}). It cannot be stored or acted "
+                    "on, so its advisories were NOT recorded."
+                )
+                continue
+
             # pip-audit reports a dependency it declined to audit as a
             # `skip_reason` and NO `vulns` key at all, so `.get("vulns", [])`
             # yielded an empty list and the entry vanished. Every editable
@@ -259,7 +331,7 @@ class DepsDetector:
             if skip_reason:
                 ctx.skip(
                     f"hygiene/deps: pip-audit declined to audit {name}: "
-                    f"{skip_reason}"
+                    f"{_storable(str(skip_reason))}"
                 )
                 continue
 
@@ -280,7 +352,35 @@ class DepsDetector:
                     )
                     continue
 
+                advisory = vuln.get("id", "unknown-advisory")
                 fixes = vuln.get("fix_versions") or []
+
+                # Same rule as the package name: the advisory id is the finding's
+                # identity and the fix versions are the remedy, so neither can be
+                # text nobody can store or type.
+                if _unstorable(advisory) or _unstorable(fixes):
+                    ctx.skip(
+                        f"hygiene/deps: {name} has an advisory whose id or fix "
+                        f"versions are not valid UTF-8 (id={ascii(advisory)}); "
+                        "it was NOT recorded."
+                    )
+                    continue
+
+                description = vuln.get("description", "No description provided.")
+                if _unstorable(description):
+                    # Unlike identity, prose is not what the user acts on. A
+                    # real advisory is not worth discarding over one bad byte in
+                    # its text, so the text is escaped and the substitution is
+                    # reported -- the stored detail is then not verbatim what
+                    # the tool emitted, and that has to be said out loud.
+                    ctx.skip(
+                        f"hygiene/deps: {name} advisory {advisory} has a "
+                        "description containing bytes that are not valid UTF-8. "
+                        "The finding was recorded with those bytes escaped, so "
+                        "its description is not verbatim."
+                    )
+                    description = _storable(description)
+
                 fix_text = (
                     f"Fixed in {', '.join(fixes)}."
                     if fixes
@@ -288,21 +388,18 @@ class DepsDetector:
                 )
                 yield Candidate(
                     lens="hygiene",
-                    rule_id=vuln.get("id", "unknown-advisory"),
+                    rule_id=advisory,
                     subject=name,
-                    title=f"{name} {version} has advisory {vuln.get('id', '?')}",
-                    detail=(
-                        f"{vuln.get('description', 'No description provided.')}\n"
-                        f"{fix_text}"
-                    ),
+                    title=f"{name} {version} has advisory {advisory}",
+                    detail=f"{description}\n{fix_text}",
                     severity=Severity.high,
                     evidence=Evidence(
                         kind=EvidenceKind.metric,
-                        summary=f"pip-audit advisory {vuln.get('id', '?')}",
+                        summary=f"pip-audit advisory {advisory}",
                         data={
                             "package": name,
                             "installed": version,
-                            "advisory": vuln.get("id"),
+                            "advisory": advisory,
                             "fix_versions": fixes,
                             # Which manifest the audit actually resolved. The
                             # defect this replaces was invisible precisely

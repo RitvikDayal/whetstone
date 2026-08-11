@@ -6,12 +6,17 @@ Nothing here patches `_run_pip_audit`. The tests either run the installed
 pip-audit or point `_PIP_AUDIT_ARGV` at a script whose output shape we control,
 so Popen, the encoding, the timeout, the kill, and the return-code gate all run.
 
-Cases the host cannot support -- pip-audit not installed, no network -- skip
-with a reason rather than failing.
+pip-audit itself is a declared dev dependency, so it is present whenever the
+suite runs properly. Its ABSENCE fails rather than skips: a regression test that
+silently never runs is the mechanism that let the ambient-environment defect
+through three reviews. Only a genuine index or network failure skips, and
+`_is_environment_failure` is what keeps that line from widening back out into
+"anything that went wrong".
 """
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -19,15 +24,53 @@ import time
 from pathlib import Path
 
 import pytest
+from _pytest.outcomes import Failed, Skipped
 
 from whetstone.lenses.base import RunContext
 from whetstone.lenses.hygiene.detectors import deps as deps_module
 from whetstone.lenses.hygiene.detectors.deps import DepsDetector
 
-# Installed in pip-audit's own environment, never in the demo projects below.
-# If one of these is flagged, the ambient interpreter was audited instead of
-# the project -- the exact defect this file exists to pin down.
-AMBIENT_ONLY = frozenset({"pip-audit", "cyclonedx-python-lib", "boolean-py", "pip-api"})
+# Present in the environment the tests run in -- pip-audit is a dev dependency,
+# so it shares this venv -- and never declared by the demo projects below. If
+# one of these is flagged, the ambient interpreter was audited instead of the
+# project, which is the exact defect this file exists to pin down.
+#
+# Deliberately excludes requests, urllib3, idna, certifi and packaging: pip-audit
+# depends on those too, so they appear on both sides and prove nothing.
+AMBIENT_ONLY = frozenset(
+    {
+        "pip-audit",
+        "cyclonedx-python-lib",
+        "boolean-py",
+        "pip-api",
+        "pytest",
+        "ruff",
+        "typer",
+        "pydantic",
+        "pathspec",
+        "jinja2",
+        "whetstone-cli",
+    }
+)
+
+# pip-audit reaching neither PyPI nor OSV is a property of the host, not of
+# Whetstone, and skipping is the honest response. Anything else -- a bad argv, a
+# target that does not exist, an option the tool rejects -- is a Whetstone-side
+# regression and must fail. Getting this line wrong turns the regression test
+# for the Critical back into a test that quietly never runs.
+_ENVIRONMENT_FAILURE = re.compile(
+    r"timed out|timeout|connection|network|temporary failure|name resolution|"
+    r"getaddrinfo|max retries|failed to establish|ssl|certificate|proxy|"
+    r"no matching distribution|could not find a version|"
+    r"\b50[234]\b|\btemporarily unavailable\b",
+    re.IGNORECASE,
+)
+
+
+def _is_environment_failure(skip_text: str) -> bool:
+    """True when a pip-audit failure is the host's fault, not Whetstone's."""
+    return _ENVIRONMENT_FAILURE.search(skip_text) is not None
+
 
 # A pin with a published advisory and a published fix. Old enough that the
 # advisory is not going to be withdrawn.
@@ -59,20 +102,36 @@ def _fake_tool(tmp_path: Path, body: str) -> tuple[str, ...]:
 
 
 def _requires_real_pip_audit() -> None:
-    if shutil.which("pip-audit") is None:
-        pytest.skip("pip-audit is not installed on this host")
+    """Fail, do not skip, when the tool is missing.
+
+    pip-audit is a declared dev dependency (`[dependency-groups] dev`), so its
+    absence is a broken environment, not a host limitation. Skipping here is
+    precisely the mechanism that let the ambient-environment defect survive
+    three review passes: the proof was inert and nothing said so.
+    """
+    assert shutil.which("pip-audit") is not None, (
+        "pip-audit is not on PATH. It is a declared dev dependency; run "
+        "`uv sync --all-groups`. This is a failure and not a skip on purpose -- "
+        "a regression test that silently never runs is worse than no test."
+    )
 
 
 def _audit_or_skip(ctx: RunContext):
-    """Run the detector, turning an offline host into a skip, not a failure."""
+    """Run the detector. Skip only for a genuine environment failure."""
     found = list(DepsDetector().detect(ctx))
-    offline = [
+    failures = [
         s
         for s in ctx.skips
         if "pip-audit failed" in s or "produced no output" in s
     ]
-    if offline:
-        pytest.skip(f"pip-audit could not complete here: {offline[0]}")
+    for failure in failures:
+        if _is_environment_failure(failure):
+            pytest.skip(f"pip-audit could not reach its index here: {failure}")
+        pytest.fail(
+            "pip-audit failed for a reason that is not a network or index "
+            "problem, so this is a Whetstone-side regression rather than a host "
+            f"limitation:\n{failure}"
+        )
     return found
 
 
@@ -365,3 +424,263 @@ def test_subprocess_module_is_actually_used(tmp_path):
     """Guards the guard: if `_run_pip_audit` ever stops shelling out, these
     tests would keep passing while proving nothing about a subprocess."""
     assert deps_module.subprocess is subprocess
+
+
+# --- gate round 2: surrogates must not escape the detector -------------------
+#
+# `errors="surrogateescape"` stops a non-UTF-8 byte from killing the reader
+# thread, and then leaves a lone surrogate in the decoded text. sqlite3 refuses
+# to bind one, and `upsert` runs in runner.py OUTSIDE HygienePack's
+# per-detector guard, so the whole run died with an unhandled
+# UnicodeEncodeError. These tests drive `execute_run`, not the detector, because
+# the detector alone never touches the store and cannot show the failure.
+
+
+def _run_with_payload(tmp_path: Path, monkeypatch, payload: bytes):
+    """Run a real execute_run against a fake pip-audit emitting *payload*."""
+    from whetstone.config.model import LensConfig, ProjectConfig, WhetstoneConfig
+    from whetstone.runner import execute_run
+    from whetstone.store.db import connect
+
+    script = tmp_path / "fake_bytes.py"
+    script.write_text(
+        f"import sys\nsys.stdout.buffer.write({payload!r})\n"
+        "sys.stdout.buffer.flush()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        deps_module, "_PIP_AUDIT_ARGV", (sys.executable, str(script))
+    )
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    conn = connect(state)
+    cfg = WhetstoneConfig(
+        project=ProjectConfig(name="demo"),
+        lenses={"hygiene": LensConfig(only=["deps"])},
+    )
+    result = execute_run(
+        conn, cfg, tmp_path, state, tier="quick", changed_only=False
+    )
+    row = conn.execute("SELECT * FROM runs WHERE id = ?", (result.run_id,)).fetchone()
+    return result, row, conn
+
+
+def test_a_bad_byte_in_the_package_name_does_not_kill_the_run(tmp_path, monkeypatch):
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        b'{"dependencies":[{"name":"caf\xe9-pkg","version":"1.0","vulns":'
+        b'[{"id":"X-1","fix_versions":[],"description":"plain"}]}]}'
+    )
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    assert list_findings(conn) == []
+    assert any(
+        "not valid UTF-8" in skip and "NOT recorded" in skip
+        for skip in result.skips
+    ), result.skips
+
+
+def test_a_bad_byte_in_the_description_still_records_the_advisory(
+    tmp_path, monkeypatch
+):
+    """Identity is intact here, so the advisory is real and actionable.
+    Discarding a genuine security finding over one bad byte in its prose is the
+    wrong failure direction; the text is escaped and the substitution is
+    reported."""
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        b'{"dependencies":[{"name":"plainpkg","version":"1.0","vulns":'
+        b'[{"id":"X-2","fix_versions":[],"description":"caf\xe9 crash"}]}]}'
+    )
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    findings = list_findings(conn)
+    assert [f.rule_id for f in findings] == ["X-2"]
+    assert findings[0].subject == "plainpkg"
+    # The property that matters is that the text is encodable at all; the
+    # escaped spelling is asserted without a backslash literal so this line
+    # cannot itself be misread.
+    assert findings[0].detail.encode("utf-8")
+    assert "udce9" in findings[0].detail
+    assert any("not verbatim" in skip for skip in result.skips), result.skips
+
+
+def test_a_bad_byte_in_the_advisory_id_does_not_kill_the_run(tmp_path, monkeypatch):
+    """The id is the finding's identity and feeds the dedupe key."""
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        b'{"dependencies":[{"name":"plainpkg","version":"1.0","vulns":'
+        b'[{"id":"X-\xe9","fix_versions":[],"description":"plain"}]}]}'
+    )
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    assert list_findings(conn) == []
+    assert any("NOT recorded" in skip for skip in result.skips), result.skips
+
+
+def test_a_bad_byte_in_a_declined_dependency_does_not_kill_the_run(
+    tmp_path, monkeypatch
+):
+    payload = (
+        b'{"dependencies":[{"name":"plainpkg","skip_reason":"could not audit '
+        b'caf\xe9 (0.1)"}]}'
+    )
+    result, row, _ = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    assert any("declined to audit" in skip for skip in result.skips), result.skips
+
+
+def test_a_lone_surrogate_escape_in_valid_json_is_contained(tmp_path, monkeypatch):
+    """No byte is malformed here: the JSON carries an explicit \ud800 escape,
+    which json.loads decodes into a lone surrogate. That is why the guard is
+    wider than the resolver's surrogateescape-only range."""
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        rb'{"dependencies":[{"name":"bad\ud800name","version":"1.0","vulns":'
+        rb'[{"id":"X-3","fix_versions":[],"description":"plain"}]}]}'
+    )
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    assert list_findings(conn) == []
+    assert any("not valid UTF-8" in skip for skip in result.skips), result.skips
+
+
+def test_clean_output_records_no_encoding_skip(tmp_path, monkeypatch):
+    """The guard must not fire on ordinary text, including non-ASCII that IS
+    perfectly storable."""
+    from whetstone.store.findings import list_findings
+
+    payload = (
+        '{"dependencies":[{"name":"café-pkg","version":"1.0","vulns":'
+        '[{"id":"X-4","fix_versions":["2.0"],"description":"naïve parse"}]}]}'
+    ).encode()
+    result, row, conn = _run_with_payload(tmp_path, monkeypatch, payload)
+
+    assert row["status"] == "complete"
+    findings = list_findings(conn)
+    assert [f.subject for f in findings] == ["café-pkg"]
+    assert "naïve" in findings[0].detail
+    assert not any(
+        "UTF-8" in skip or "verbatim" in skip for skip in result.skips
+    ), result.skips
+
+
+# --- gate round 2: the skip/fail split, and pip-audit's availability ---------
+
+
+def test_pip_audit_is_a_declared_dev_dependency():
+    """The regression tests for the Critical run the real tool. If it is not
+    installed they skip, all four CI legs go green having proved nothing, and
+    the suite reports a smaller number that nobody reads. Pinning it in the dev
+    group is what makes those tests actually execute."""
+    import tomllib
+
+    root = Path(__file__).resolve().parents[2]
+    with (root / "pyproject.toml").open("rb") as handle:
+        data = tomllib.load(handle)
+    dev = data["dependency-groups"]["dev"]
+    assert any(
+        str(entry).replace(" ", "").startswith("pip-audit") for entry in dev
+    ), f"pip-audit missing from the dev dependency group: {dev}"
+    assert shutil.which("pip-audit"), "declared in pyproject but not installed"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hygiene/deps: pip-audit failed (Command ... timed out after 120 seconds)",
+        "hygiene/deps: pip-audit failed (Max retries exceeded with url: /simple/)",
+        "hygiene/deps: pip-audit failed (Temporary failure in name resolution)",
+        "hygiene/deps: pip-audit failed (getaddrinfo failed)",
+        "hygiene/deps: pip-audit failed (503 Server Error: Service Unavailable)",
+        "hygiene/deps: pip-audit failed (SSLCertVerificationError)",
+    ],
+)
+def test_network_failures_are_classified_as_environment(text):
+    assert _is_environment_failure(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The exact shapes a Whetstone-side argv regression produces.
+        "hygiene/deps: pip-audit failed (couldn't find a supported project file in .)",
+        "hygiene/deps: pip-audit failed (pyproject file pyproject.toml does not "
+        "contain `project` section)",
+        "hygiene/deps: pip-audit failed (unrecognized arguments: --bogus)",
+        "hygiene/deps: pip-audit failed (exit 2)",
+        "hygiene/deps: pip-audit produced no output while auditing pyproject.toml",
+    ],
+)
+def test_whetstone_side_failures_are_not_classified_as_environment(text):
+    """A regression must fail the suite, not be absorbed as 'offline'."""
+    assert not _is_environment_failure(text)
+
+
+def test_a_regressed_audit_target_fails_rather_than_skips(tmp_path, monkeypatch):
+    """End-to-end proof of the split: a fake tool reproducing the argv
+    regression must make _audit_or_skip fail, not skip."""
+    monkeypatch.setattr(
+        deps_module,
+        "_PIP_AUDIT_ARGV",
+        _fake_tool(
+            tmp_path,
+            "import sys\n"
+            "print(\"couldn't find a supported project file in .\", file=sys.stderr)\n"
+            "sys.exit(2)\n",
+        ),
+    )
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    with pytest.raises(Failed, match="Whetstone-side regression"):
+        _audit_or_skip(_ctx(tmp_path))
+
+
+def test_a_network_failure_still_skips(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        deps_module,
+        "_PIP_AUDIT_ARGV",
+        _fake_tool(
+            tmp_path,
+            "import sys\n"
+            "print('Max retries exceeded with url: /simple/requests/', "
+            "file=sys.stderr)\n"
+            "sys.exit(2)\n",
+        ),
+    )
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    with pytest.raises(Skipped, match="could not reach its index"):
+        _audit_or_skip(_ctx(tmp_path))
+
+
+# --- cosmetic: an unparseable manifest is not a missing table ---------------
+
+
+def test_unparseable_pyproject_says_so_rather_than_blaming_the_table(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project\nname = broken", encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path)
+    assert list(DepsDetector().detect(ctx)) == []
+    assert any("could not be parsed as TOML" in skip for skip in ctx.skips), ctx.skips
+    assert not any("no [project] table" in skip for skip in ctx.skips), ctx.skips
+
+
+def test_an_unparseable_pyproject_still_falls_through_to_requirements(tmp_path):
+    """A broken pyproject must not stop a requirements.txt from being audited."""
+    (tmp_path / "pyproject.toml").write_text("[project\nbroken", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    plan = deps_module._plan_audit(tmp_path)
+    assert not isinstance(plan, str)
+    assert plan.source == "requirements.txt"
