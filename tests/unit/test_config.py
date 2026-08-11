@@ -1,4 +1,5 @@
 import textwrap
+import traceback
 from pathlib import Path
 
 import pytest
@@ -282,6 +283,87 @@ def test_redaction_covers_a_secret_under_a_misspelled_key(tmp_path, monkeypatch)
     rendered = str(caught.value)
     assert secret not in rendered
     assert "api_tokn" in rendered
+
+
+def _assert_secret_is_gone(exc: BaseException, secret: str) -> None:
+    """Fail if *secret* survives anywhere a default renderer would reach.
+
+    Checking `str(exc)` alone is what let two leaks through. The value has to be
+    absent from every rendering, in both the raw and the repr-escaped spelling,
+    and the exception chain has to be empty -- an unredacted `__cause__` is
+    printed by the default traceback hook, `logging.exception`, and
+    `traceback.format_exc` alike.
+    """
+    escaped = repr(secret)[1:-1]
+    renderings = {
+        "str(exc)": str(exc),
+        "repr(exc)": repr(exc),
+        "traceback.format_exception": "".join(traceback.format_exception(exc)),
+    }
+    for where, text in renderings.items():
+        assert secret not in text, f"raw secret reached {where}"
+        assert escaped not in text, f"repr-escaped secret reached {where}"
+    assert exc.__cause__ is None, "the unredacted ValidationError is still chained"
+    assert exc.__context__ is None, "the unredacted ValidationError is still the context"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "ghp_R3alSecretValue0000000000000000000000",
+        # Pydantic renders values with repr(), so a control character comes out
+        # escaped and `str.replace` against the raw value misses it entirely.
+        "line1\nSUPERSECRETLINE2",
+        "tabbed\tSECRETVALUE",
+        # The ordinary way a secret grows a newline: SECRET=$(cat token.txt).
+        "trailing_newline_SECRETVALUE\n",
+        "carriage\rSECRETRETURN",
+        "quoted'SECRET\"VALUE",
+    ],
+)
+def test_resolved_secret_survives_nowhere_in_the_raised_error(
+    tmp_path, monkeypatch, secret
+):
+    """Redacting `str(exc)` is not enough: the chain and the escaping defeat it."""
+    monkeypatch.setenv("DEMO_GH_TOKEN", secret)
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        budget:
+          tier: "${env:DEMO_GH_TOKEN}"
+        """,
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    _assert_secret_is_gone(caught.value, secret)
+    # ...and the message is still useful. A redaction that shreds the error into
+    # uselessness would pass every assertion above.
+    rendered = str(caught.value)
+    assert "${env:DEMO_GH_TOKEN}" in rendered
+    assert "tier" in rendered
+
+
+def test_redaction_does_not_depend_on_a_top_level_handler(tmp_path, monkeypatch):
+    """There is no ConfigError handler anywhere, so this traceback is what users see."""
+    secret = "ghp_UnhandledTracebackSecret000000000000"
+    monkeypatch.setenv("DEMO_GH_TOKEN", secret)
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        budget:
+          tier: "${env:DEMO_GH_TOKEN}"
+        """,
+    )
+    try:
+        load_config(path)
+    except ConfigError:
+        printed = traceback.format_exc()
+    assert secret not in printed
+    assert "ValidationError" not in printed
 
 
 @pytest.mark.parametrize(

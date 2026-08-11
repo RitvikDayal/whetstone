@@ -108,7 +108,16 @@ def load_config(path: Path) -> WhetstoneConfig:
     try:
         return WhetstoneConfig.model_validate(resolved)
     except ValidationError as exc:
-        raise ConfigError(f"{path} is invalid:\n{_redact(str(exc), resolved_secrets)}") from exc
+        detail = _redact(str(exc), resolved_secrets)
+
+    # Raised OUTSIDE the `except` block on purpose. Inside it, Python attaches
+    # the ValidationError as __context__ (and `from exc` would attach it as
+    # __cause__), and that exception renders the secret unredacted. The default
+    # traceback hook, `logging.exception`, and `traceback.format_exc` all walk
+    # the chain and print it directly above the redacted message. Once the block
+    # exits, the ValidationError is no longer the exception being handled, so
+    # nothing chains it and the redacted text is the only rendering that exists.
+    raise ConfigError(f"{path} is invalid:\n{detail}")
 
 
 def _is_secret_key(key: object) -> bool:
@@ -181,11 +190,22 @@ def _substitute(match: re.Match[str], resolved: dict[str, str]) -> str:
 def _redact(text: str, resolved: dict[str, str]) -> str:
     """Put every resolved environment value back behind its reference.
 
+    Both spellings of each value are scrubbed. Pydantic renders the rejected
+    input with repr(), which escapes control characters, so a secret holding a
+    newline reaches the message as `line1\\nSECRET` -- text that never matches
+    the raw value and sailed straight through a plain str.replace. A trailing
+    newline is the ordinary case, not an exotic one: SECRET=$(cat token.txt).
+
     Length-descending so a value that contains another is replaced first. Every
     resolved value is scrubbed regardless of length: short ones make for a
     noisier message, but guessing which values are "secret enough" is how leaks
     happen. The Pydantic detail is preserved, so the message still names the key.
     """
-    for value in sorted(resolved, key=len, reverse=True):
-        text = text.replace(value, resolved[value])
+    spellings: dict[str, str] = {}
+    for value, reference in resolved.items():
+        spellings[value] = reference
+        # repr() quotes the value; strip the delimiters and keep the escaping.
+        spellings.setdefault(repr(value)[1:-1], reference)
+    for spelling in sorted(spellings, key=len, reverse=True):
+        text = text.replace(spelling, spellings[spelling])
     return text
