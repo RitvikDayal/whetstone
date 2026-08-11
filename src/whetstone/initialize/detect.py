@@ -89,12 +89,28 @@ _PYTHON_MANIFESTS = ("pyproject.toml", "setup.py", "requirements.txt", "setup.cf
 _NODE_SCRIPT_LABELS = ("test", "lint", "build", "dev")
 
 
+# Where a proposed command came from, per label. The distinction is the one the
+# module docstring above draws: Node READS a declared script, Python PROPOSES a
+# conventional spelling for the detected manager whether or not the project uses
+# it. Both used to reach the user labelled "from project manifest", which is
+# true of one of them.
+MANIFEST = "declared by the project manifest"
+
+
+def _conventional(manager: str) -> str:
+    return f"conventional for {manager}; not declared by the project"
+
+
 @dataclass
 class Detection:
     languages: list[str] = field(default_factory=list)
     package_manager: str | None = None
     commands: dict[str, str] = field(default_factory=dict)
     evidence: dict[str, str] = field(default_factory=dict)
+    # label -> provenance, parallel to `commands`. Kept separate rather than
+    # folded into a richer command object so the many call sites that read
+    # `detection.commands[label]` as a plain string stay unchanged.
+    origins: dict[str, str] = field(default_factory=dict)
 
 
 def detect_stack(project_root: Path) -> Detection:
@@ -148,6 +164,10 @@ def _detect_python(root: Path, detection: Detection) -> None:
             )
 
     detection.commands.update(commands)
+    # Every one of these is a guess -- see the module docstring. `install` is a
+    # guess too even in the requirements.txt branch: the file proves what to
+    # install, never that `pip install -r` is how this project installs it.
+    detection.origins.update(dict.fromkeys(commands, _conventional(manager)))
 
 
 def _is_installable(root: Path) -> bool:
@@ -167,6 +187,18 @@ def _detect_node(root: Path, detection: Detection) -> None:
         payload = json.loads(package_json.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         detection.evidence["javascript"] = "package.json is unparseable; scripts skipped"
+        return
+    except (OSError, UnicodeDecodeError) as exc:
+        # A separate branch from the one above, and not a theoretical one:
+        # `is_file()` passing says the name resolves to a file, not that this
+        # process may read it or that the bytes are UTF-8. A manifest written in
+        # a legacy codepage, or one whose ACL excludes the current user, reached
+        # `read_text` and left `detect_stack` -- and therefore the first command
+        # a new user runs -- as an uncaught traceback.
+        detection.evidence["javascript"] = (
+            f"package.json could not be read ({type(exc).__name__}: {exc}); "
+            "scripts skipped"
+        )
         return
 
     # `json.loads` succeeding proves the file was valid JSON, not that it was an
@@ -238,6 +270,11 @@ def _detect_node(root: Path, detection: Detection) -> None:
         detection.package_manager = manager
         detection.evidence["package_manager"] = manager_evidence
         detection.commands.update(node_commands)
+        # `install` is synthesized from the manager, not read from `scripts` --
+        # the same "conventional" label Python's proposals carry. Everything in
+        # `declared` was read out of the file.
+        detection.origins.update(dict.fromkeys(node_commands, _conventional(manager)))
+        detection.origins.update(dict.fromkeys(declared, MANIFEST))
         return
 
     # A polyglot repo: Python was detected first and already owns the single

@@ -15,6 +15,10 @@ class LiteralSecretError(ConfigError):
     """A secret-shaped config key holds a literal value instead of a reference."""
 
 
+class UnsafeConfigTargetError(WhetstoneError):
+    """The whetstone.yaml path is a symlink, so writing it would leave the worktree."""
+
+
 class UnsafeStatePathError(WhetstoneError):
     """The resolved state directory looks cloud-synced; SQLite would be torn."""
 

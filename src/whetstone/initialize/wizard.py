@@ -7,6 +7,8 @@ verified, what failed, and what was left out.
 
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
 
 import yaml
@@ -23,6 +25,7 @@ from ..config.model import (
     WhetstoneConfig,
 )
 from ..doctor import _TIMEOUTS, run_command
+from ..errors import UnsafeConfigTargetError
 from .detect import Detection, detect_stack
 
 # Per-label timeouts come from doctor._TIMEOUTS rather than a value copied
@@ -105,6 +108,9 @@ def run_wizard(
 ) -> Path:
     console = console or Console()
     target = project_root / CONFIG_NAME
+    # Before the exists() gate, and before anything is executed: the refusal has
+    # to happen while nothing has been written and nothing has been run.
+    _refuse_symlinked_target(target)
     if target.exists() and not force:
         raise FileExistsError(
             f"{target} already exists. Re-run with --force to overwrite it."
@@ -160,7 +166,7 @@ def run_wizard(
             )
 
     cfg = build_config(detection, name=project_root.name, verified=verified)
-    target.write_text(render_config(cfg), encoding="utf-8")
+    _write_config(target, render_config(cfg))
 
     omitted = [label for label, ok in verified.items() if not ok]
     console.print(f"\n[green]Wrote {target}[/green]")
@@ -173,6 +179,77 @@ def run_wizard(
     return target
 
 
+# POSIX only. Windows has no open flag that refuses a reparse point, so the
+# check there is lstat-then-write; see `_write_config`.
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _refuse_symlinked_target(target: Path) -> None:
+    """Refuse to write whetstone.yaml through a symlink.
+
+    `init` is pointed at a repository the user may have cloned minutes ago and
+    not read, and git carries symlinks in tree objects. A committed
+    `whetstone.yaml -> ../../../.bashrc` makes the FIRST command a new user runs
+    write a YAML document into a file outside the worktree, which is the write
+    barrier defeated by a path the barrier never inspects.
+
+    The dangling case is the one that gets past everything else on the way here:
+    `Path.exists()` follows the link and returns False when the target does not
+    exist yet, so `--force` is not even required -- the "already exists" guard
+    sees nothing, and `write_text` then CREATES the external file. `--force` does
+    not widen this: overwriting a file the user knows about is what that flag is
+    for, and a symlink is not that file. Refused either way; the user removes the
+    link.
+
+    `lstat`, not `resolve()`: a link whose target is inside the worktree is
+    refused too. The point is that the config is a real file at a known path,
+    not that this particular link happens to land somewhere harmless.
+    """
+    try:
+        is_link = target.is_symlink()
+    except OSError:  # pragma: no cover - unreadable parent; the write reports it
+        return
+    if not is_link:
+        return
+    raise UnsafeConfigTargetError(
+        f"{target} is a symlink. Whetstone will not write its config through "
+        "one -- the link decides where the bytes land, and a link committed to "
+        "a repository decides it on the repository's behalf.\n"
+        "Remove or replace it with a real file, then re-run `whetstone init`."
+    )
+
+
+def _write_config(target: Path, text: str) -> None:
+    """Write *text* to *target*, refusing to follow a symlink at the last moment.
+
+    `_refuse_symlinked_target` runs before any command executes, so the user
+    hears about the link before the wizard spends a minute running their test
+    suite. This runs again at the write itself, because commands executed in
+    between are the project's own code and could have created the link.
+
+    O_NOFOLLOW makes that refusal atomic where it exists. Windows has no
+    equivalent flag, so the check there is the lstat above -- which still covers
+    the case that actually reaches users, a symlink committed to a repository,
+    and does not cover a link raced into place mid-run. Stated rather than
+    implied.
+    """
+    _refuse_symlinked_target(target)
+    try:
+        handle = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW)
+    except OSError as exc:
+        if _NOFOLLOW and exc.errno in (errno.ELOOP, errno.EMLINK):
+            # The link was created between the lstat and the open.
+            raise UnsafeConfigTargetError(
+                f"{target} became a symlink while `whetstone init` was running. "
+                "Nothing was written."
+            ) from None
+        raise
+    # Default newline translation, matching the `write_text` this replaced: on
+    # Windows the file keeps its CRLF endings.
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(text)
+
+
 def _announce_execution(
     console: Console, project_root: Path, detection: Detection
 ) -> None:
@@ -180,8 +257,9 @@ def _announce_execution(
 
     `init` verifies by execution -- that is the whole design, and it is not
     something to be apologetic about. What it should not be is quiet. The
-    commands come from the project's own manifest, the project may have been
-    cloned minutes ago and not read, and `shell=True` with `cwd=project_root`
+    commands come from the project's own files or from a convention this tool
+    chose, the project may have been cloned minutes ago and not read, and
+    `shell=True` with `cwd=project_root`
     means the working directory is consulted before PATH on a default Windows
     box: a `pytest.bat` committed to the repo wins over the user's pytest. The
     directory is therefore part of the warning, not decoration -- WHERE these
@@ -198,11 +276,15 @@ def _announce_execution(
     )
     for label, command in sorted(detection.commands.items()):
         note = " (recorded, not launched -- long-running)" if label == "dev" else ""
-        console.print(f"  {label}: [cyan]{command}[/cyan]{note}")
+        origin = detection.origins.get(label)
+        origin_note = f" [dim]({origin})[/dim]" if origin else ""
+        console.print(f"  {label}: [cyan]{command}[/cyan]{origin_note}{note}")
     console.print(
-        "[yellow]They come from this project's own manifest, and they run with "
-        "this directory as the working directory -- which on Windows is searched "
-        "before PATH. If you have not read this repository, read it first.[/yellow]"
+        "[yellow]Some are declared by this project, some are conventional "
+        "spellings proposed for the detected package manager -- each line above "
+        "says which. They run with this directory as the working directory, "
+        "which on Windows is searched before PATH. If you have not read this "
+        "repository, read it first.[/yellow]"
     )
 
 
@@ -212,21 +294,42 @@ def _print_detection(console: Console, detection: Detection) -> None:
             "[yellow]No recognised project manifest found.[/yellow] "
             "A config will still be written; declare commands by hand."
         )
-        return
-    table = Table("detected", "value", "why")
-    table.add_row("languages", ", ".join(detection.languages), "")
-    table.add_row(
-        "package manager",
-        detection.package_manager or "unknown",
-        detection.evidence.get("package_manager", ""),
-    )
-    for label, command in sorted(detection.commands.items()):
-        table.add_row(f"command: {label}", command, "from project manifest")
-    console.print(table)
-    # A polyglot repo can detect commands it then does not use -- see
-    # detect.py's `_detect_node`. Told, not silently dropped.
+    else:
+        table = Table("detected", "value", "why")
+        table.add_row(
+            "languages",
+            ", ".join(detection.languages),
+            "; ".join(
+                detection.evidence[language]
+                for language in detection.languages
+                if language in detection.evidence
+            ),
+        )
+        table.add_row(
+            "package manager",
+            detection.package_manager or "unknown",
+            detection.evidence.get("package_manager", ""),
+        )
+        for label, command in sorted(detection.commands.items()):
+            # Was the constant "from project manifest" for every row, which is
+            # true of a Node script read out of `scripts` and false of the
+            # conventional Python spellings the detector proposes on its own.
+            # The user decides whether to let these run; they need to know which
+            # is which before deciding.
+            table.add_row(f"command: {label}", command, detection.origins.get(label, ""))
+        console.print(table)
+
+    # Everything detection recorded and the table above did not already show.
+    # Enumerated by EXCLUSION, not by a suffix pattern: this used to print only
+    # `*_commands_unused`, so `python_install` ("only setup.cfg was found, so no
+    # install command is proposed") and `javascript_scripts` ("scripts could not
+    # be read") were recorded, never rendered, and the wizard omitted work
+    # without saying why. A new evidence key added in detect.py now reaches the
+    # user without a matching edit here -- the coupling that failed was one that
+    # had to be remembered.
+    shown = {"package_manager", *detection.languages}
     for key, note in sorted(detection.evidence.items()):
-        if key.endswith("_commands_unused"):
+        if key not in shown:
             console.print(f"[yellow]{note}[/yellow]")
 
 

@@ -1,8 +1,9 @@
 import json
+from pathlib import Path
 
 import pytest
 
-from whetstone.initialize.detect import detect_stack
+from whetstone.initialize.detect import MANIFEST, detect_stack
 
 
 def test_python_uv_project(tmp_path):
@@ -266,6 +267,70 @@ def test_unparseable_package_json_still_says_so(tmp_path):
     detection = detect_stack(tmp_path)
     assert "javascript" in detection.languages
     assert "unparseable" in detection.evidence["javascript"]
+
+
+def test_package_json_that_is_not_utf8_records_a_reason(tmp_path):
+    """A different branch from the JSON one above: `is_file()` passing says the
+    name resolves to a file, not that its bytes decode. A manifest saved in a
+    legacy codepage raised UnicodeDecodeError out of `read_text` -- before any
+    JSON parsing -- and left `detect_stack` as an uncaught traceback."""
+    # 0x80 is a lone continuation byte: valid cp1252, never valid UTF-8.
+    (tmp_path / "package.json").write_bytes(b'{"name": "caf\x80"}')
+
+    detection = detect_stack(tmp_path)
+
+    assert "javascript" in detection.languages
+    assert "could not be read" in detection.evidence["javascript"]
+    assert "UnicodeDecodeError" in detection.evidence["javascript"]
+
+
+def test_package_json_that_cannot_be_opened_records_a_reason(tmp_path, monkeypatch):
+    """The other half of the same branch. A permissions failure or an I/O error
+    on read is an OSError, not a decoding error and not a JSON error."""
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def _refuse(self, *args, **kwargs):
+        if self.name == "package.json":
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _refuse)
+
+    detection = detect_stack(tmp_path)
+
+    assert "javascript" in detection.languages
+    assert "could not be read" in detection.evidence["javascript"]
+    assert "PermissionError" in detection.evidence["javascript"]
+
+
+# --- provenance: which commands the project declared, and which we guessed ---
+
+
+def test_python_command_proposals_are_labelled_conventional(tmp_path):
+    """`_detect_python` hands out `pytest` and `ruff check .` for any Python
+    manifest, declared or not -- see detect.py's docstring. The user is about to
+    be asked to let those run, so the origin has to say they were guessed."""
+    (tmp_path / "pyproject.toml").write_text("[build-system]\n", encoding="utf-8")
+    detection = detect_stack(tmp_path)
+    assert set(detection.origins) == set(detection.commands), detection.origins
+    for label in ("test", "lint", "install"):
+        assert "conventional" in detection.origins[label], label
+        assert "not declared" in detection.origins[label], label
+
+
+def test_declared_node_scripts_are_labelled_as_declared(tmp_path):
+    """The counterweight: a script read out of `scripts` really did come from
+    the manifest, and must not be demoted to a guess."""
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest run", "build": "vite build"}}),
+        encoding="utf-8",
+    )
+    detection = detect_stack(tmp_path)
+    assert detection.origins["test"] == MANIFEST
+    assert detection.origins["build"] == MANIFEST
+    # `npm install` is synthesized from the manager; `scripts` never declared it.
+    assert "conventional" in detection.origins["install"]
 
 
 # --- Python detection: the manifest decides the install command --------------
