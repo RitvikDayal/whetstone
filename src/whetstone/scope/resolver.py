@@ -92,7 +92,12 @@ def _git_changed(project_root: Path, base_branch: str) -> set[Path]:
             "repository, or set project.forge.base_branch to a branch that "
             "shares history."
         ) from exc
-    raw = _git(project_root, ["diff", "--name-only", "-z", merge_base])
+    # `--no-relative` is the counterpart to `--full-name` on ls-files: with
+    # `diff.relative=true` set -- a documented, common monorepo config -- git
+    # prints diff paths relative to the cwd instead of the repo root. The two
+    # sets are intersected below, so one side drifting out of frame emptied it:
+    # zero files, no error, no skip. Pin the frame rather than trust the config.
+    raw = _git(project_root, ["diff", "--no-relative", "--name-only", "-z", merge_base])
     return {Path(part) for part in raw.split("\0") if part}
 
 

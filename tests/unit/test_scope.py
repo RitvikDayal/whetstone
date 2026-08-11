@@ -520,6 +520,44 @@ def test_trailing_dot_really_collapses_on_this_filesystem(tmp_path):
     assert landed.read_text(encoding="utf-8") == "PWNED"
 
 
+def test_changed_only_survives_diff_relative_in_a_monorepo(monorepo):
+    """`diff.relative=true` prints paths relative to the cwd, not the repo root.
+
+    `ls-files --full-name` was pinned to the repo-root frame and `git diff` was
+    not, so one documented config emptied the intersection: zero files, no
+    error, no skip -- the silent clean scan this module exists to forbid.
+    """
+    project_root = monorepo / "apps" / "web"
+    _git(monorepo, "config", "diff.relative", "true")
+    _git(monorepo, "checkout", "-b", "feature")
+    (project_root / "src" / "a.py").write_text("changed", encoding="utf-8")
+    _git(monorepo, "add", "apps/web/src/a.py")
+    _git(monorepo, "commit", "-m", "change", "--no-gpg-sign")
+
+    files = resolve_files(
+        project_root,
+        BoundariesConfig(include=["**/*"]),
+        changed_only=True,
+        base_branch="main",
+    )
+    assert files == (Path("src/a.py"),)
+
+
+def test_changed_only_survives_diff_relative_at_the_repo_root(repo):
+    """No prefix to strip here, so the config changes nothing -- pinned anyway,
+    because `--no-relative` must not break the frame it was already correct in."""
+    _git(repo, "config", "diff.relative", "true")
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "src" / "app.py").write_text("changed", encoding="utf-8")
+    _git(repo, "add", "src/app.py")
+    _git(repo, "commit", "-m", "change", "--no-gpg-sign")
+
+    files = resolve_files(
+        repo, BoundariesConfig(include=["**/*"]), changed_only=True, base_branch="main"
+    )
+    assert files == (Path("src/app.py"),)
+
+
 def test_deleted_tracked_files_are_filtered_out(repo):
     """A file removed from the working tree but still in the index has nothing
     to read. It is dropped from the analysis set -- whether it was deleted
