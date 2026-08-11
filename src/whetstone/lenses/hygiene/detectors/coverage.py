@@ -1,7 +1,12 @@
 """Flag test coverage below a configured floor.
 
-Reads an existing coverage.xml. Whetstone does not run your test suite to
-produce one -- that is `doctor`'s job and the user's choice.
+Reads an existing coverage.xml. Whetstone never runs your test suite to produce
+one: that is your test runner's job, invoked by you. (`doctor` re-verifies the
+config against reality -- see cli.py -- it does not generate artifacts.)
+
+The floor comes from `lenses.hygiene.options.coverage_floor`. It is read
+through `RunContext.options`, not from the top level of `lens_options`, because
+the top level holds only the spine's own typed keys; see `LensConfig.options`.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ class CoverageDetector:
     id = "coverage"
 
     def detect(self, ctx: RunContext) -> Iterator[Candidate]:
-        floor_raw = ctx.lens_options.get("coverage_floor", DEFAULT_FLOOR)
+        floor_raw = ctx.options.get("coverage_floor", DEFAULT_FLOOR)
         if isinstance(floor_raw, bool):
             # isinstance(True, int) is True and float(True) == 1.0 -- reject
             # before the numeric conversion would silently accept it. A

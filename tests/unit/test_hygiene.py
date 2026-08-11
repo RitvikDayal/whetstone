@@ -32,13 +32,22 @@ PIP_AUDIT_JSON = json.dumps(
 )
 
 
-def _ctx(tmp_path: Path, **options) -> RunContext:
+def _ctx(tmp_path: Path, *, only=None, **options) -> RunContext:
+    """Build a context the way the runner does.
+
+    Pack options go under `options`, not at the top level of `lens_options`:
+    that is the shape `LensConfig` produces and the shape `RunContext.options`
+    reads. `only` is a spine key and stays at the top level.
+    """
+    lens_options: dict = {"options": options}
+    if only is not None:
+        lens_options["only"] = only
     return RunContext(
         project_root=tmp_path,
         state_root=tmp_path / "state",
         files=(),
         tier="quick",
-        lens_options=options,
+        lens_options=lens_options,
         run_id="run-1",
     )
 
@@ -79,7 +88,7 @@ def test_missing_coverage_artifact_skips_loudly(tmp_path):
 def test_deps_parses_advisories(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "whetstone.lenses.hygiene.detectors.deps._run_pip_audit",
-        lambda root: PIP_AUDIT_JSON,
+        lambda root, args: PIP_AUDIT_JSON,
     )
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
     found = list(DepsDetector().detect(_ctx(tmp_path)))
@@ -91,7 +100,7 @@ def test_deps_parses_advisories(tmp_path, monkeypatch):
 
 
 def test_deps_skips_loudly_when_tool_absent(tmp_path, monkeypatch):
-    def _boom(root):
+    def _boom(root, args):
         raise FileNotFoundError("pip-audit")
 
     monkeypatch.setattr(
@@ -217,7 +226,7 @@ def test_coverage_floor_numeric_string_is_accepted(tmp_path):
 def _deps_ctx(tmp_path: Path, payload: str, monkeypatch, **options) -> RunContext:
     monkeypatch.setattr(
         "whetstone.lenses.hygiene.detectors.deps._run_pip_audit",
-        lambda root: payload,
+        lambda root, args: payload,
     )
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
     return _ctx(tmp_path, **options)
@@ -308,3 +317,75 @@ def test_deps_skips_non_dict_vuln_entry(tmp_path, monkeypatch):
     assert len(found) == 1
     assert found[0].rule_id == "GHSA-zzzz"
     assert any("foo" in skip and "vuln" in skip.lower() for skip in ctx.skips)
+
+
+# --- finding 4: one detector raising must not suppress the other -------------
+
+
+class _ExplodingDetector:
+    id = "deps"
+
+    def detect(self, ctx):
+        raise TypeError("sequence item 0: expected str instance, int found")
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
+def test_one_detector_raising_does_not_suppress_the_other(tmp_path, monkeypatch):
+    """`yield from detector.detect(ctx)` had no per-detector guard, so `deps`
+    dying took `coverage` with it: the coverage finding vanished and nothing
+    recorded that coverage never ran."""
+    monkeypatch.setattr(
+        "whetstone.lenses.hygiene.pack.DETECTORS",
+        (_ExplodingDetector(), CoverageDetector()),
+    )
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.05"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=60)
+
+    found = list(HygienePack().run(ctx))
+
+    assert [c.rule_id for c in found] == ["coverage-below-floor"]
+    assert any(
+        "deps" in skip and "TypeError" in skip and "expected str instance" in skip
+        for skip in ctx.skips
+    ), ctx.skips
+
+
+def test_a_raising_detector_names_its_exception(tmp_path, monkeypatch):
+    """A guard broad enough to hide a bug in our own code is the next defect.
+    The type and message have to survive into the skip text."""
+    monkeypatch.setattr(
+        "whetstone.lenses.hygiene.pack.DETECTORS", (_ExplodingDetector(),)
+    )
+    ctx = _ctx(tmp_path)
+    assert list(HygienePack().run(ctx)) == []
+    assert len(ctx.skips) == 1
+    assert "TypeError" in ctx.skips[0]
+
+
+def test_hygiene_declares_itself_project_scoped():
+    """Neither detector reads ctx.files, so boundaries do not narrow it. The
+    runner can only tell the user that if the pack says so."""
+    from whetstone.lenses.base import LensScope, lens_scope
+
+    assert lens_scope(HygienePack()) is LensScope.project
+
+
+# --- finding 8: the unreadable-artifact path had no test --------------------
+
+
+def test_unreadable_coverage_xml_skips_loudly(tmp_path):
+    (tmp_path / "coverage.xml").write_text("<coverage", encoding="utf-8")
+    ctx = _ctx(tmp_path, coverage_floor=60)
+    assert list(CoverageDetector().detect(ctx)) == []
+    assert any("unreadable" in skip for skip in ctx.skips), ctx.skips
+
+
+def test_coverage_xml_without_a_line_rate_skips_loudly(tmp_path):
+    (tmp_path / "coverage.xml").write_text(
+        '<?xml version="1.0"?><coverage version="7.0"/>', encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=60)
+    assert list(CoverageDetector().detect(ctx)) == []
+    assert any("unreadable" in skip for skip in ctx.skips), ctx.skips
