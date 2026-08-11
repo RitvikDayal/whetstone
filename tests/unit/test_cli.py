@@ -8,6 +8,8 @@ ModuleNotFoundError, which the README does not prepare anyone for.
 from __future__ import annotations
 
 import importlib.metadata
+import subprocess
+import sys
 
 import pytest
 from typer.testing import CliRunner
@@ -49,3 +51,18 @@ def test_unimplemented_commands_say_so_and_exit_non_zero(command):
     result = runner.invoke(app, [command])
     assert result.exit_code != 0
     assert "not implemented yet" in result.output
+
+
+def test_python_dash_m_runs_the_same_app():
+    """`python -m whetstone` died with `No module named whetstone.__main__`.
+
+    Really launched, not imported: __main__ only runs under -m, so importing it
+    would prove nothing about the path that was broken.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "whetstone", "--version"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert whetstone.__version__ in result.stdout
