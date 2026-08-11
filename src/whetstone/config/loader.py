@@ -231,4 +231,32 @@ def _redact(text: str, resolved: dict[str, str]) -> str:
         spellings.setdefault(repr(value)[1:-1], reference)
     for spelling in sorted(spellings, key=len, reverse=True):
         text = text.replace(spelling, spellings[spelling])
+    # Exact replacement cannot catch a value Pydantic ELIDED. Past ~50
+    # characters it renders `head...tail`, so neither spelling matches and both
+    # ends print verbatim -- a 51-character credential leaked 24 characters off
+    # each end. The split point is a Pydantic internal, so sweep for surviving
+    # runs instead of hard-coding it.
+    for value, reference in resolved.items():
+        text = _scrub_runs(text, value, reference)
+        text = _scrub_runs(text, repr(value)[1:-1], reference)
+    return text
+
+
+# Below this, a shared run is more likely to be a coincidence than a leak, and
+# over-redacting the message has its own cost. Above it, assume the worst.
+_MIN_LEAKED_RUN = 8
+
+
+def _scrub_runs(text: str, value: str, reference: str) -> str:
+    """Replace every run of *value* at least _MIN_LEAKED_RUN long left in *text*."""
+    start = 0
+    while start <= len(value) - _MIN_LEAKED_RUN:
+        if value[start : start + _MIN_LEAKED_RUN] not in text:
+            start += 1
+            continue
+        end = start + _MIN_LEAKED_RUN
+        while end < len(value) and value[start : end + 1] in text:
+            end += 1
+        text = text.replace(value[start:end], reference)
+        start = end
     return text

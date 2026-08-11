@@ -285,6 +285,17 @@ def test_redaction_covers_a_secret_under_a_misspelled_key(tmp_path, monkeypatch)
     assert "api_tokn" in rendered
 
 
+def _longest_surviving_run(text: str, secret: str) -> int:
+    """Length of the longest contiguous slice of *secret* still present in *text*."""
+    longest = 0
+    for start in range(len(secret)):
+        for end in range(start + longest + 1, len(secret) + 1):
+            if secret[start:end] not in text:
+                break
+            longest = end - start
+    return longest
+
+
 def _assert_secret_is_gone(exc: BaseException, secret: str) -> None:
     """Fail if *secret* survives anywhere a default renderer would reach.
 
@@ -303,6 +314,11 @@ def _assert_secret_is_gone(exc: BaseException, secret: str) -> None:
     for where, text in renderings.items():
         assert secret not in text, f"raw secret reached {where}"
         assert escaped not in text, f"repr-escaped secret reached {where}"
+        # Whole-value containment is not enough. Pydantic elides a long value in
+        # the middle, so `secret not in text` passes while both ends print
+        # verbatim. Assert that no usable run of the secret survives.
+        run = _longest_surviving_run(text, secret)
+        assert run < 8, f"a {run}-character run of the secret reached {where}"
     assert exc.__cause__ is None, "the unredacted ValidationError is still chained"
     assert exc.__context__ is None, "the unredacted ValidationError is still the context"
 
@@ -319,6 +335,11 @@ def _assert_secret_is_gone(exc: BaseException, secret: str) -> None:
         "trailing_newline_SECRETVALUE\n",
         "carriage\rSECRETRETURN",
         "quoted'SECRET\"VALUE",
+        # Past ~50 characters Pydantic elides the middle and renders
+        # `head...tail`, so neither spelling matches and both ends survive.
+        "AKIAIOSFODNN7EXAMPLE/wJalrXUtnFEMI/K7MDENG/bPxRfiCY",
+        "ghp_" + "L" * 500,
+        "-----BEGIN PRIVATE KEY-----\n" + "M" * 300 + "\n-----END KEY-----",
     ],
 )
 def test_resolved_secret_survives_nowhere_in_the_raised_error(
