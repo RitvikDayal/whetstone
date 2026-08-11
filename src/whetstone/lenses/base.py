@@ -91,7 +91,9 @@ class RunContext:
 
     project_root: Path
     state_root: Path
-    files: tuple[Path, ...]  # repo-relative, already boundary-filtered
+    # project_root-relative, already boundary-filtered. Not repo-relative: the
+    # two differ for any monorepo, and `project_root / path` is what lenses open.
+    files: tuple[Path, ...]
     tier: str
     lens_options: dict[str, Any]
     run_id: str
