@@ -139,6 +139,81 @@ def test_coverage_floor_float_does_not_silently_loosen(tmp_path):
     assert found[0].evidence.data["floor"] == 59.9
 
 
+def test_coverage_floor_bool_true_is_rejected(tmp_path):
+    # isinstance(True, int) is True and float(True) == 1.0 -- without an
+    # explicit bool check, `coverage_floor: true` would silently become a
+    # 1% floor instead of the misconfiguration it almost certainly is.
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.72"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=True)
+    assert list(CoverageDetector().detect(ctx)) == []
+    assert any("coverage_floor" in skip and "bool" in skip for skip in ctx.skips)
+
+
+def test_coverage_floor_negative_is_rejected(tmp_path):
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.72"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=-5)
+    assert list(CoverageDetector().detect(ctx)) == []
+    assert any("coverage_floor" in skip and "-5" in skip for skip in ctx.skips)
+
+
+def test_coverage_floor_zero_is_rejected(tmp_path):
+    # A floor of 0 can never fail -- it isn't a floor, it's the check turned
+    # off, and it looks identical to a clean project.
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.001"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=0)
+    assert list(CoverageDetector().detect(ctx)) == []
+    assert any("coverage_floor" in skip and "0" in skip for skip in ctx.skips)
+
+
+def test_coverage_floor_over_100_is_rejected(tmp_path):
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.99"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=150)
+    assert list(CoverageDetector().detect(ctx)) == []
+    assert any("coverage_floor" in skip and "150" in skip for skip in ctx.skips)
+
+
+def test_coverage_floor_of_100_is_accepted(tmp_path):
+    # 100 is a legitimate "require full coverage" value, unlike 0 which can
+    # never fail. Only the *range* is invalid outside 0 < floor <= 100.
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.99"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=100)
+    found = list(CoverageDetector().detect(ctx))
+    assert len(found) == 1
+    assert found[0].evidence.data["floor"] == 100.0
+    assert not any("coverage_floor" in skip for skip in ctx.skips)
+
+
+def test_coverage_floor_fractional_half_percent_is_accepted(tmp_path):
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.001"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor=0.5)
+    found = list(CoverageDetector().detect(ctx))
+    assert len(found) == 1
+    assert found[0].evidence.data["floor"] == 0.5
+    assert not any("coverage_floor" in skip for skip in ctx.skips)
+
+
+def test_coverage_floor_numeric_string_is_accepted(tmp_path):
+    (tmp_path / "coverage.xml").write_text(
+        COVERAGE_XML.format(rate="0.41"), encoding="utf-8"
+    )
+    ctx = _ctx(tmp_path, coverage_floor="60")
+    found = list(CoverageDetector().detect(ctx))
+    assert len(found) == 1
+    assert found[0].evidence.data["floor"] == 60.0
+
+
 def _deps_ctx(tmp_path: Path, payload: str, monkeypatch, **options) -> RunContext:
     monkeypatch.setattr(
         "whetstone.lenses.hygiene.detectors.deps._run_pip_audit",

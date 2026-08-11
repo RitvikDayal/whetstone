@@ -21,6 +21,17 @@ class CoverageDetector:
 
     def detect(self, ctx: RunContext) -> Iterator[Candidate]:
         floor_raw = ctx.lens_options.get("coverage_floor", DEFAULT_FLOOR)
+        if isinstance(floor_raw, bool):
+            # isinstance(True, int) is True and float(True) == 1.0 -- reject
+            # before the numeric conversion would silently accept it. A
+            # config saying `coverage_floor: true` almost certainly meant to
+            # enable something, not to set a 1% floor.
+            ctx.skip(
+                "hygiene/coverage: coverage_floor option is a bool "
+                f"({floor_raw!r}), not a percentage; coverage was not evaluated."
+            )
+            return
+
         try:
             # Deliberately not int()-truncated: int(59.9) == 59 would loosen a
             # fractional floor and let a real regression through silently. A
@@ -32,6 +43,19 @@ class CoverageDetector:
             ctx.skip(
                 "hygiene/coverage: coverage_floor option is not a number "
                 f"({floor_raw!r}); coverage was not evaluated."
+            )
+            return
+
+        # 0 (or negative) can never fail -- it isn't a floor, it's the check
+        # turned off, and a detector that runs and reports nothing looks
+        # exactly like a clean project. 100 is kept as the legitimate
+        # "require full coverage" value; only the boundary at 0 is excluded
+        # because it is the value that can never produce a finding.
+        if not (0 < floor <= 100):
+            ctx.skip(
+                "hygiene/coverage: coverage_floor option is out of range "
+                f"({floor_raw!r}); must be > 0 and <= 100. Coverage was not "
+                "evaluated."
             )
             return
 
