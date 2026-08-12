@@ -371,11 +371,25 @@ def test_report_refuses_a_directory_target(tmp_path):
 def test_report_refuses_a_reserved_device_target(tmp_path):
     """`--out NUL` printed "Wrote ...\\NUL" and exited 0 having written
     nothing at all -- the same shape as every other finding here: a success
-    message over work that did not happen."""
+    message over work that did not happen.
+
+    The two-word phrase below is checked against WHITESPACE-NORMALIZED
+    stdout, not the raw rendering. The error message embeds the full
+    `--path`, so under a long enough basetemp Rich's word-wrap lands the
+    space between "reserved" and "device" on a line break -- reproduced
+    directly: a config directory ~130 chars deep put "a reserved \\ndevice
+    on Windows." in the rendered text, and the un-normalized substring check
+    failed while exit_code was still 1. Pinning the console width sidesteps
+    the concrete repro but not the defect class, since a hostile-enough
+    basetemp wraps at any fixed width; collapsing whitespace before the
+    substring check reconstructs the sentence regardless of where -- or
+    whether -- Rich wrapped it.
+    """
     _write_config(tmp_path)
     result = runner.invoke(app, ["report", "--path", str(tmp_path), "--out", "NUL"])
     assert result.exit_code != 0
-    assert "reserved device" in result.stdout
+    normalized_stdout = " ".join(result.stdout.split())
+    assert "reserved device" in normalized_stdout
     assert "Traceback" not in result.stdout
 
 
