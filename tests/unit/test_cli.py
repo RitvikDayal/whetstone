@@ -167,6 +167,42 @@ _NOT_CONSOLE_TEXT = frozenset(("[\ud800-\udfff]", "[\udc80-\udcff]"))
 assert len(_NOT_CONSOLE_TEXT) == 2, "the two allowlisted regex ranges collapsed"
 
 
+# `tokenize` reports an f-string as a single STRING token up to Python 3.11 and
+# as FSTRING_START / FSTRING_MIDDLE / FSTRING_END from 3.12. A scan filtering on
+# STRING alone therefore stopped seeing inside f-strings on the two 3.12 CI legs
+# -- silently, because the 3.11 legs went on passing and half a matrix reporting
+# clean looks identical to a clean matrix.
+#
+# The 3.12 names are looked up rather than written, since they do not exist on
+# 3.11 and importing them by name would be a collection error there.
+_TEXT_TOKENS = frozenset(
+    {tokenize.COMMENT, tokenize.STRING}
+    | {
+        getattr(tokenize, name)
+        for name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END")
+        if hasattr(tokenize, name)
+    }
+)
+
+
+def _non_ascii_in_text_tokens(source: str, label: str) -> tuple[list[str], int]:
+    """Offenders and the number of tokens actually inspected.
+
+    The count is returned rather than kept local so a caller can assert the scan
+    looked at something. An empty offender list means nothing on its own.
+    """
+    offenders: list[str] = []
+    inspected = 0
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type not in _TEXT_TOKENS:
+            continue
+        inspected += 1
+        for ch in token.string:
+            if ord(ch) > 127:
+                offenders.append(f"{label}:{token.start[0]}: {ch!r} (U+{ord(ch):04X})")
+    return offenders, inspected
+
+
 def test_console_output_is_ascii_only():
     """The default Windows console codepage (cp1252) mangles non-ASCII
     punctuation -- an em dash renders as '?' or 'a"', a middle dot as a box.
@@ -314,18 +350,33 @@ def test_comments_and_docstrings_in_src_are_ascii_only():
     for path in files:
         if path in exempt:
             continue
-        source = path.read_text(encoding="utf-8")
-        for token in tokenize.generate_tokens(io.StringIO(source).readline):
-            if token.type not in (tokenize.COMMENT, tokenize.STRING):
-                continue
-            inspected += 1
-            for ch in token.string:
-                if ord(ch) > 127:
-                    offenders.append(
-                        f"{path}:{token.start[0]}: {ch!r} (U+{ord(ch):04X})"
-                    )
+        found, seen = _non_ascii_in_text_tokens(
+            path.read_text(encoding="utf-8"), str(path)
+        )
+        offenders.extend(found)
+        inspected += seen
     assert inspected > 0, "no comments or strings were inspected"
     assert offenders == [], offenders
+
+
+def test_the_ascii_scan_sees_inside_an_f_string():
+    """The scan's own regression test, because its blind spot was version-shaped.
+
+    `tokenize` reports an f-string as one STRING token up to 3.11 and as
+    FSTRING_START / FSTRING_MIDDLE / FSTRING_END from 3.12, so a scan filtering
+    on STRING alone stopped looking inside f-strings on the two 3.12 CI legs
+    while the 3.11 legs went on passing. A guard that silently covers less on
+    half the matrix is the failure mode this project keeps paying for, so the
+    scanner is fed a known offender here rather than trusted.
+
+    Synthetic source, not a real file: `src/` is ASCII, so there is nothing on
+    disk that would make this go red if the filter regressed.
+    """
+    offenders, inspected = _non_ascii_in_text_tokens(
+        'x = f"caf\u00e9 {1}"\n', "<synthetic>"
+    )
+    assert inspected > 0, "no token was inspected at all"
+    assert offenders, "a non-ASCII character inside an f-string was not seen"
 
 
 # --- doctor's exit code is the CI gate ----------------------------------------
@@ -807,16 +858,22 @@ def test_the_whole_cli_command_does_not_leak_the_state_dir(tmp_path, monkeypatch
     result = runner.invoke(app, ["findings", "--path", str(project)])
     assert result.exit_code != 0
     assert _CLI_SECRET not in result.output, result.output
-    if result.exception is not None:
-        rendered = "".join(
-            traceback.TracebackException(
-                type(result.exception),
-                result.exception,
-                result.exception.__traceback__,
-                capture_locals=True,
-            ).format()
-        )
-        assert _CLI_SECRET not in rendered, rendered
+    # Asserted, not branched on. Behind `if result.exception is not None` the
+    # locals assertion -- the one that actually reproduces the reported defect,
+    # where the output assertion above holds either way -- would stop running
+    # the day the command surface handles the error and returns a code instead.
+    # It would stay green and say nothing. `CliRunner` catches the exception by
+    # default, so this holds on every failing path today.
+    assert result.exception is not None, result.output
+    rendered = "".join(
+        traceback.TracebackException(
+            type(result.exception),
+            result.exception,
+            result.exception.__traceback__,
+            capture_locals=True,
+        ).format()
+    )
+    assert _CLI_SECRET not in rendered, rendered
 
 
 def test_no_production_code_binds_a_resolved_secret_to_a_name():
