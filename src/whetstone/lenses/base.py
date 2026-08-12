@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -21,13 +22,66 @@ from ..errors import LensError
 from ..severity import Severity as Severity
 from ..severity import severity_at_least as severity_at_least
 
+# A surrogate is the one thing a Python `str` can hold that UTF-8 cannot
+# encode. `errors="surrogateescape"` produces them from bytes that were not
+# valid UTF-8, and a JSON `\ud800` escape produces one without any byte ever
+# having been malformed -- so model output, which M1a's candidates are made of,
+# reaches here carrying them by the ordinary route rather than an exotic one.
+#
+# This is the home `detectors/deps.py` named for its own copy: "the right
+# long-term home for this is `Evidence`/`Candidate` refusing unstorable text at
+# construction, so every lens inherits it instead of each one remembering". That
+# is now here, and deps.py imports it rather than keeping a second copy.
+#
+# `scope/resolver.py` keeps a DIFFERENT and deliberately narrower pattern,
+# `[\udc80-\udcff]`, and is left alone: it is specifically about what
+# surrogateescape leaves behind for a bad byte from git, which is that range and
+# only that range. Merging the two would widen a check whose narrowness is
+# argued in place.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def unstorable(value: object) -> bool:
+    """True when *value* holds text UTF-8 cannot represent, at any depth.
+
+    Shared with `detectors/deps.py`, which uses it on raw `pip-audit` output
+    before a `Candidate` is built so it can report a SKIP naming the package
+    rather than lose the whole run to a hard failure.
+
+    Mappings are walked over KEYS as well as values. This is not paranoia about
+    depth: `json.dumps` defaults to `ensure_ascii=True`, so a surrogate buried
+    in `evidence.data` serialises to the ASCII text `\\udce9`, encodes cleanly,
+    and stores without complaint -- then `json.loads` hands a real lone
+    surrogate back to whatever renders it. Encoding the serialised JSON
+    therefore cannot detect this and a structural walk is the only thing that
+    can. deps.py only ever passes strings and lists of strings, so the extra
+    arms change nothing there.
+    """
+    if isinstance(value, str):
+        return _SURROGATE.search(value) is not None
+    if isinstance(value, dict):
+        return any(
+            unstorable(key) or unstorable(item) for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(unstorable(item) for item in value)
+    return False
+
 
 def _require_text(owner: str, field_name: str, value: object) -> None:
-    """Refuse anything that is not non-blank text.
+    """Refuse anything that is not non-blank, storable text.
 
     `str` rather than "stringifiable" on purpose. Almost everything stringifies,
     which is exactly the defect: `rule_id=123` becomes "123" somewhere down the
     stack and stores cleanly under an identity no other run reproduces.
+
+    And `str` is not sufficient either. A lone surrogate is a perfectly ordinary
+    `str` that passes `isinstance` and `.strip()`, and then dies in sqlite with
+    a `UnicodeEncodeError` -- which is NOT a `WhetstoneError`, so it escapes the
+    CLI's `except WhetstoneError` and reaches the user as a bare traceback, from
+    inside a transaction whose `runs` row already exists. That is precisely the
+    failure `Evidence.__post_init__` says this validation exists to prevent, and
+    it was reachable through the front door until this check existed.
     """
     if not isinstance(value, str):
         raise LensError(
@@ -41,6 +95,13 @@ def _require_text(owner: str, field_name: str, value: object) -> None:
             f"{owner}: {field_name} is empty. An empty subject is a finding "
             "about nothing, and an empty rule_id makes every finding from a "
             "lens the same finding."
+        )
+    if unstorable(value):
+        raise LensError(
+            f"{owner}: {field_name} contains text UTF-8 cannot encode "
+            f"({ascii(value)}). sqlite would raise UnicodeEncodeError, which "
+            "is not a WhetstoneError, so it would reach the user as a bare "
+            "traceback from inside the run's own transaction."
         )
 
 
@@ -104,7 +165,7 @@ class EvidenceKind(StrEnum):
     metric = "metric"      # a measured value crossing a threshold
     repro = "repro"        # an executable artifact that fails before, passes after
     capture = "capture"    # a screenshot plus replayable navigation
-    critique = "critique"  # a judgement with a cited heuristic — never provable
+    critique = "critique"  # a judgement with a cited heuristic -- never provable
 
 
 @dataclass(frozen=True)
@@ -134,13 +195,27 @@ class Evidence:
                 f"evidence data must be a mapping, not "
                 f"{type(self.data).__name__} ({self.data!r})."
             )
+        # Structural, and BEFORE the dumps probe, because dumps cannot see it:
+        # `ensure_ascii=True` renders a surrogate as the ASCII text `\udce9`,
+        # which encodes and stores cleanly, and `json.loads` then hands a real
+        # lone surrogate back to whatever renders the finding.
+        if unstorable(self.data):
+            raise LensError(
+                "evidence data contains text UTF-8 cannot encode. It survives "
+                "json.dumps as an ASCII escape and comes back a lone surrogate "
+                "on the way out, so the failure lands on a later reader rather "
+                "than on the lens that produced it."
+            )
         try:
-            json.dumps(self.data, sort_keys=True)
+            # `allow_nan=False` because the default emits a bare `NaN`, which
+            # every JSON parser outside Python rejects: `to_json` would produce
+            # a document the store accepts and no other consumer can read.
+            json.dumps(self.data, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise LensError(
-                f"evidence data is not JSON-encodable ({exc}). It is stored as "
-                "JSON, so a value that cannot be encoded fails inside the "
-                "store's transaction rather than here."
+                f"evidence data is not storable as JSON ({exc}). It is stored "
+                "as UTF-8 JSON, so a value that cannot be encoded fails inside "
+                "the store's transaction rather than here."
             ) from None
         # `isinstance(artifacts, str)` first: a string is a sequence, so
         # `tuple("a.txt")` turns one path into eight single-character ones and
@@ -160,7 +235,16 @@ class Evidence:
                 )
 
     def to_json(self) -> str:
-        """Deterministic JSON — key order must not affect stored bytes."""
+        """Deterministic JSON -- key order must not affect stored bytes.
+
+        `allow_nan=False` matches the construction-time probe. `data` is a
+        mutable dict inside a frozen dataclass, so a lens CAN put a NaN or a
+        surrogate in after construction and reinstate the failure the probe
+        exists to prevent; freezing it would mean a deep copy on every
+        candidate. Raising here rather than emitting a bare `NaN` keeps the
+        worst case a loud failure instead of a stored document no JSON parser
+        outside Python will read.
+        """
         return json.dumps(
             {
                 "kind": str(self.kind),
@@ -169,6 +253,7 @@ class Evidence:
                 "artifacts": list(self.artifacts),
             },
             sort_keys=True,
+            allow_nan=False,
         )
 
 
@@ -178,7 +263,7 @@ class Candidate:
 
     lens: str
     rule_id: str
-    subject: str  # file path, package name, route — what this is *about*
+    subject: str  # file path, package name, route -- what this is *about*
     title: str
     detail: str
     severity: Severity

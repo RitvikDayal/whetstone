@@ -5,6 +5,7 @@ import pytest
 
 import whetstone.lenses.registry as registry_module
 from whetstone.config.model import LensConfig, ProjectConfig, WhetstoneConfig
+from whetstone.errors import LensError, WhetstoneError
 from whetstone.lenses.base import (
     Candidate,
     Evidence,
@@ -862,3 +863,106 @@ def test_get_last_run_leaves_lens_count_unknown_rather_than_claiming_zero(
     )
     assert live.lens_count == 1
     assert get_last_run(conn).lens_count is None
+
+
+# --- unstorable text must not escape as a bare traceback ---------------------
+#
+# A lone surrogate is a perfectly ordinary `str`: it passes `isinstance(v, str)`
+# and `.strip()`, and then dies at the sqlite boundary with a
+# `UnicodeEncodeError`, which is NOT a `WhetstoneError` -- so it sails past the
+# CLI's `except WhetstoneError` and reaches the user as a bare traceback, from
+# inside a transaction whose `runs` row already exists.
+#
+# Tested through `execute_run` rather than against `Candidate` alone, because
+# the store call that actually breaks is in the runner. A constructor-only test
+# is structurally unable to see whether the run survives.
+
+_LONE_SURROGATE_SUBJECT = "src/caf\udce9.py"
+
+
+class _ModelShaped:
+    """A lens shaped like M1a's: its field values came from model output, so a
+    surrogate arrives by the ordinary route rather than an exotic one."""
+
+    name = "modelshaped"
+    max_autonomy = 3
+
+    def __init__(self, **overrides):
+        self._overrides = overrides
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        fields = dict(
+            lens="modelshaped",
+            rule_id="R1",
+            subject="src/ok.py",
+            title="t",
+            detail="d",
+            severity=Severity.low,
+            evidence=Evidence(EvidenceKind.metric, "s", {"k": 1}),
+        )
+        fields.update(self._overrides)
+        yield Candidate(**fields)
+
+
+def _run_with(tmp_path, monkeypatch, pack):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(pack)
+    conn = connect(tmp_path)
+    return execute_run(
+        conn,
+        _cfg(**{pack.name: {}}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+
+@pytest.mark.parametrize("field", ["subject", "rule_id", "title", "detail", "lens"])
+def test_a_surrogate_in_any_text_field_fails_as_a_whetstone_error(
+    tmp_path, monkeypatch, field
+):
+    """Not `pytest.raises(LensError)` alone -- the assertion that matters is
+    that it is NOT a UnicodeEncodeError, because that is the class the CLI does
+    not catch."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_ModelShaped(**{field: _LONE_SURROGATE_SUBJECT}))
+    conn = connect(tmp_path)
+    with pytest.raises(WhetstoneError) as caught:
+        execute_run(
+            conn,
+            _cfg(**{"modelshaped": {}}),
+            tmp_path,
+            tmp_path,
+            tier="quick",
+            changed_only=False,
+        )
+    assert not isinstance(caught.value, UnicodeEncodeError)
+    assert field in str(caught.value)
+
+
+def test_a_surrogate_inside_evidence_data_fails_as_a_whetstone_error(tmp_path):
+    """`json.dumps` serialises a surrogate happily; the failure only appears
+    when the resulting string is encoded on its way into sqlite."""
+    with pytest.raises(LensError, match="data"):
+        Evidence(EvidenceKind.metric, "s", {"path": _LONE_SURROGATE_SUBJECT})
+    with pytest.raises(LensError, match="data"):
+        Evidence(EvidenceKind.metric, "s", {_LONE_SURROGATE_SUBJECT: "v"})
+
+
+def test_evidence_data_refuses_nan_which_no_other_json_parser_accepts(tmp_path):
+    with pytest.raises(LensError, match="data"):
+        Evidence(EvidenceKind.metric, "s", {"ratio": float("nan")})
+
+
+def test_a_clean_model_shaped_candidate_still_runs(tmp_path, monkeypatch):
+    """The population guard for the block above. Every test here asserts a
+    refusal; without this one, a `Candidate` that refused everything would
+    satisfy all of them."""
+    result = _run_with(tmp_path, monkeypatch, _ModelShaped())
+    assert result.status == "complete"
+    assert result.new == 1
+    assert [f.subject for f in list_findings(connect(tmp_path))] == ["src/ok.py"]
