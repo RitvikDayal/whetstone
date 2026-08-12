@@ -17,8 +17,31 @@ from typing import Any, Protocol, runtime_checkable
 
 # Re-exported: `Severity` is shared with `config`, which must not import the
 # lens layer. See whetstone/severity.py.
+from ..errors import LensError
 from ..severity import Severity as Severity
 from ..severity import severity_at_least as severity_at_least
+
+
+def _require_text(owner: str, field_name: str, value: object) -> None:
+    """Refuse anything that is not non-blank text.
+
+    `str` rather than "stringifiable" on purpose. Almost everything stringifies,
+    which is exactly the defect: `rule_id=123` becomes "123" somewhere down the
+    stack and stores cleanly under an identity no other run reproduces.
+    """
+    if not isinstance(value, str):
+        raise LensError(
+            f"{owner}: {field_name} must be a string, not "
+            f"{type(value).__name__} ({value!r}). Every lens field reaches "
+            "sqlite; a non-string is stored under an identity nothing else "
+            "will produce again."
+        )
+    if not value.strip():
+        raise LensError(
+            f"{owner}: {field_name} is empty. An empty subject is a finding "
+            "about nothing, and an empty rule_id makes every finding from a "
+            "lens the same finding."
+        )
 
 
 class LensScope(StrEnum):
@@ -91,6 +114,51 @@ class Evidence:
     data: dict[str, Any]
     artifacts: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        """Validate at construction, for the reason argued on `Candidate`.
+
+        `data` is probed for JSON-encodability here rather than left to
+        `to_json`, which runs inside the store's transaction: a TypeError there
+        aborts a run whose `runs` row already exists, three layers from the
+        lens that caused it.
+        """
+        if not isinstance(self.kind, EvidenceKind):
+            raise LensError(
+                f"evidence kind must be an EvidenceKind, not "
+                f"{type(self.kind).__name__} ({self.kind!r}). Valid kinds: "
+                f"{', '.join(k.value for k in EvidenceKind)}."
+            )
+        _require_text("evidence", "summary", self.summary)
+        if not isinstance(self.data, dict):
+            raise LensError(
+                f"evidence data must be a mapping, not "
+                f"{type(self.data).__name__} ({self.data!r})."
+            )
+        try:
+            json.dumps(self.data, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise LensError(
+                f"evidence data is not JSON-encodable ({exc}). It is stored as "
+                "JSON, so a value that cannot be encoded fails inside the "
+                "store's transaction rather than here."
+            ) from None
+        # `isinstance(artifacts, str)` first: a string is a sequence, so
+        # `tuple("a.txt")` turns one path into eight single-character ones and
+        # every per-item check below then passes.
+        if isinstance(self.artifacts, str) or not isinstance(
+            self.artifacts, (tuple, list)
+        ):
+            raise LensError(
+                f"evidence artifacts must be a tuple or list of paths, not "
+                f"{type(self.artifacts).__name__} ({self.artifacts!r})."
+            )
+        for index, artifact in enumerate(self.artifacts):
+            if not isinstance(artifact, str):
+                raise LensError(
+                    f"evidence artifacts[{index}] must be a string, not "
+                    f"{type(artifact).__name__} ({artifact!r})."
+                )
+
     def to_json(self) -> str:
         """Deterministic JSON — key order must not affect stored bytes."""
         return json.dumps(
@@ -115,6 +183,50 @@ class Candidate:
     detail: str
     severity: Severity
     evidence: Evidence
+
+    def __post_init__(self) -> None:
+        """Validate every leaf at construction, not per detector.
+
+        Issues #14 and #9 are one defect seen twice: a lens hands the spine a
+        field the store cannot use. It is validated HERE rather than where the
+        external data enters because a lens pack arrives through an entry point
+        -- third-party code that never saw this file -- and because M1a's
+        candidates come from a model, where a wrong-typed field is the expected
+        case rather than an exotic one.
+
+        The three `dedupe_key` components are the sharpest of them: the key
+        JSON-encodes `lens`, `rule_id` and `subject`, so a non-string does not
+        raise, it changes the hash. The finding stores cleanly under an identity
+        no later run reproduces, so it can never be deduped and a rejection
+        recorded against it can never suppress it.
+
+        `severity` must be the enum rather than anything that stringifies. That
+        is issue #9: `upsert` does `str(candidate.severity)`, so `None` was
+        stored as the string 'None' -- the row is queued, `list_findings` ranks
+        it into the ELSE bucket, and nothing says it is wrong. Every other None
+        from a lens hits a NOT NULL constraint; this was the one that became
+        plausible-looking data. 'HIGH' and 'sev-1' land in the same bucket for
+        the same reason, so a plain string is refused too and a lens that reads
+        a severity out of model output has to map it explicitly.
+        """
+        owner = self.lens if isinstance(self.lens, str) and self.lens.strip() else "lens"
+        for field_name in ("lens", "rule_id", "subject", "title", "detail"):
+            _require_text(owner, field_name, getattr(self, field_name))
+        if not isinstance(self.severity, Severity):
+            raise LensError(
+                f"{owner}: severity must be a Severity, not "
+                f"{type(self.severity).__name__} ({self.severity!r}). Valid "
+                f"severities: {', '.join(s.value for s in Severity)}. The store "
+                "writes str(severity), so anything else is recorded as "
+                "plausible-looking text and ranked below 'medium'."
+            )
+        if not isinstance(self.evidence, Evidence):
+            raise LensError(
+                f"{owner}: evidence must be an Evidence, not "
+                f"{type(self.evidence).__name__} ({self.evidence!r}). The store "
+                "calls evidence.to_json(); anything else raises AttributeError "
+                "inside the transaction."
+            )
 
     @property
     def dedupe_key(self) -> str:
