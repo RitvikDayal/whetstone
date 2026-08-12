@@ -206,7 +206,8 @@ def test_long_unbroken_detail_text_can_wrap():
     css = render_report([FINDING], project_name="demo", run=RUN).split("</style>")[0]
     rules = re.findall(r"([^{}]+)\{([^{}]*)\}", css)
     wrapping = [selector for selector, body in rules if "overflow-wrap: anywhere" in body]
-    assert any(".detail" in selector for selector in wrapping), css
+    detail_selector = re.compile(r"(?<![\w-])\.detail(?![\w-])")
+    assert any(detail_selector.search(selector) for selector in wrapping), css
 
 
 def test_html_is_escaped():
