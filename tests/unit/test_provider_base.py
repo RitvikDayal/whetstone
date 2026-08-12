@@ -12,7 +12,7 @@ def _request(**overrides) -> StageRequest:
         schema={"type": "object"},
         permissions=None,
         effort="medium",
-        max_turns=7,
+        max_budget_usd=None,
         cwd=Path("."),
     )
     base.update(overrides)

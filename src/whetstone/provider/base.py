@@ -24,22 +24,57 @@ class Usage:
     """What a stage cost. Zero means free, never unknown -- an unknown cost
     that defaults to zero silently under-reports, so a provider that cannot
     measure must say so by leaving cost_usd None rather than by omitting Usage.
+
+    The cache fields are not optional detail. A measured trivial call reported
+    `input_tokens: 4` alongside `cache_creation_input_tokens: 41036`, because
+    the subprocess inherits whatever configuration the operator has installed.
+    A budget reading `input_tokens` alone would have under-reported that stage
+    by four orders of magnitude, so anything summing tokens must sum all four.
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
     cost_usd: float | None = None
     wall_seconds: float = 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        """Every token the stage was billed for, cached or not.
+
+        Exists so no caller has to remember the four-field shape, which is
+        exactly the mistake that makes a budget under-report.
+        """
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+        )
 
 
 @dataclass(frozen=True)
 class StageRequest:
+    """One stage's ask. Everything the provider needs and nothing it decides.
+
+    `max_budget_usd` rather than a turn count, because the Claude Code CLI has
+    no `--max-turns` and does have `--max-budget-usd`. The first spelling was
+    written before anybody ran the binary; a request field no provider consumes
+    is a bound the caller believes it set and nothing enforces, which is the
+    same defect as a code path that declines work without saying so.
+
+    None means unbounded, and that is a real choice rather than a missing value:
+    Task 9's budget holds the run-level ceiling, so a stage that declines to set
+    its own is deferring to it, not escaping it.
+    """
+
     stage: str
     prompt: str
     schema: dict[str, Any]
     permissions: Any
     effort: str
-    max_turns: int
+    max_budget_usd: float | None
     cwd: Path
 
 
