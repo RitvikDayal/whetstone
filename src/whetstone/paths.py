@@ -38,7 +38,7 @@ _CLOUD_MARKERS = (
 # "omega" and "megabyte", which are ordinary directory names.
 _CLOUD_COMPONENTS = frozenset({"mega"})
 
-# An unexpanded variable left over after os.path.expandvars — the name was not
+# An unexpanded variable left over after os.path.expandvars -- the name was not
 # set in the environment, and creating the path would make a directory named
 # after the reference. WHICH spellings count is platform-specific, because which
 # ones are legal in a path is platform-specific.
@@ -49,7 +49,7 @@ _CLOUD_COMPONENTS = frozenset({"mega"})
 # Windows: `%VAR%` is the native spelling and the one a Windows user writes, and
 # ntpath.expandvars leaves it literal when the name is unset. `$` is deliberately
 # NOT flagged there: it is a legal filename character that real system
-# directories use — `$Recycle.Bin`, `$WINDOWS.~BT` — so treating `$Recycle` as a
+# directories use -- `$Recycle.Bin`, `$WINDOWS.~BT` -- so treating `$Recycle` as a
 # failed expansion rejects valid paths, which is the same defect pointed the
 # other way. ntpath.expandvars still expands `$VAR` when the name IS set; only
 # the unset case goes unreported on Windows, and it is not the spelling anyone
@@ -106,7 +106,48 @@ def assert_not_cloud_synced(path: Path, *, override: str | None = None) -> None:
 
 
 def state_root(project_root: Path, override: str | None = None) -> Path:
-    """Resolve, validate, and create the state directory for *project_root*."""
+    """Resolve, validate, and create the state directory for *project_root*.
+
+    A thin wrapper whose only job is issue #3: keeping the resolved `state_dir`
+    out of every frame a traceback renderer can reach.
+
+    `traceback.TracebackException(capture_locals=True)` renders each local with
+    `repr()`, and `rich`, `better-exceptions` and every Sentry-style reporter
+    turn it on. `_state_root`'s `root` and `_make_dir`'s `root` are Paths built
+    from the resolved override, so a user with any of those installed got the
+    credential in their error output -- past the `<elided>` message, because
+    message-level elision never reaches a frame's locals, and a Sentry user
+    shipped it to a third party.
+
+    Message-level elision cannot be extended to cover this, so the frames
+    themselves are removed instead. A failure with an override behind it is
+    re-raised from HERE, which gives the new exception a traceback that starts
+    at this frame -- the inner frames belonged to the caught exception and do
+    not carry over -- and `override` is deleted before the raise so this frame
+    holds nothing either. The re-raise is OUTSIDE the except block for the
+    reason `_make_dir` already documents: inside it, Python attaches the
+    original as `__context__` and every chain-walking renderer prints its
+    locals anyway.
+
+    The cost is the inner frames' location detail on an override failure. That
+    is the trade: a state_dir error already tells the user which setting is
+    wrong, which is the actionable half.
+
+    With NO override there is no secret and nothing is elided, so the original
+    exception propagates untouched and keeps its full traceback.
+    """
+    try:
+        return _state_root(project_root, override)
+    except (StateDirError, UnsafeStatePathError, ConfigError) as exc:
+        if override is None:
+            raise
+        failure, message = type(exc), str(exc)
+    del override
+    raise failure(message)
+
+
+def _state_root(project_root: Path, override: str | None) -> Path:
+    """Resolve, validate, and create the state directory. See `state_root`."""
     if override is None:
         digest = hashlib.sha256(
             str(project_root.resolve()).encode("utf-8")
@@ -116,7 +157,7 @@ def state_root(project_root: Path, override: str | None = None) -> Path:
         root = _root_from_override(override)
         # A relative `state_dir` is relative to the PROJECT, not to wherever the
         # user happened to be standing. find_config walks up to locate the
-        # config, so the CWD is routinely somewhere below project_root — or, for
+        # config, so the CWD is routinely somewhere below project_root -- or, for
         # a tool pointed at someone else's repository, somewhere else entirely.
         # Resolving against the CWD would scatter a project's state across every
         # directory it was ever invoked from.

@@ -227,6 +227,56 @@ def test_console_output_is_ascii_only():
     assert offenders == [], offenders
 
 
+# The decorators whose docstrings Typer renders. `@app.command()` puts a
+# function's docstring in `whetstone --help` (as the command summary) and in
+# `whetstone <cmd> --help` (as the description); `@app.callback()` does the same
+# for the root. Verified by running both, not inferred from the library.
+_TYPER_DECORATORS = frozenset({"command", "callback"})
+
+
+def _typer_decorated(node: ast.AST) -> bool:
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    for decorator in node.decorator_list:
+        call = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(call, ast.Attribute) and call.attr in _TYPER_DECORATORS:
+            return True
+    return False
+
+
+def test_typer_help_text_is_ascii_only():
+    """A command's DOCSTRING is console output, and the scan above exempts
+    docstrings.
+
+    That exemption is right for the rest of `src/`, where docstrings are prose
+    nobody prints -- the codebase uses em dashes throughout and flagging them
+    would make the guard noise. It is wrong here: Typer renders the docstring of
+    an `@app.command()` function as the command summary in `whetstone --help`
+    and as the description in `whetstone <cmd> --help`. So the one category of
+    docstring that IS console output had no gate at all, which is the same shape
+    of hole the literal scan above was widened to close.
+    """
+    cli_path = Path(__file__).resolve().parents[2] / "src" / "whetstone" / "cli.py"
+    tree = ast.parse(cli_path.read_text(encoding="utf-8"), filename=str(cli_path))
+    offenders: list[str] = []
+    inspected = 0
+    for node in ast.walk(tree):
+        if not _typer_decorated(node):
+            continue
+        doc = ast.get_docstring(node, clean=False)
+        if doc is None:
+            continue
+        inspected += 1
+        for ch in doc:
+            if ord(ch) > 127:
+                offenders.append(f"{cli_path}:{node.lineno}: {ch!r} (U+{ord(ch):04X})")
+    # `whetstone --help` lists six commands plus the root callback. Asserting a
+    # floor rather than nothing: a decorator rename, or an AST shape change,
+    # would otherwise leave `offenders == []` trivially true.
+    assert inspected >= 6, f"only {inspected} Typer docstrings were inspected"
+    assert offenders == [], offenders
+
+
 # --- doctor's exit code is the CI gate ----------------------------------------
 
 

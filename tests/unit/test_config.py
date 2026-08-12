@@ -4,6 +4,7 @@ import traceback
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from whetstone.config.loader import CONFIG_NAME, _scrub_runs, find_config, load_config
 from whetstone.config.model import OnCeiling, Tier, Trust
@@ -117,7 +118,10 @@ def test_env_reference_is_interpolated(tmp_path, monkeypatch):
         """,
     )
     cfg = load_config(path)
-    assert cfg.environment.app.auth["password"] == "s3cret"
+    # A secret-shaped key yields a SecretStr, not a plain string -- the design
+    # call for issue #2, argued in `loader._interpolate`. This assertion used to
+    # read `== "s3cret"`, and that plain string was what `repr(config)` printed.
+    assert cfg.environment.app.auth["password"].get_secret_value() == "s3cret"
 
 
 def test_missing_env_reference_is_an_error(tmp_path, monkeypatch):
@@ -203,7 +207,8 @@ def test_env_reference_is_case_insensitive_on_the_prefix(tmp_path, monkeypatch):
             auth: { kind: form, password: "${ENV:DEMO_PW}" }
         """,
     )
-    assert load_config(path).environment.app.auth["password"] == "s3cret"
+    auth = load_config(path).environment.app.auth
+    assert auth["password"].get_secret_value() == "s3cret"
 
 
 def test_runtime_placeholder_named_env_something_is_untouched(tmp_path):
@@ -892,3 +897,147 @@ def test_an_unknown_lens_key_outside_options_is_still_rejected(tmp_path):
     )
     with pytest.raises(ConfigError, match="coverage_floor"):
         load_config(path)
+
+
+# --- issue #2: a secret under a free-form dict must render like state_dir -----
+#
+# `state_dir` is a SecretStr, so it prints as **********. A credential under
+# `environment.app.auth` was a plain string in the same object and printed in
+# full. It is the WORSE of the two, because `_reject_literal_secrets`
+# GUARANTEES a secret-shaped key holds a `${env:...}` reference, so after
+# interpolation that value is always a real credential -- there is no
+# false-positive class here at all.
+
+
+def _auth_config(tmp_path, monkeypatch, secret: str):
+    monkeypatch.setenv("DEMO_PW", secret)
+    return load_config(
+        _write(
+            tmp_path,
+            """
+            version: 1
+            project: { name: demo }
+            environment:
+              app:
+                auth: { kind: form, password: "${env:DEMO_PW}" }
+            """,
+        )
+    )
+
+
+def test_a_secret_under_a_free_form_dict_is_a_secret_str(tmp_path, monkeypatch):
+    """The design call for issue #2: a secret-shaped key yields a SecretStr, the
+    same thing `state_dir` yields, and the consumer says get_secret_value().
+
+    The alternatives were a plain string (the defect) and a bespoke accessor.
+    SecretStr wins because it is already the codebase's answer for exactly this
+    problem one field away, it masks repr, str, model_dump and model_dump_json
+    in one move, and it forces the one consumer to name what it is reaching for.
+    """
+    cfg = _auth_config(tmp_path, monkeypatch, "s3cret")
+    assert isinstance(cfg.environment.app.auth["password"], SecretStr)
+    assert cfg.environment.app.auth["password"].get_secret_value() == "s3cret"
+    # A non-secret key beside it is untouched: this wraps by key name, not by
+    # "was interpolated".
+    assert cfg.environment.app.auth["kind"] == "form"
+
+
+def test_a_secret_under_a_free_form_dict_never_reaches_a_renderer(
+    tmp_path, monkeypatch
+):
+    secret = "ghp_R3alSecretValue0000000000000000000000"
+    cfg = _auth_config(tmp_path, monkeypatch, secret)
+    for where, text in {
+        "repr": repr(cfg),
+        "str": str(cfg),
+        "model_dump_json": cfg.model_dump_json(),
+        "repr(model_dump)": repr(cfg.model_dump()),
+    }.items():
+        assert secret not in text, f"the resolved auth.password reached {where}"
+
+
+def test_every_secret_shaped_key_in_a_free_form_dict_is_wrapped(
+    tmp_path, monkeypatch
+):
+    """The population guard. `assert secret not in repr(cfg)` also holds when
+    nothing was interpolated at all, so count the wrapped values and assert the
+    count is what the config declared."""
+    secret = "ghp_R3alSecretValue0000000000000000000000"
+    for index, name in enumerate(("A", "B", "C")):
+        monkeypatch.setenv(f"DEMO_{name}", f"{secret}{index}")
+    cfg = load_config(
+        _write(
+            tmp_path,
+            """
+            version: 1
+            project: { name: demo }
+            environment:
+              app:
+                auth:
+                  kind: form
+                  password: "${env:DEMO_A}"
+                  api_key: "${env:DEMO_B}"
+            model:
+              stages:
+                hunt: { token: "${env:DEMO_C}" }
+            """,
+        )
+    )
+    wrapped = [
+        cfg.environment.app.auth["password"],
+        cfg.environment.app.auth["api_key"],
+        cfg.model.stages["hunt"]["token"],
+    ]
+    assert len(wrapped) == 3
+    assert all(isinstance(value, SecretStr) for value in wrapped), wrapped
+    rendered = repr(cfg) + cfg.model_dump_json()
+    assert secret not in rendered
+
+
+# --- issue #3: capture_locals renders locals, and two held secrets ------------
+#
+# `rich`, `better-exceptions` and every Sentry-style reporter build a traceback
+# with capture_locals=True. It renders each local with repr(), which the
+# redaction of the MESSAGE never reaches. A user with any of those installed got
+# the credential in their error output; a Sentry user shipped it to a third
+# party.
+
+
+def _locals_rendering(exc: BaseException) -> str:
+    """Render *exc* the way rich / Sentry do, over the PRODUCTION frames only.
+
+    `tb_next` drops the calling test's own frame. Without that, the test's
+    `secret = "ghp_..."` local is itself rendered and every assertion below
+    fails on the test harness rather than on the code under test.
+    """
+    tb = exc.__traceback__.tb_next if exc.__traceback__ else None
+    return "".join(
+        traceback.TracebackException(
+            type(exc), exc, tb, capture_locals=True
+        ).format()
+    )
+
+
+def test_capture_locals_does_not_render_a_resolved_secret_from_the_loader(
+    tmp_path, monkeypatch
+):
+    secret = "ghp_R3alSecretValue0000000000000000000000"
+    monkeypatch.setenv("DEMO_PW", secret)
+    path = _write(
+        tmp_path,
+        """
+        version: 1
+        project: { name: demo }
+        budget: { tier: nonsense }
+        environment:
+          app:
+            auth: { kind: form, password: "${env:DEMO_PW}" }
+        """,
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    rendered = _locals_rendering(caught.value)
+    # The population guard: a rendering with no locals section in it proves
+    # nothing, because the secret is absent from an empty string too.
+    assert "resolved_secrets" in rendered or "secrets =" in rendered, rendered
+    assert secret not in rendered, rendered

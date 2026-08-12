@@ -362,3 +362,63 @@ def test_relative_state_dir_resolves_against_the_project_not_the_cwd(
 
     assert result == (project / ".whetstone-state").resolve()
     assert not (elsewhere / ".whetstone-state").exists()
+
+
+# --- issue #3: capture_locals renders locals, and `root` held the secret ------
+#
+# `traceback.TracebackException(capture_locals=True)` renders every local with
+# repr(). `paths.py`'s `root` is a Path built from the resolved `state_dir`, so
+# a user running `rich`, `better-exceptions` or a Sentry-style reporter got the
+# credential in their error output -- past every message-level elision, because
+# the elision never reached a frame's locals.
+
+
+def _locals_rendering(exc: BaseException) -> str:
+    """Render *exc* the way rich / Sentry do, over the PRODUCTION frames only.
+
+    `tb_next` drops the calling test's own frame. Without that, the test's
+    `secret = "ghp_..."` local is itself rendered and every assertion below
+    fails on the test harness rather than on the code under test.
+    """
+    tb = exc.__traceback__.tb_next if exc.__traceback__ else None
+    return "".join(
+        traceback.TracebackException(
+            type(exc), exc, tb, capture_locals=True
+        ).format()
+    )
+
+
+@pytest.mark.parametrize(
+    "case", ["resolved-file", "resolved-under-file", "cloud-synced"]
+)
+def test_capture_locals_does_not_render_the_resolved_state_dir(tmp_path, case):
+    if case == "resolved-file":
+        target = tmp_path / _SECRET
+        target.write_text("not a directory", encoding="utf-8")
+        override = str(target)
+    elif case == "resolved-under-file":
+        blocker = tmp_path / _SECRET
+        blocker.write_text("not a directory", encoding="utf-8")
+        override = str(blocker / "deep" / "state")
+    else:
+        override = str(tmp_path / "OneDrive" / _SECRET)
+
+    with pytest.raises((StateDirError, UnsafeStatePathError)) as caught:
+        state_root(tmp_path, override)
+    rendered = _locals_rendering(caught.value)
+    # The population guard: capture_locals renders a `<locals>` block per frame,
+    # and an empty rendering satisfies the absence assertion for free.
+    assert "project_root =" in rendered, rendered
+    assert _SECRET not in rendered, rendered
+
+
+def test_the_default_state_path_is_still_rendered_in_locals(tmp_path, monkeypatch):
+    """The counterweight. Scoping the override out of the frame must not strip
+    the DEFAULT path too -- that one holds nothing the user did not already
+    know, and eliding it makes an ordinary error unactionable."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    blocker = tmp_path / "home"
+    blocker.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(StateDirError) as caught:
+        state_root(tmp_path)
+    assert "home" in _locals_rendering(caught.value)
