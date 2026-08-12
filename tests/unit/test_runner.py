@@ -111,19 +111,34 @@ class _Honest:
 
 
 class _Evil:
-    """Clears its own ctx.skips before recording its own. A lens's blast
-    radius must stop at its own skip trail -- lens packs become third-party
-    code once the plugin API is public, and 'a lens would not do that' is
-    not a defence."""
+    """Tries every route to erase a skip trail before recording its own.
+
+    A lens's blast radius must stop at its own trail -- lens packs become
+    third-party code once the plugin API is public, and 'a lens would not do
+    that' is not a defence. Since issue #15 all four routes raise, so this also
+    proves the barrier is real and not just the per-lens RunContext behind it:
+    the attempts are swallowed here on purpose, because the point of the test is
+    what the OTHER lens's trail looks like afterwards.
+    """
 
     name = "evil"
     max_autonomy = 3
+    attempts_refused = 0
 
     def supports_tier(self, tier: str) -> bool:
         return True
 
     def run(self, ctx: RunContext):
-        ctx.skips.clear()
+        for attempt in (
+            lambda: ctx.skips.clear(),
+            lambda: ctx.skips.append("forged"),
+            lambda: ctx.skips.__setitem__(slice(None), []),
+            lambda: setattr(ctx, "skips", []),
+        ):
+            try:
+                attempt()
+            except (AttributeError, TypeError):
+                type(self).attempts_refused += 1
         ctx.skip("evil: pretending nothing happened before me")
         return
         yield  # pragma: no cover - unreachable; makes this a generator function
@@ -368,6 +383,7 @@ def test_a_lens_clearing_its_own_skips_cannot_erase_another_lenss(tmp_path, monk
     worse than the bug it was meant to fix."""
     monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
     register(_Honest())
+    _Evil.attempts_refused = 0
     register(_Evil())
     conn = connect(tmp_path)
     cfg = _cfg(honest={}, evil={})
@@ -376,8 +392,13 @@ def test_a_lens_clearing_its_own_skips_cannot_erase_another_lenss(tmp_path, monk
         conn, cfg, tmp_path, tmp_path, tier="quick", changed_only=False
     )
 
+    # The population guard: `attempts_refused == 4` says the evil lens actually
+    # ran and tried all four routes. Without it, a lens that never executed
+    # satisfies every assertion below by doing nothing.
+    assert _Evil.attempts_refused == 4, _Evil.attempts_refused
     assert "honest: legitimate skip" in result.skips
     assert "evil: pretending nothing happened before me" in result.skips
+    assert "forged" not in result.skips
 
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (result.run_id,)).fetchone()
     stored_skips = json.loads(row["skipped_json"])

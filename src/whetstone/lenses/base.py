@@ -265,7 +265,36 @@ class RunContext:
     tier: str
     lens_options: dict[str, Any]
     run_id: str
-    skips: list[str] = field(default_factory=list)
+    # Private, with `skip()` as the only writer and `skips` a read-only view.
+    #
+    # This was a plain public list, so a lens could clear its own trail
+    # (`ctx.skips.clear()`, `ctx.skips[:] = []`), rebind the attribute
+    # (`ctx.skips = []`), or forge an entry that no skip() call produced. The
+    # blast radius is self-only -- every lens gets a freshly constructed
+    # RunContext, which is deliberate; sharing the run's list into every context
+    # was tried, let one lens erase every other lens's trail while the run still
+    # reported status='complete', and was reverted. What remained was that a
+    # lens's own skip record is not trustworthy, which matters little for
+    # first-party code and a lot once lens packs are third-party.
+    #
+    # RESIDUAL, stated rather than implied: Python has no enforceable privacy,
+    # so `ctx._skips` is still reachable by a lens that goes looking for it.
+    # What this closes is every path that does not have to say so -- the public
+    # name is now a snapshot, and reaching past it is a deliberate act that
+    # shows up in a diff. A lens pack running in-process can always be trusted
+    # exactly as far as the process is; real isolation is a subprocess boundary,
+    # which is what M1a's provider gives the model-driven stages.
+    _skips: list[str] = field(default_factory=list, repr=False)
+
+    @property
+    def skips(self) -> tuple[str, ...]:
+        """The skips recorded so far, as a snapshot.
+
+        A tuple rather than the list itself: returning the list would be the
+        same mutable handle wearing a property. A tuple copy also means a view
+        taken before a later `skip()` cannot be used to reach back into it.
+        """
+        return tuple(self._skips)
 
     @property
     def options(self) -> dict[str, Any]:
@@ -285,8 +314,14 @@ class RunContext:
         return value if isinstance(value, dict) else {}
 
     def skip(self, reason: str) -> None:
-        """Record work not done. A skip that is not reported is a bug."""
-        self.skips.append(reason)
+        """Record work not done. A skip that is not reported is a bug.
+
+        The only writer. *reason* must be non-blank text because a skip is
+        rendered straight into the console and the HTML report, and the whole
+        point of a skip is that a human reads it.
+        """
+        _require_text("skip", "reason", reason)
+        self._skips.append(reason)
 
 
 @runtime_checkable

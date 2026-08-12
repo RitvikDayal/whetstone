@@ -248,6 +248,77 @@ def test_run_context_carries_scope(tmp_path):
     assert ctx.files == (Path("src/a.py"),)
 
 
+# --- skips are append-only through skip() (issue #15) -------------------------
+
+
+def _ctx(tmp_path) -> RunContext:
+    return RunContext(
+        project_root=tmp_path,
+        state_root=tmp_path / "state",
+        files=(),
+        tier="quick",
+        lens_options={},
+        run_id="run-1",
+    )
+
+
+def test_skip_is_the_only_writer(tmp_path):
+    ctx = _ctx(tmp_path)
+    ctx.skip("a")
+    ctx.skip("b")
+    assert list(ctx.skips) == ["a", "b"]
+
+
+def test_a_lens_cannot_erase_its_own_trail(tmp_path):
+    """`ctx.skips.clear()` and `ctx.skips[:] = []` were both live: the list was
+    the attribute, so a lens could report work not done and then unreport it."""
+    ctx = _ctx(tmp_path)
+    ctx.skip("pip-audit did not run")
+    with pytest.raises(AttributeError):
+        ctx.skips.clear()
+    with pytest.raises(TypeError):
+        ctx.skips[:] = []
+    assert list(ctx.skips) == ["pip-audit did not run"]
+
+
+def test_a_lens_cannot_forge_an_entry(tmp_path):
+    ctx = _ctx(tmp_path)
+    with pytest.raises(AttributeError):
+        ctx.skips.append("nothing was wrong")
+    assert list(ctx.skips) == []
+
+
+def test_a_lens_cannot_rebind_the_attribute(tmp_path):
+    """Rebinding was the simplest erasure of all: `ctx.skips = []`."""
+    ctx = _ctx(tmp_path)
+    ctx.skip("real")
+    with pytest.raises(AttributeError):
+        ctx.skips = []
+    assert list(ctx.skips) == ["real"]
+
+
+def test_the_view_is_a_snapshot_not_a_live_handle(tmp_path):
+    """A view handed out before a later skip must not be a route back into the
+    list -- that is the same mutable handle wearing a property."""
+    ctx = _ctx(tmp_path)
+    ctx.skip("first")
+    view = ctx.skips
+    ctx.skip("second")
+    assert list(view) == ["first"]
+    assert list(ctx.skips) == ["first", "second"]
+
+
+def test_a_skip_reason_must_be_text(tmp_path):
+    """A skip is rendered into the console and the HTML report. A non-string
+    reaches those as whatever it stringifies to, or as a template error."""
+    ctx = _ctx(tmp_path)
+    with pytest.raises(LensError, match="skip"):
+        ctx.skip(None)
+    with pytest.raises(LensError, match="skip"):
+        ctx.skip("")
+    assert list(ctx.skips) == []
+
+
 def test_load_plugins_failure_is_sticky_not_silently_partial(monkeypatch):
     import whetstone.lenses.registry as registry_module
 

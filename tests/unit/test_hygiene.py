@@ -448,7 +448,7 @@ def test_a_measurement_exactly_on_the_floor_still_passes(tmp_path):
     )
     ctx = _ctx(tmp_path, coverage_floor=60)
     assert list(CoverageDetector().detect(ctx)) == []
-    assert ctx.skips == []
+    assert ctx.skips == ()
 
 
 # --- CodeRabbit round: an `only` entry that names no detector ---------------
