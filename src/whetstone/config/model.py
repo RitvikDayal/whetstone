@@ -86,7 +86,7 @@ class ContextConfig(_Strict):
 
 
 class ModelConfig(_Strict):
-    """Unused in M0 — no model calls exist yet."""
+    """Unused in M0 -- no model calls exist yet."""
 
     provider: str | None = None
     model: str | None = None

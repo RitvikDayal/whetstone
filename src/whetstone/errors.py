@@ -63,7 +63,7 @@ class CommandFailed(WhetstoneError):
 
 
 class LensError(WhetstoneError):
-    """A lens pack misbehaved — bad contract, unhandled failure."""
+    """A lens pack misbehaved -- bad contract, unhandled failure."""
 
 
 class ReportError(WhetstoneError):

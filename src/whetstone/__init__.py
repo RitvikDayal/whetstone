@@ -1,4 +1,4 @@
-"""Whetstone — evidence-gated project improvement."""
+"""Whetstone -- evidence-gated project improvement."""
 
 from __future__ import annotations
 

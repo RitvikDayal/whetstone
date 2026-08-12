@@ -39,7 +39,7 @@ class Finding:
     """The stored form of a Candidate.
 
     `evidence` is a plain dict decoded from the stored JSON, not the
-    `Evidence` dataclass `Candidate` carries — reaching for `.evidence.kind`
+    `Evidence` dataclass `Candidate` carries -- reaching for `.evidence.kind`
     here raises `AttributeError`; use `.evidence["kind"]`.
     """
 
@@ -125,7 +125,7 @@ def upsert(
     deliberately excludes title, detail, and severity so a reworded or
     re-scored candidate is still recognised as the same finding, and that is
     only useful if the new wording and score then reach the stored row.
-    `state` is never touched here — a finding already in the table keeps its
+    `state` is never touched here -- a finding already in the table keeps its
     state, so a rejection can never be undone by re-running.
 
     The existence check and the insert are two separate statements, so two

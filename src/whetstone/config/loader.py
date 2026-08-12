@@ -34,15 +34,15 @@ class _ResolvedSecrets(dict):
 
 CONFIG_NAME = "whetstone.yaml"
 
-# Matches ${env:VAR_NAME} (env prefix case-insensitive, variable name is not —
+# Matches ${env:VAR_NAME} (env prefix case-insensitive, variable name is not --
 # environment variable names are case-sensitive). Deliberately narrower than
-# ${VAR} so that runtime placeholders Whetstone substitutes itself —
-# ${WHETSTONE_PORT} — pass through.
+# ${VAR} so that runtime placeholders Whetstone substitutes itself --
+# ${WHETSTONE_PORT} -- pass through.
 _ENV_REF = re.compile(r"\$\{[Ee][Nn][Vv]:([A-Za-z_][A-Za-z0-9_]*)\}")
 
 # Words that name a secret. Matched as whole WORDS, never as substrings.
 # Substring matching caught every conventional spelling and a pile of ordinary
-# config with it — `max_tokens`, `tokenizer`, `secretary`, `credentialing`,
+# config with it -- `max_tokens`, `tokenizer`, `secretary`, `credentialing`,
 # `passwords_enabled` were all rejected, and a tool that will not load someone's
 # valid config is its own defect.
 #
@@ -50,7 +50,7 @@ _ENV_REF = re.compile(r"\$\{[Ee][Nn][Vv]:([A-Za-z_][A-Za-z0-9_]*)\}")
 # quantity or a collection rather than one secret value: `max_tokens` is an LLM
 # setting, `passwords_enabled` a feature flag. Demanding `${env:...}` there
 # makes ordinary documents unloadable with no escape hatch. `credentials` stays
-# because that is simply how the thing is spelled — nobody writes `credential:`
+# because that is simply how the thing is spelled -- nobody writes `credential:`
 # for an auth blob.
 _SECRET_WORDS = frozenset(
     {
@@ -154,7 +154,7 @@ def load_config(path: Path) -> WhetstoneConfig:
         ) from exc
     except OSError as exc:
         # Covers IsADirectoryError, PermissionError, and the assorted platform
-        # spellings of the same two mistakes — Windows raises PermissionError
+        # spellings of the same two mistakes -- Windows raises PermissionError
         # where POSIX raises IsADirectoryError for a directory.
         detail = "it is a directory" if path.is_dir() else str(exc)
         raise ConfigError(f"{path} could not be read: {detail}") from exc
