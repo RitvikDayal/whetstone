@@ -8,12 +8,11 @@ It never merges and it never deploys.
 
 **Status:** M0's deterministic core verified end-to-end on encode/httpcore on
 2026-08-12 -- `init` -> `doctor` -> `run` -> `findings` -> `report`, locally on
-Windows. The report's bytes were read and checked directly, not rendered in a
-browser: the shared DevTools profile used for that was locked by another
-session. Full transcript, and what remains before M0 can be called done (a
-browser render, and the Ubuntu/Windows x 3.11/3.12 CI matrix, neither run by
-this task), in
-`.superpowers/sdd/2026-08-10-whetstone-m0-plan/task-12-report.md`.
+Windows. Full transcript in
+`.superpowers/sdd/2026-08-10-whetstone-m0-plan/task-12-report.md`; the fixes
+from the adversarial review of that work are in `pr5-adversarial-fixes.md`
+beside it. Still outstanding before M0 is done: the Ubuntu/Windows x
+3.11/3.12 CI matrix.
 
 ## Install
 
@@ -25,9 +24,9 @@ cd whetstone
 uv sync --all-groups
 ```
 
-## Planned commands
+## Commands
 
-None of these do anything yet. They are installed and they tell you so.
+All six are real.
 
 ```bash
 whetstone init      # interactive setup; verifies every answer by running it
@@ -35,7 +34,29 @@ whetstone doctor    # re-verifies the config against reality
 whetstone run       # find issues
 whetstone findings  # list what it found
 whetstone report    # write a shareable HTML report
+whetstone version   # print the installed version
 ```
+
+### Exit codes
+
+| Command | 0 | non-zero |
+|---|---|---|
+| `doctor` | every check passed or was skipped | any check FAILed |
+| `run` | at least one lens ran | **no lens ran at all**, or the config could not be loaded |
+| `findings` | listed (possibly nothing) | bad `--state`, or the config could not be loaded |
+| `report` | written | `--out` refused, or the config could not be loaded |
+
+`run` exiting 0 does **not** mean nothing was found — a run that did its job
+and found something is a success, and `doctor` is the gate for broken
+infrastructure. But a run in which **no lens ran** exits 1: a config with no
+`lenses:` key, or with every lens disabled or unavailable, examines nothing,
+and "nothing was checked" must never be indistinguishable from "nothing is
+wrong". Whatever could not run is printed under **Not everything was checked**,
+and the same list is carried into the HTML report.
+
+If the last run did not finish — you pressed Ctrl-C, or a lens failed partway —
+`findings` and `report` both say so before showing anything. A partial run's
+empty result is not a clean bill of health.
 
 ## The hygiene lens
 
