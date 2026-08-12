@@ -5,16 +5,22 @@ from __future__ import annotations
 import ast
 import contextlib
 import importlib.metadata
+import io
 import re
 import subprocess
 import sys
+import textwrap
+import tokenize
+import traceback
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, SecretStr
 from typer.testing import CliRunner
 
 import whetstone
 from whetstone.cli import app
+from whetstone.errors import WhetstoneError
 
 runner = CliRunner()
 
@@ -148,8 +154,8 @@ def test_source_contains_no_merge_or_push_invocation():
 
 
 # Two literals in src/ are regex character classes over the surrogate range,
-# used to CONTAIN text that cannot be stored -- `deps.py`'s `_SURROGATE` and
-# `scope/resolver.py`'s equivalent. They are never printed and could not be
+# used to CONTAIN text that cannot be stored -- `lenses/base.py`'s `_SURROGATE`
+# and `scope/resolver.py`'s narrower equivalent. They are never printed and could not be
 # spelled in ASCII. Allowlisted by exact value rather than by file, so moving
 # one keeps it exempt and inventing a third has to be a deliberate edit here.
 #
@@ -184,9 +190,11 @@ def test_console_output_is_ascii_only():
     string literal in src/ that is not a docstring -- the only boundary that
     does not depend on guessing which literals end up on a console.
 
-    Comments and docstrings stay out of scope; the codebase uses em dashes in
-    prose throughout. `report/html.py` is UTF-8 HTML, not a console, and is
-    exempt.
+    Comments and docstrings are covered by their own tests below rather than
+    here, because the reason each is in scope is different: a Typer docstring is
+    console output, and a comment is not console output at all but is now held
+    to ASCII anyway. `report/html.py` is UTF-8 HTML, not a console, and is
+    exempt from all three.
 
     `inspected` counts every non-docstring string literal this walk actually
     looked at, asserted non-zero before the offender assertion: an empty
@@ -274,6 +282,49 @@ def test_typer_help_text_is_ascii_only():
     # floor rather than nothing: a decorator rename, or an AST shape change,
     # would otherwise leave `offenders == []` trivially true.
     assert inspected >= 6, f"only {inspected} Typer docstrings were inspected"
+    assert offenders == [], offenders
+
+
+def test_comments_and_docstrings_in_src_are_ascii_only():
+    """Comments are not console output. They are held to ASCII regardless.
+
+    The earlier stance was that comments should stay out of scope "because the
+    codebase uses em dashes in prose throughout", and that was a fair reading of
+    the cost at the time: flagging thirty existing sites would have made the
+    guard noise. It is no longer true -- `src/` is ASCII throughout now, apart
+    from `report/html.py`, which is a UTF-8 HTML template rather than anything a
+    console renders.
+
+    So the trade has inverted. With nothing to flag, the rule costs nothing to
+    hold, and holding it mechanically is the difference between a property and a
+    periodic cleanup. Without this test the conversion regresses the first time
+    someone pastes prose from an editor that smart-quotes, and the next reviewer
+    raises it again -- which is exactly how it got raised this time.
+
+    Comments AND docstrings, in one pass over the token stream: `tokenize` sees
+    every comment, and the AST scan above deliberately exempts docstrings, so
+    this is the only place the two are covered together.
+    """
+    src = Path(__file__).resolve().parents[2] / "src" / "whetstone"
+    exempt = {src / "report" / "html.py"}
+    files = sorted(src.rglob("*.py"))
+    assert len(files) >= 5, f"only found {files}; the scan is not reaching src/"
+    offenders: list[str] = []
+    inspected = 0
+    for path in files:
+        if path in exempt:
+            continue
+        source = path.read_text(encoding="utf-8")
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type not in (tokenize.COMMENT, tokenize.STRING):
+                continue
+            inspected += 1
+            for ch in token.string:
+                if ord(ch) > 127:
+                    offenders.append(
+                        f"{path}:{token.start[0]}: {ch!r} (U+{ord(ch):04X})"
+                    )
+    assert inspected > 0, "no comments or strings were inspected"
     assert offenders == [], offenders
 
 
@@ -688,3 +739,161 @@ def test_report_prints_a_path_that_can_be_copied(tmp_path, monkeypatch):
     result = runner.invoke(app, ["report", "--path", str(tmp_path), "--out", str(out)])
     assert result.exit_code == 0, result.stdout
     assert str(out) in result.stdout
+
+
+# --- issue #3, on the PRODUCTION path -----------------------------------------
+#
+# The first fix scrubbed paths.py's own frames and was tested by calling
+# `state_root` directly -- which is structurally unable to see the frame that
+# actually leaked. `cli._load` unwrapped the SecretStr into a local one frame
+# up, so a `capture_locals` rendering of a real CLI failure still printed the
+# credential in full and the issue's headline scenario, a Sentry user shipping
+# it to a third party, still happened verbatim.
+#
+# These tests go through `_load` and through the CLI. A helper-level test is not
+# an acceptable substitute for either.
+
+_CLI_SECRET = "state-secret-XYZ-0123456789"
+
+
+def _config_with_secret_state_dir(tmp_path, monkeypatch) -> Path:
+    """A project whose `state_dir` resolves, through `${env:...}`, onto a path
+    that already exists as a FILE -- so creating it fails and raises."""
+    blocker = tmp_path / _CLI_SECRET
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("DEMO_STATE", str(blocker / "deep"))
+    (tmp_path / "whetstone.yaml").write_text(
+        textwrap.dedent(
+            """
+            version: 1
+            project: { name: demo }
+            state_dir: "${env:DEMO_STATE}"
+            """
+        ),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def _production_locals(exc: BaseException) -> str:
+    """Render *exc* the way rich / Sentry do, over the production frames only.
+
+    `tb_next` drops the calling test's frame, whose own `_CLI_SECRET` local
+    would otherwise be what the assertion measures.
+    """
+    tb = exc.__traceback__.tb_next if exc.__traceback__ else None
+    return "".join(
+        traceback.TracebackException(type(exc), exc, tb, capture_locals=True).format()
+    )
+
+
+def test_load_does_not_leak_the_state_dir_into_capture_locals(tmp_path, monkeypatch):
+    from whetstone.cli import _load
+
+    project = _config_with_secret_state_dir(tmp_path, monkeypatch)
+    with pytest.raises(WhetstoneError) as caught:
+        _load(project)
+    rendered = _production_locals(caught.value)
+    # Population guard: capture_locals renders one block per frame, and an empty
+    # rendering satisfies the absence assertion for free.
+    assert "project_root =" in rendered or "cfg =" in rendered, rendered
+    assert _CLI_SECRET not in rendered, rendered
+
+
+def test_the_whole_cli_command_does_not_leak_the_state_dir(tmp_path, monkeypatch):
+    """One level further out than `_load`: whatever the command surface does
+    with the exception, no frame it passes through may hold the plaintext."""
+    project = _config_with_secret_state_dir(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["findings", "--path", str(project)])
+    assert result.exit_code != 0
+    assert _CLI_SECRET not in result.output, result.output
+    if result.exception is not None:
+        rendered = "".join(
+            traceback.TracebackException(
+                type(result.exception),
+                result.exception,
+                result.exception.__traceback__,
+                capture_locals=True,
+            ).format()
+        )
+        assert _CLI_SECRET not in rendered, rendered
+
+
+def test_no_production_code_binds_a_resolved_secret_to_a_name():
+    """The mechanical guard that keeps the trap from being reset.
+
+    `capture_locals` renders `frame.f_locals`, so a `get_secret_value()` result
+    is safe as long as it is passed or returned and never bound. This walks
+    `src/` for an assignment whose value contains such a call -- which is
+    exactly the shape `cli._load` had.
+    """
+    src = Path(__file__).resolve().parents[2] / "src" / "whetstone"
+    files = sorted(src.rglob("*.py"))
+    assert len(files) >= 5, f"only found {files}; the scan is not reaching src/"
+    offenders: list[str] = []
+    calls_seen = 0
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get_secret_value"
+            ):
+                calls_seen += 1
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                continue
+            if node.value is None:
+                continue
+            for inner in ast.walk(node.value):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "get_secret_value"
+                ):
+                    offenders.append(f"{path}:{node.lineno}")
+    # Population guard: with no `get_secret_value` call anywhere, an empty
+    # offender list says nothing at all.
+    assert calls_seen > 0, "no get_secret_value call was found; the scan is vacuous"
+    assert offenders == [], (
+        "a resolved secret is bound to a local, so capture_locals will render "
+        "it. Pass or return the unwrapped value instead:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_no_typed_config_field_is_named_like_a_secret():
+    """A latent trap in the #2 fix, guarded rather than left to be discovered.
+
+    `_interpolate` wraps by KEY NAME, so a typed model field named `api_key` or
+    `token` would start receiving a `SecretStr` where the annotation says `str`,
+    and every config carrying it would fail with a confusing pydantic error.
+    No collision exists today; this keeps it that way.
+    """
+    from whetstone.config import model as model_module
+    from whetstone.config.loader import _is_secret_key
+
+    models = [
+        value
+        for value in vars(model_module).values()
+        if isinstance(value, type)
+        and issubclass(value, BaseModel)
+        and value is not BaseModel
+    ]
+    assert len(models) >= 5, f"only found {models}; the scan is not reaching the models"
+    checked = 0
+    offenders: list[str] = []
+    for model in models:
+        for name, info in model.model_fields.items():
+            checked += 1
+            if _is_secret_key(name) and info.annotation not in (
+                SecretStr,
+                SecretStr | None,
+            ):
+                offenders.append(f"{model.__name__}.{name}: {info.annotation}")
+    assert checked > 0, "no model fields were inspected"
+    assert offenders == [], (
+        "a typed config field is named like a secret, so `_interpolate` will "
+        "hand it a SecretStr the annotation does not accept:\n  "
+        + "\n  ".join(offenders)
+    )

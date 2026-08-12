@@ -7,6 +7,8 @@ import os
 import re
 from pathlib import Path
 
+from pydantic import SecretStr
+
 from .errors import ConfigError, StateDirError, UnsafeStatePathError
 
 # Substrings that indicate a file-replacing sync client owns the directory.
@@ -105,11 +107,38 @@ def assert_not_cloud_synced(path: Path, *, override: str | None = None) -> None:
         )
 
 
-def state_root(project_root: Path, override: str | None = None) -> Path:
+def _plain(override: SecretStr | str | None) -> str | None:
+    """Unwrap a `SecretStr` here, so no CALLER has to hold the plaintext.
+
+    Returned rather than assigned anywhere on purpose: a `return` puts the value
+    on the value stack, and `capture_locals` reads `frame.f_locals`. Binding it
+    to a name in any frame that a raise passes through is the whole defect this
+    guards.
+    """
+    return (
+        override.get_secret_value() if isinstance(override, SecretStr) else override
+    )
+
+
+def state_root(
+    project_root: Path, override: SecretStr | str | None = None
+) -> Path:
     """Resolve, validate, and create the state directory for *project_root*.
 
     A thin wrapper whose only job is issue #3: keeping the resolved `state_dir`
     out of every frame a traceback renderer can reach.
+
+    *override* takes the `SecretStr` straight off the config. That is the point,
+    not a convenience: the first fix for this issue scrubbed paths.py's own
+    frames and left `cli._load` binding
+    `cfg.state_dir.get_secret_value()` one frame up, so a `capture_locals`
+    rendering of a real CLI failure still printed the credential in full and the
+    issue's headline scenario -- a Sentry user shipping it to a third party --
+    still happened verbatim. A helper that only cleans its own frames leaves
+    that trap set for every caller. Unwrapping HERE means no caller ever holds
+    the plaintext, and `tests/unit/test_cli.py` scans `src/` to keep it that
+    way. A plain `str` is still accepted, for the tests that construct one
+    directly.
 
     `traceback.TracebackException(capture_locals=True)` renders each local with
     `repr()`, and `rich`, `better-exceptions` and every Sentry-style reporter
@@ -137,11 +166,13 @@ def state_root(project_root: Path, override: str | None = None) -> Path:
     exception propagates untouched and keeps its full traceback.
     """
     try:
-        return _state_root(project_root, override)
+        return _state_root(project_root, _plain(override))
     except (StateDirError, UnsafeStatePathError, ConfigError) as exc:
         if override is None:
             raise
         failure, message = type(exc), str(exc)
+    # `del` even though a SecretStr already masks its own repr: a caller may
+    # legitimately pass a plain str, and this frame must be clean either way.
     del override
     raise failure(message)
 
