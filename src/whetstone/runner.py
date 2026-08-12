@@ -31,6 +31,58 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def get_last_run(conn: sqlite3.Connection) -> RunResult | None:
+    """Reconstruct the most recently STARTED run, skips included, or None.
+
+    None means no run has ever happened here -- a distinct state from a run
+    that happened and recorded no skips, and callers (the HTML report, in
+    particular) must be able to tell the two apart rather than rendering
+    both as silence.
+
+    Ordered by started_at, not finished_at or status: a run that failed
+    mid-way is exactly the one whose skips and partial file_count matter
+    most to whoever reads a report generated afterward, so filtering out
+    anything but status='complete' would hide the run most worth surfacing.
+
+    Tied by SQLite's implicit rowid as a second key. `started_at` is an
+    ISO-8601 string from `datetime.now(UTC)`, and two `execute_run` calls
+    close enough together landed on the identical string in practice --
+    measured directly in this test suite, not a theoretical worry -- which
+    made plain `ORDER BY started_at DESC LIMIT 1` pick whichever row SQLite
+    felt like on a tie, and it was consistently the OLDER one. `runs.id` is
+    TEXT, not the rowid, but rowid still exists and still increases with
+    insertion order, so it recovers the real ordering a tied string cannot.
+
+    `new`/`seen` are not columns on `runs` (see the schema in store/db.py) --
+    they are derived here from `findings.first_seen_run`/`last_seen_run`
+    against this run's own id, the same counts `execute_run` itself produced
+    live while upserting. Defaulting them to 0 instead would silently render
+    a real run's history as if nothing happened, which is the exact kind of
+    quiet loss this module exists to forbid.
+    """
+    row = conn.execute(
+        "SELECT * FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    run_id = row["id"]
+    new = conn.execute(
+        "SELECT COUNT(*) FROM findings WHERE first_seen_run = ?", (run_id,)
+    ).fetchone()[0]
+    seen = conn.execute(
+        "SELECT COUNT(*) FROM findings WHERE last_seen_run = ? AND first_seen_run != ?",
+        (run_id, run_id),
+    ).fetchone()[0]
+    return RunResult(
+        run_id=run_id,
+        tier=row["tier"],
+        file_count=row["file_count"],
+        new=new,
+        seen=seen,
+        skips=json.loads(row["skipped_json"]),
+    )
+
+
 # M0 ships one sink: the built-in store, which every command already reads.
 # Anything else declared in config is not silently dropped.
 _IMPLEMENTED_SINKS = frozenset({"dashboard"})

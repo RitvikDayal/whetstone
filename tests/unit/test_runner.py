@@ -13,7 +13,7 @@ from whetstone.lenses.base import (
     Severity,
 )
 from whetstone.lenses.registry import register
-from whetstone.runner import execute_run
+from whetstone.runner import execute_run, get_last_run
 from whetstone.store.db import connect
 from whetstone.store.findings import list_findings
 
@@ -659,3 +659,68 @@ def test_without_the_option_the_default_floor_still_applies(tmp_path):
     assert not any(
         skip.startswith("hygiene/coverage") for skip in result.skips
     ), result.skips
+
+
+# --- get_last_run: report --out needs a run's skips, not just its findings ---
+
+
+def test_get_last_run_returns_none_when_no_run_has_happened(tmp_path):
+    """A store with no run row at all is a distinct state from a run with no
+    skips -- the caller must be able to tell them apart."""
+    conn = connect(tmp_path)
+    assert get_last_run(conn) is None
+
+
+def test_get_last_run_carries_the_stored_skips(tmp_path, monkeypatch):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    conn = connect(tmp_path)
+    execute_run(
+        conn, _cfg(nosuchlens={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    last = get_last_run(conn)
+    assert last is not None
+    assert any("not installed" in skip for skip in last.skips)
+
+
+def test_get_last_run_derives_new_and_seen_from_the_findings_table(
+    tmp_path, monkeypatch
+):
+    """`runs` has no new/seen columns; fabricating them as 0 would be exactly
+    the kind of dishonest silence this project exists to forbid, so they are
+    derived from `findings.first_seen_run`/`last_seen_run` against the run's
+    own id -- the same evidence `execute_run` itself counted live."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub(count=2))
+    conn = connect(tmp_path)
+
+    execute_run(conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False)
+    first = get_last_run(conn)
+    assert (first.new, first.seen) == (2, 0)
+
+    execute_run(conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False)
+    second = get_last_run(conn)
+    assert (second.new, second.seen) == (0, 2)
+
+
+def test_get_last_run_prefers_a_later_failed_run_over_an_earlier_complete_one(
+    tmp_path, monkeypatch
+):
+    """Ordered by started_at, not finished_at or status: a run that failed
+    mid-way is exactly the one whose skips matter most to a reader of a
+    report generated afterward, so excluding failed runs from "most recent"
+    would hide the run most worth surfacing."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub())
+    register(_ImmediateBoom())
+    conn = connect(tmp_path)
+
+    execute_run(conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False)
+    with pytest.raises(RuntimeError):
+        execute_run(
+            conn, _cfg(boom={}), tmp_path, tmp_path, tier="quick", changed_only=False
+        )
+
+    failed_row = conn.execute("SELECT id FROM runs WHERE status = 'failed'").fetchone()
+    last = get_last_run(conn)
+    assert last is not None
+    assert last.run_id == failed_row["id"]

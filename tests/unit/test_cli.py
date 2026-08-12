@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.metadata
 import re
 import subprocess
@@ -123,6 +124,55 @@ def test_source_contains_no_merge_or_push_invocation():
     assert offenders == [], offenders
 
 
+def test_console_output_is_ascii_only():
+    """The default Windows console codepage (cp1252) mangles non-ASCII
+    punctuation -- an em dash renders as '?', a middle dot as a box glyph.
+
+    This exact defect shipped once: a middle dot ('·') crept into `run`'s
+    console.print calls when the placeholder cli.py -- whose own comment
+    warned about this by name -- was replaced wholesale, and the comment did
+    not survive the replacement. A comment alone did not stop it recurring
+    once; this scans every literal string argument passed to
+    `console.print`/`console.input`/`typer.echo` for a non-ASCII character.
+
+    Comments and docstrings are not console output and are out of scope --
+    the codebase uses em dashes in prose throughout. `report/html.py`'s
+    template is UTF-8 HTML, not a console, and is explicitly exempt (the
+    task brief allows non-ASCII there).
+    """
+    src = Path(__file__).resolve().parents[2] / "src" / "whetstone"
+    exempt = {src / "report" / "html.py"}
+    offenders: list[str] = []
+    for path in sorted(src.rglob("*.py")):
+        if path in exempt:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            target = node.func.value
+            is_console_call = (
+                node.func.attr in ("print", "input")
+                and isinstance(target, ast.Name)
+                and target.id == "console"
+            ) or (
+                node.func.attr == "echo"
+                and isinstance(target, ast.Name)
+                and target.id == "typer"
+            )
+            if not is_console_call:
+                continue
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Constant) or not isinstance(sub.value, str):
+                    continue
+                for ch in sub.value:
+                    if ord(ch) > 127:
+                        offenders.append(
+                            f"{path}:{node.lineno}: {ch!r} (U+{ord(ch):04X})"
+                        )
+    assert offenders == [], offenders
+
+
 # --- doctor's exit code is the CI gate ----------------------------------------
 
 
@@ -186,7 +236,41 @@ def test_run_without_full_defaults_to_changed_only(tmp_path, monkeypatch):
     assert calls["changed_only"] is True
 
 
-# --- report: --out is user-supplied and is not trusted blindly ---------------
+# --- report: the invariant a stale report is worse than none is only real
+# if the actual CLI wires a run's skips into the actual HTML. ------------------
+
+
+def test_report_shows_skips_from_the_real_last_run_end_to_end(tmp_path):
+    """Through the real CLI and the real store, not a hand-built RunResult.
+
+    `render_report` proves the "Not everything was checked" banner in
+    isolation, but `report()` used to call it with `run=None` always, which
+    made that banner unreachable through the only command a user has. A
+    bogus, unregistered lens produces a real skip via a real `whetstone run`;
+    `whetstone report` against that same state must surface it.
+    """
+    (tmp_path / "whetstone.yaml").write_text(
+        "version: 1\n"
+        "project:\n"
+        "  name: demo\n"
+        "state_dir: .whetstone-state\n"
+        "lenses:\n"
+        "  bogus-lens: {}\n",
+        encoding="utf-8",
+    )
+    run_result = runner.invoke(app, ["run", "--path", str(tmp_path)])
+    assert run_result.exit_code == 0, run_result.stdout
+    assert "not installed" in run_result.stdout
+
+    out = tmp_path / "out.html"
+    report_result = runner.invoke(
+        app, ["report", "--path", str(tmp_path), "--out", str(out)]
+    )
+    assert report_result.exit_code == 0, report_result.stdout
+    html = out.read_text(encoding="utf-8")
+    assert "Not everything was checked" in html
+    assert "bogus-lens" in html
+    assert "not installed" in html
 
 
 def test_report_writes_a_self_contained_file(tmp_path):

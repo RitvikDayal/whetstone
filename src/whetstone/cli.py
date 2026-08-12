@@ -16,7 +16,7 @@ from .errors import ReportError, WhetstoneError
 from .initialize.wizard import run_wizard
 from .paths import state_root
 from .report.html import render_report, write_report
-from .runner import execute_run
+from .runner import execute_run, get_last_run
 from .store.db import connect
 from .store.findings import list_findings
 
@@ -26,6 +26,14 @@ app = typer.Typer(
 )
 console = Console()
 
+# ASCII only in anything that reaches console.print(): the default Windows
+# console codepage (cp1252) mangles an em dash to "?" and a middle dot to a
+# box glyph. The placeholder cli.py this module replaced carried this same
+# warning verbatim, and it was lost when the placeholder was deleted -- a
+# middle-dot separator crept back into this exact `run` command as a result
+# and shipped once before review caught it. Comments and docstrings are not
+# console output and are exempt; `report/html.py`'s template is UTF-8 HTML,
+# not a console, and is exempt too.
 _PathOption = typer.Option(Path("."), "--path", help="Project root.")
 # Module-level singletons, not inline calls: ruff's B008 exempts a bare
 # `typer.Option(...)` default when the parameter is a plain builtin type, but
@@ -156,12 +164,12 @@ def run(
 
     console.print(
         f"[bold]{result.new} new[/bold], {result.seen} already known "
-        f"· tier {result.tier} · {result.file_count} files in scope"
+        f"- tier {result.tier} - {result.file_count} files in scope"
     )
     if result.skips:
         console.print("\n[yellow]Not everything was checked:[/yellow]")
         for skip in result.skips:
-            console.print(f"  · {skip}")
+            console.print(f"  - {skip}")
 
 
 @app.command()
@@ -195,9 +203,16 @@ def report(
     """Write a self-contained HTML report."""
     try:
         cfg, project_root, root = _load(path.resolve())
-        rows = list_findings(connect(root), state="queued")
+        conn = connect(root)
+        rows = list_findings(conn, state="queued")
+        # The most recent run's skips, not None: a report standing in for a
+        # run that examined less than it claimed must say so, and it can only
+        # say so if the run that produced this state actually reaches the
+        # template. See runner.get_last_run for why "most recent" includes a
+        # failed run rather than filtering it out.
+        run = get_last_run(conn)
         target = _report_target(project_root, out)
-        html = render_report(rows, project_name=cfg.project.name, run=None)
+        html = render_report(rows, project_name=cfg.project.name, run=run)
         written = write_report(target, html)
     except WhetstoneError as exc:
         console.print(f"[red]{exc}[/red]")
