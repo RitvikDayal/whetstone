@@ -6,6 +6,22 @@ for the commands themselves and for the argument-list spellings a subprocess
 call would use.
 
 This file names every forbidden string, so it scans src/ only and never itself.
+
+Scope: this is a static scan of source TEXT. It proves Whetstone's own code
+contains no literal call to these commands -- it does NOT prove no such
+command can ever execute. `doctor.py` runs arbitrary user-declared strings
+under `shell=True` by design (see its module docstring), so a whetstone.yaml
+declaring `test: git push origin main` runs under doctor and this guard stays
+green; the scan cannot see through `shell=True` into a runtime string. That
+is the intended boundary.
+
+Authorship (human-written config vs. model-authored) is the boundary for the
+command STRING, and it is not the boundary for what actually runs: `shell=True`
+with `cwd=project_root` lets cmd.exe resolve a `git.bat` in the project root
+ahead of `git.EXE` on PATH, so even a string nobody would object to can execute
+the repository's own code. doctor.py's module docstring carries the measurement.
+Do not restate the boundary as authorship alone -- this file said that, and it
+was wrong in a way that reads as reassuring.
 """
 
 from __future__ import annotations

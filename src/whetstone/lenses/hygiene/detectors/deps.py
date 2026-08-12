@@ -15,17 +15,16 @@ manifest shape that cannot be targeted skips loudly instead of falling back.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
-import signal
 import subprocess
 import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from ...._subprocess import close_pipes, kill_and_reap, new_group
 from ...base import Candidate, Evidence, EvidenceKind, RunContext, Severity
 
 _PYPROJECT = "pyproject.toml"
@@ -40,9 +39,6 @@ _MANIFESTS = (_PYPROJECT, _REQUIREMENTS, _SETUP_CFG)
 _PIP_AUDIT_ARGV: tuple[str, ...] = ("pip-audit",)
 
 _TIMEOUT_SECONDS = 120
-# How long to wait for a killed process tree to release the pipes. Bounded, so
-# a kill that does not take cannot reintroduce the unbounded wait it fixes.
-_REAP_SECONDS = 15
 
 
 @dataclass(frozen=True)
@@ -189,48 +185,6 @@ def _plan_audit(project_root: Path) -> _AuditPlan | str:
     )
 
 
-def _new_group() -> dict[str, object]:
-    """Popen keywords that make the child's whole tree killable as one unit."""
-    if os.name == "nt":
-        # `taskkill /T` walks the parent/child chain directly, so no group flag
-        # is needed -- and CREATE_NEW_PROCESS_GROUP would also detach the child
-        # from console signals for no gain here.
-        return {}
-    return {"start_new_session": True}
-
-
-def _kill_tree(proc: subprocess.Popen[str]) -> None:
-    """Kill the child AND anything it started.
-
-    Killing only the direct child leaves a grandchild holding the inherited
-    stdout pipe, so the read that follows never sees EOF. pip-audit shells out
-    to pip, so this is the ordinary case, not an exotic one.
-
-    Cannot raise. This is best-effort cleanup on an exception path, and the
-    caller re-raises the original exception straight after calling it -- a
-    KeyboardInterrupt or a TimeoutExpired the user needs to see. A cleanup
-    error escaping from here replaces that with itself and the `raise` never
-    runs, so the reap below it is skipped too. `Popen.kill()` suppresses the
-    already-dead race on both platforms, but not every OSError it can raise.
-    """
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-                timeout=_REAP_SECONDS,
-            )
-        else:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (OSError, subprocess.SubprocessError):
-        # Already gone, or the platform refused. Fall through to the direct
-        # child so the caller is never left waiting on a live process.
-        pass
-    finally:
-        with contextlib.suppress(OSError):
-            proc.kill()
-
-
 def _run_pip_audit(project_root: Path, args: list[str]) -> str:
     """Run pip-audit against *args* and return raw JSON.
 
@@ -238,12 +192,15 @@ def _run_pip_audit(project_root: Path, args: list[str]) -> str:
     outlives its bound, RuntimeError on any other non-success exit.
     """
     argv = [*_PIP_AUDIT_ARGV, "--format", "json", "--progress-spinner", "off", *args]
-    # `with`, so the pipes are closed and the child reaped on every exit, not
-    # just the two this function names. Note that Popen.__exit__ ends in an
-    # UNBOUNDED wait(), which is why the handler below kills the tree first:
-    # the context manager is what guarantees cleanup, the kill is what keeps
-    # that cleanup bounded.
-    with subprocess.Popen(
+    # Not a `with`. The context manager was adopted to guarantee the pipes close
+    # and the child is reaped on every exit, not just the ones this function
+    # names -- and that guarantee is worth keeping. What came attached to it was
+    # `Popen.__exit__`'s bare unbounded `wait()`, which runs on every exit that
+    # is not a KeyboardInterrupt and so undid the bound the kill exists to
+    # provide. Measured with the kill neutered: the reap returned on schedule
+    # and the function returned 73 seconds later. `close_pipes` in the `finally`
+    # is the guarantee without the wait; see `_subprocess.py`'s docstring.
+    proc = subprocess.Popen(
         argv,
         cwd=project_root,
         stdout=subprocess.PIPE,
@@ -261,27 +218,30 @@ def _run_pip_audit(project_root: Path, args: list[str]) -> str:
         # the decode without the containment just moves the crash from
         # json.loads to sqlite.
         errors="surrogateescape",
-        **_new_group(),
-    ) as proc:
-        try:
-            raw, err = proc.communicate(timeout=_TIMEOUT_SECONDS)
-        except BaseException:
-            # BaseException, not TimeoutExpired: Ctrl-C in the middle of a slow
-            # audit used to propagate straight past this and leave pip-audit --
-            # and the pip it shelled out to -- running with the pipes still
-            # open. The timeout is not the only way out of a communicate().
-            _kill_tree(proc)
-            # The tree is dead; if the reader threads still have not closed,
-            # they are not worth waiting on further. Surfacing the original
-            # exception is what matters, and this wait is bounded so it cannot
-            # reintroduce the unbounded one it exists to fix.
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=_REAP_SECONDS)
-            raise
-        # pip-audit exits 1 when it finds vulnerabilities -- success for us.
-        if proc.returncode not in (0, 1):
-            raise RuntimeError((err or "").strip() or f"exit {proc.returncode}")
-        return raw or ""
+        **new_group(),
+    )
+    try:
+        raw, err = proc.communicate(timeout=_TIMEOUT_SECONDS)
+    except BaseException:
+        # BaseException, not TimeoutExpired: Ctrl-C in the middle of a slow
+        # audit used to propagate straight past this and leave pip-audit --
+        # and the pip it shelled out to -- running with the pipes still
+        # open. The timeout is not the only way out of a communicate().
+        # `kill_and_reap` kills the tree, then drains what's left of the
+        # pipes with its own bounded timeout, so surfacing the original
+        # exception below cannot be blocked by a reap that never finishes.
+        kill_and_reap(proc)
+        raise
+    # `communicate()` returned, so the reader threads are done and the pipes are
+    # already closed. `kill_and_reap` handles the paths that do not get here,
+    # and leaves the pipes alone when its own drain hits the bound -- closing
+    # them there blocks on the stuck reader thread, which is the same unbounded
+    # wait by a different route.
+    close_pipes(proc)
+    # pip-audit exits 1 when it finds vulnerabilities -- success for us.
+    if proc.returncode not in (0, 1):
+        raise RuntimeError((err or "").strip() or f"exit {proc.returncode}")
+    return raw or ""
 
 
 class DepsDetector:
