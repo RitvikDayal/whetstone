@@ -422,3 +422,64 @@ def test_the_default_state_path_is_still_rendered_in_locals(tmp_path, monkeypatc
     with pytest.raises(StateDirError) as caught:
         state_root(tmp_path)
     assert "home" in _locals_rendering(caught.value)
+
+
+# --- the resolve() failures that are not OSError ------------------------------
+#
+# `state_root` removes the frames holding the resolved state_dir by catching the
+# three whetstone errors and re-raising from its own frame. Anything NOT in that
+# clause travels out with every inner frame intact, and `_state_root`'s `root`
+# is built from the override. `Path.resolve()` has two such exits -- RuntimeError
+# for a symlink loop, ValueError for an embedded NUL -- and the loop message
+# interpolates the path, so that one leaks through the text as well.
+#
+# Injected rather than provoked: creating a symlink loop needs a privilege this
+# Windows host does not hold, and an embedded NUL resolves without complaint on
+# Windows while raising ValueError on POSIX. Reasoning about a branch instead of
+# running it is how the EISDIR defect on this branch reached CI, so both arms
+# run on either host.
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError(f"Symlink loop from '{_SECRET}'"),
+        ValueError("embedded null byte"),
+        OSError(40, "Too many levels of symbolic links"),
+    ],
+    ids=["symlink-loop", "embedded-nul", "oserror"],
+)
+def test_a_resolve_failure_does_not_carry_the_state_dir_out(
+    tmp_path, monkeypatch, failure
+):
+    def _boom(self, *args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(Path, "resolve", _boom)
+    with pytest.raises(ConfigError) as caught:
+        state_root(tmp_path, str(tmp_path / _SECRET))
+    _assert_secret_is_unreachable(caught.value, _SECRET)
+    rendered = _locals_rendering(caught.value)
+    assert "project_root =" in rendered, rendered
+    assert _SECRET not in rendered, rendered
+
+
+def test_a_resolve_failure_without_an_override_still_names_the_path(
+    tmp_path, monkeypatch
+):
+    """The counterweight. The default state directory holds nothing the user did
+    not already know, and eliding it makes an ordinary error unactionable."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+
+    real_resolve = Path.resolve
+
+    def _boom(self, *args, **kwargs):
+        if "home" in str(self):
+            raise RuntimeError("Symlink loop from 'home'")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", _boom)
+    with pytest.raises(ConfigError) as caught:
+        state_root(tmp_path)
+    assert "home" in str(caught.value)
+    assert "<elided>" not in str(caught.value)

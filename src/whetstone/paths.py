@@ -194,10 +194,54 @@ def _state_root(project_root: Path, override: str | None) -> Path:
         # directory it was ever invoked from.
         if not root.is_absolute():
             root = project_root / root
-    root = root.resolve()
+    root = _resolve_root(root, override)
     assert_not_cloud_synced(root, override=override)
     _make_dir(root, override)
     return root
+
+
+def _resolve_root(root: Path, override: str | None) -> Path:
+    """`Path.resolve()`, plus the two failures it raises that are not OSError.
+
+    `resolve()` raises `RuntimeError` for a symlink loop and `ValueError` for an
+    embedded NUL. Neither is an `OSError`, so neither was in `state_root`'s
+    except clause, and an override-derived path took both straight past the one
+    place that removes the frames `capture_locals` reads. The `RuntimeError` is
+    the worse of the two: CPython builds its message as `Symlink loop from
+    '<path>'`, so the resolved `state_dir` was in the message text as well.
+
+    Which of them is reachable is platform-specific -- POSIX raises `ValueError`
+    for a NUL where Windows resolves the same string without complaint -- so
+    both are converted here rather than only the one this host can produce.
+    `ConfigError` is already in `state_root`'s clause, so converting is all this
+    needs to do; the frame removal is that function's job and stays there.
+    """
+    try:
+        return root.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        source = (
+            "`state_dir` in whetstone.yaml"
+            if override is not None
+            else "the default state directory"
+        )
+        # The exception's own text is elided with everything else. It is not
+        # incidentally safe: the symlink-loop message interpolates the path.
+        detail = (
+            type(exc).__name__
+            if override is not None
+            else f"{type(exc).__name__}: {exc}"
+        )
+        message = (
+            f"{source} names {_shown(root, override)}, which cannot be resolved "
+            f"to a real location ({detail}).\n"
+            "A symlink loop in the path, or a NUL byte in the value, both land "
+            "here. Point `state_dir` at a plain directory."
+            + (_ELISION_NOTE if override is not None else "")
+        )
+    # Outside the except block, for the reason `_make_dir` documents at length:
+    # inside it Python attaches the caught exception as `__context__`, and every
+    # chain-walking renderer then prints the text this message exists to elide.
+    raise ConfigError(message)
 
 
 def _root_from_override(override: str) -> Path:
