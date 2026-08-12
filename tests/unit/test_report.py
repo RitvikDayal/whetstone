@@ -247,6 +247,23 @@ def test_write_report_refuses_a_directory_target(tmp_path):
         write_report(target, "<html></html>", project_root=tmp_path)
 
 
+def test_write_report_refuses_to_write_into_dot_git(tmp_path):
+    """The entry point behind the barrier rule: `--out .git/config`.
+
+    `write_report` passes an empty `BoundariesConfig` deliberately, so the
+    refusal cannot come from `never_touch` and has to be unconditional. The
+    assertion is the file's contents, not the exception -- a barrier that
+    refuses after truncating has not refused.
+    """
+    (tmp_path / ".git").mkdir()
+    config = tmp_path / ".git" / "config"
+    original = "[core]\n\thooksPath = .githooks\n"
+    config.write_text(original, encoding="utf-8")
+    with pytest.raises(ReportError):
+        write_report(config, "<html></html>", project_root=tmp_path)
+    assert config.read_text(encoding="utf-8") == original
+
+
 def test_write_report_wraps_an_os_error_instead_of_raising_raw(tmp_path):
     """A missing parent directory raises FileNotFoundError from write_text;
     that must reach the CLI as a named WhetstoneError, not a bare traceback."""

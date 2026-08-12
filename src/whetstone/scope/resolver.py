@@ -23,7 +23,7 @@ import stat
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
-from typing import IO
+from typing import IO, NoReturn
 
 import pathspec
 
@@ -222,6 +222,25 @@ def is_write_forbidden(
     except ValueError:
         return True
 
+    # `.git` is refused unconditionally, at any depth, whatever the boundaries
+    # say. It is the one directory inside the worktree where writing is not an
+    # edit to the project but an edit to what the project DOES: a planted
+    # `core.hooksPath` in `.git/config` runs attacker-chosen code on the next
+    # ordinary git command, and `.git/hooks/` is more direct still.
+    #
+    # Unconditional because `never_touch` cannot be relied on to carry it. The
+    # one production caller today, `report.write_report`, deliberately passes an
+    # empty `BoundariesConfig` -- `--out` is the user naming a file, not
+    # Whetstone editing a repository -- so `--out .git/config` reached
+    # `guarded_write` and truncated it. Leaving this to a default entry in
+    # `never_touch` would put it back one `BoundariesConfig()` away.
+    #
+    # Case-folded because Windows and macOS filesystems are, so `.GIT/config`
+    # opens the same file, and every depth rather than the first component
+    # because a submodule's git directory is nested.
+    if any(part.lower() == ".git" for part in relative.parts):
+        return True
+
     # A component the filesystem will rename out from under the match. Windows
     # strips trailing dots and spaces at the syscall, so `secrets.env.` is the
     # file `secrets.env` once it lands -- but `Path.resolve()` canonicalises
@@ -323,8 +342,41 @@ def _open_for_write(target: Path) -> tuple[int, bool]:
 _SYMLINK_REFUSED = frozenset({errno.ELOOP, errno.EMLINK})
 
 
-def _reraise_open_failure(target: Path, exc: OSError) -> None:
-    """Raise the barrier's error for a symlink refusal; re-raise anything else."""
+def _reraise_open_failure(target: Path, exc: OSError) -> NoReturn:
+    """Raise the barrier's error for a symlink refusal; re-raise anything else.
+
+    `NoReturn`, not `None`, and it is load-bearing rather than decorative.
+    `_open_for_write` ends both of its `except OSError` arms with a call to this
+    function and is declared `-> tuple[int, bool]`. Typed `-> None`, those two
+    arms read as falling off the end and returning `None`, which `guarded_write`
+    would then unpack -- a `TypeError` about a non-sequence in place of the
+    refusal. Only the raise in here prevents it, and `NoReturn` is what puts
+    that fact in the signature instead of in a reader's head.
+
+    THE LINE THIS DRAWS, because it was asked directly of the directory case:
+    `WriteForbiddenError` means THE BARRIER REFUSED -- never_touch, containment,
+    a symlink, a hardlink, an identity mismatch. Every other failure keeps its
+    own type and its own errno.
+
+    So EISDIR is deliberately NOT wrapped, and neither is EACCES, ENOSPC or
+    ENAMETOOLONG. A directory is a user naming the wrong thing, not a security
+    decision, and three reasons keep it on this side of the line:
+
+    - Wrapping it re-blurs the boundary that was just fixed. These errors used
+      to read as "the barrier refused you" with the errno discarded, which is
+      how a full disk came to look like a policy violation.
+    - The named, actionable error already exists at the layer that owns user
+      input. `report.write_report` checks `is_dir()` before calling here and
+      wraps any `OSError` from here as `ReportError`, so the user never sees a
+      bare traceback whichever way this goes.
+    - The other caller is M1b's implementer, which writes paths it computed
+      itself. There a directory is a bug in the implementer, and
+      `IsADirectoryError` with its errno is a better diagnosis than a
+      security-flavoured sentence.
+
+    The distinction is carried by TYPE, not by wording, so no caller has to
+    match on a message to tell a refusal from a broken path.
+    """
     if _O_NOFOLLOW and exc.errno in _SYMLINK_REFUSED:
         raise WriteForbiddenError(
             f"{target} is a symlink. Whetstone does not write through one: the "
@@ -396,6 +448,20 @@ def guarded_write(
     reachable from Python offers that on Windows. What it guarantees is that
     every divergence between the classified path and the opened file is detected
     and refused, in the fail-closed direction.
+
+    WHAT IT RAISES, and the difference is load-bearing:
+
+    - `WriteForbiddenError` means THE BARRIER REFUSED. never_touch, containment,
+      a symlink, a hardlink, a device, an identity mismatch.
+    - Any other `OSError` propagates with its type and errno intact -- a
+      directory (EISDIR / EACCES), a missing parent (ENOENT), a full disk
+      (ENOSPC), an over-long name (ENAMETOOLONG). None of those is a security
+      decision and none of them should read as one. `_reraise_open_failure`
+      argues this at length.
+
+    A caller that needs to tell the two apart can do it on TYPE. A caller that
+    wants one named error for a user -- `report.write_report` -- catches both
+    and phrases them itself, which is where user-facing wording belongs.
     """
     root = project_root.resolve()
     if is_write_forbidden(path, boundaries, project_root=project_root):
@@ -408,6 +474,11 @@ def guarded_write(
     fd, created = _open_for_write(target)
     try:
         _verify(fd, target, path, boundaries, project_root)
+        # The identity the cleanup below gates on, taken while the descriptor is
+        # still ours to ask. By the time the caller's body raises, `with handle`
+        # has already closed it, so there is no fd left to `fstat` and this is
+        # the only moment the answer is available.
+        verified = _identity(os.fstat(fd))
         os.truncate(fd, 0)
         handle = os.fdopen(fd, "w", encoding=encoding)
     except BaseException:
@@ -434,9 +505,17 @@ def guarded_write(
         # Its previous contents went at step 6 by design and cannot be brought
         # back; `write_text` had the same property, so nothing is lost that was
         # ever guaranteed.
+        #
+        # Identity-gated, exactly as `_discard` is. Without the gate, a
+        # redirection planted while the caller's body was running turns the
+        # tidy-up into a deletion of whatever the name points at now -- a worse
+        # outcome than the partial file it is cleaning up, and the same
+        # check-then-act shape this whole function exists to close. The two
+        # cleanup paths had the same job and only one of them was gated.
         if created:
             with contextlib.suppress(OSError):
-                os.unlink(target)
+                if _identity(os.stat(target)) == verified:
+                    os.unlink(target)
         raise
 
 
@@ -453,11 +532,27 @@ def _verify(
     cleanup in one place. See `guarded_write` for the argument behind each check.
     """
     st = os.fstat(fd)
+    # WHAT REACHES THIS BRANCH, measured on both platforms rather than reasoned
+    # about, because an earlier version of this comment named a case that
+    # executes nowhere:
+    #
+    #   character device -- REACHES IT on both. Windows opens `NUL` happily and
+    #     reports S_IFCHR; Linux opens `/dev/null` and reports S_IFCHR. This is
+    #     the case the branch exists for, and it is the dangerous one: the write
+    #     SUCCEEDS, discards every byte, and reads as a completed write.
+    #     Covered by `test_guarded_write_refuses_a_character_device`.
+    #
+    #   directory -- NEVER reaches it, on either platform. `os.open` fails
+    #     first: EISDIR on Linux, EACCES on Windows. That is not wrapped (see
+    #     `_reraise_open_failure`), so a directory surfaces as an OSError, which
+    #     is what `test_guarded_write_refuses_a_directory` now asserts.
+    #
+    # The branch is kept because the device case is live and is the one where
+    # silence would be mistaken for success.
     if not stat.S_ISREG(st.st_mode):
         raise WriteForbiddenError(
-            f"{target} is not a regular file. Writing to a directory or a "
-            "device either fails or succeeds while discarding every byte, and "
-            "the second one reads as a successful write."
+            f"{target} is not a regular file. Writing to a device succeeds "
+            "while discarding every byte, which reads as a successful write."
         )
     if st.st_nlink > 1:
         raise WriteForbiddenError(
