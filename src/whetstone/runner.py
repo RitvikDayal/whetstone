@@ -19,12 +19,33 @@ from .store.findings import upsert
 
 @dataclass
 class RunResult:
+    """What one run did, in the form every surface renders.
+
+    `status` is required rather than defaulted. It is the difference between a
+    run that finished and one that died halfway, and it was previously not
+    carried here at all: `get_last_run` selected the row and dropped the
+    column, so `report` rendered an interrupted run as a clean document. A
+    default would let a construction site stay silent about the one field that
+    exists to stop that, so every caller says which it is.
+
+    `lens_count` is how many lenses this run actually executed. None means the
+    number is unknown, not zero -- `get_last_run` reconstructs from the `runs`
+    table, which has no such column, and claiming 0 there would assert that a
+    real run examined nothing. Only a live `execute_run` sets it.
+    """
+
     run_id: str
     tier: str
     file_count: int
+    status: str
     new: int = 0
     seen: int = 0
     skips: list[str] = field(default_factory=list)
+    lens_count: int | None = None
+
+    @property
+    def finished(self) -> bool:
+        return self.status == "complete"
 
 
 def _now() -> str:
@@ -59,6 +80,17 @@ def get_last_run(conn: sqlite3.Connection) -> RunResult | None:
     live while upserting. Defaulting them to 0 instead would silently render
     a real run's history as if nothing happened, which is the exact kind of
     quiet loss this module exists to forbid.
+
+    `status` is carried for the same reason and used to be dropped. This
+    function did `SELECT *` and then read `tier`, `file_count` and
+    `skipped_json` out of the row while leaving the one column that says
+    whether the run finished behind, so a Ctrl-C during a slow pip-audit --
+    status='failed', zero findings, no skip recorded, because an interrupt
+    records none -- reached `report/html.py` as a run indistinguishable from a
+    clean one and rendered "No open findings." The justification above for
+    including failed runs rests on their skips mattering most, and an
+    interrupted run has no skips, so the status is the only evidence that
+    exists in exactly the case the docstring was written for.
     """
     row = conn.execute(
         "SELECT * FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1"
@@ -77,6 +109,7 @@ def get_last_run(conn: sqlite3.Connection) -> RunResult | None:
         run_id=run_id,
         tier=row["tier"],
         file_count=row["file_count"],
+        status=row["status"],
         new=new,
         seen=seen,
         skips=json.loads(row["skipped_json"]),
@@ -100,6 +133,33 @@ def _boundaries_are_narrowed(boundaries: BoundariesConfig) -> bool:
     reading the skip list.
     """
     return bool(boundaries.exclude) or boundaries.include != _DEFAULT_INCLUDE
+
+
+def _nothing_ran_reason(cfg: WhetstoneConfig) -> str:
+    """Why an empty plan happened, worded so it cannot be read as a clean bill.
+
+    Two distinct causes, and telling a user "no lens is configured" when they
+    configured three and disabled them all sends them to the wrong line of the
+    file. Both endings say the same thing about the RESULT, because the result
+    is identical and it is not evidence of anything.
+    """
+    if not cfg.lenses:
+        cause = (
+            "whetstone.yaml declares no lenses at all -- the `lenses:` key is "
+            "absent or empty, which defaults to an empty map. Add one (for "
+            "example `lenses: {hygiene: {enabled: true}}`) or re-run "
+            "`whetstone init`."
+        )
+    else:
+        cause = (
+            "every lens declared in whetstone.yaml was skipped; the reasons are "
+            "listed alongside this line."
+        )
+    return (
+        f"NO LENS RAN: {cause} Nothing was examined, so this run is not "
+        "evidence that the project is clean -- it is evidence that nothing "
+        "was checked."
+    )
 
 
 def _report_unsupported_sinks(cfg: WhetstoneConfig, result: RunResult) -> None:
@@ -192,6 +252,17 @@ def execute_run(
                 "file_count is 0 for that reason, not because the project is "
                 "empty."
             )
+        else:
+            # The `if plan:` above used to be the ONLY line here, which
+            # suppressed the skip exactly when nothing ran at all: a
+            # whetstone.yaml with no `lenses:` key defaults to an empty map
+            # (config/model.py), so the plan was empty, no lens was iterated,
+            # no skip was recorded, and `run` printed "0 new, 0 already known"
+            # with no warning. Against a project pinning a known-vulnerable
+            # dependency at 5% coverage that same directory produced 24
+            # findings once a lens was declared. An empty plan is the loudest
+            # thing a run can have to say, not the quietest.
+            skips.append(_nothing_ran_reason(cfg))
 
     if _boundaries_are_narrowed(cfg.boundaries):
         for name, _, _ in plan:
@@ -202,7 +273,17 @@ def execute_run(
                     "patterns did NOT narrow what it examined."
                 )
 
-    result = RunResult(run_id=run_id, tier=tier, file_count=len(files), skips=skips)
+    # Pessimistic from the moment it exists, for the reason spelled out at the
+    # `try` below: `complete` is set by the one normal exit, never cleared by
+    # an `except` that BaseException walks straight past.
+    result = RunResult(
+        run_id=run_id,
+        tier=tier,
+        file_count=len(files),
+        status="failed",
+        skips=skips,
+        lens_count=len(plan),
+    )
 
     conn.execute(
         "INSERT INTO runs (id, tier, scope_mode, file_count, started_at, status) "
@@ -229,7 +310,10 @@ def execute_run(
     # exotic one -- wrote status='complete' on a run holding only the findings
     # recorded before the interrupt. An incomplete run that reads as clean is
     # the exact failure this module exists to prevent.
-    status = "failed"
+    #
+    # Held on `result` rather than in a local: the same value has to reach both
+    # the stored row and every surface that renders the run, and a local meant
+    # only the row got it -- `report` then had no way to say the run failed.
     try:
         for name, lens_cfg, pack in plan:
             # `ctx.skips` stays private to this lens (the RunContext default,
@@ -280,12 +364,12 @@ def execute_run(
                     )
 
         _report_unsupported_sinks(cfg, result)
-        status = "complete"
+        result.status = "complete"
     finally:
         conn.execute(
             "UPDATE runs SET finished_at = ?, status = ?, skipped_json = ? "
             "WHERE id = ?",
-            (_now(), status, json.dumps(result.skips), run_id),
+            (_now(), result.status, json.dumps(result.skips), run_id),
         )
 
     return result
