@@ -54,3 +54,12 @@ class CommandFailed(WhetstoneError):
 
 class LensError(WhetstoneError):
     """A lens pack misbehaved — bad contract, unhandled failure."""
+
+
+class ReportError(WhetstoneError):
+    """The HTML report could not be written to the requested path.
+
+    `report --out` is user-supplied, same shape of problem as the wizard's
+    config target: a symlink there decides where the bytes land on the
+    repository's behalf, not the user's.
+    """

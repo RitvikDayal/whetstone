@@ -6,10 +6,32 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from ..errors import StoreError
 from ..lenses.base import Candidate
+
+
+class FindingState(StrEnum):
+    """The states a stored finding can be in.
+
+    Two members, because M0 ships two. `queued` is what `upsert` writes;
+    `rejected` is the one a user sets by hand today, and the store honours it
+    by never touching `state` on a re-run so a rejection cannot be undone.
+    There is no command that moves a finding between them yet, and inventing
+    `accepted`/`fixed` here before anything can produce them would be a
+    vocabulary the tool cannot honour.
+
+    It exists as an enum so `findings --state` can reject a typo. Untyped, the
+    CLI answered `--state bogus`, `--state Queued` and `--state ""` with "No
+    findings in state 'X'." and exit 0 -- indistinguishable from a valid state
+    that is genuinely empty, which is the same lie as a clean report over a
+    run that checked nothing.
+    """
+
+    queued = "queued"
+    rejected = "rejected"
 
 
 @dataclass(frozen=True)

@@ -199,7 +199,7 @@ def _state_dir_message(root: Path, override: str | None, exc: OSError) -> str:
     if blocker == root:
         return (
             f"{source} resolves to {shown}, which is an existing file.\n"
-            "State needs a directory. This is usually a typo — point `state_dir` "
+            "State needs a directory. This is usually a typo: point `state_dir` "
             "at a directory, or move the file out of the way." + note
         )
     if blocker is not None:

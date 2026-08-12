@@ -13,7 +13,7 @@ from whetstone.lenses.base import (
     Severity,
 )
 from whetstone.lenses.registry import register
-from whetstone.runner import execute_run
+from whetstone.runner import execute_run, get_last_run
 from whetstone.store.db import connect
 from whetstone.store.findings import list_findings
 
@@ -659,3 +659,185 @@ def test_without_the_option_the_default_floor_still_applies(tmp_path):
     assert not any(
         skip.startswith("hygiene/coverage") for skip in result.skips
     ), result.skips
+
+
+# --- a run in which no lens ran is the loudest result, not the quietest -----
+
+
+def test_a_config_declaring_no_lenses_says_so_instead_of_reading_as_clean(
+    tmp_path, monkeypatch
+):
+    """`lenses` defaults to an empty dict (config/model.py), and the only skip
+    line in the no-file-scoped branch was guarded by `if plan:` -- suppressed
+    exactly when nothing ran.
+
+    Measured before the fix, against a real project pinning requests==2.19.0
+    at 5% line coverage: `run` printed "0 new, 0 already known - tier quick -
+    0 files in scope" with no skip lines, `findings` printed "No findings in
+    state 'queued'.", and `report` wrote "No open findings." -- all exit 0.
+    Declaring `lenses: {hygiene: {enabled: true}}` in that same directory
+    produced 24 findings including PYSEC-2018-28.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+
+    assert result.lens_count == 0
+    assert any("NO LENS RAN" in skip for skip in result.skips), result.skips
+    assert any("no lenses at all" in skip for skip in result.skips), result.skips
+    # Stored, not just returned: `report` reads the row, not this object.
+    stored = json.loads(
+        conn.execute(
+            "SELECT skipped_json FROM runs WHERE id = ?", (result.run_id,)
+        ).fetchone()["skipped_json"]
+    )
+    assert any("NO LENS RAN" in skip for skip in stored), stored
+
+
+def test_every_lens_being_skipped_also_reports_that_nothing_ran(tmp_path, monkeypatch):
+    """The other route to an empty plan. The per-lens reasons are there, but
+    none of them says the SUM was zero, and 'disabled in config' reads as one
+    lens opting out rather than as the whole run examining nothing."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn,
+        _cfg(stub={"enabled": False}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+    assert result.lens_count == 0
+    assert any("NO LENS RAN" in skip for skip in result.skips), result.skips
+    # Worded for the cause it actually had, not the one it did not.
+    assert not any("no lenses at all" in skip for skip in result.skips), result.skips
+    assert any("disabled in config" in skip for skip in result.skips), result.skips
+
+
+def test_a_run_that_did_examine_something_does_not_claim_nothing_ran(
+    tmp_path, monkeypatch
+):
+    """The counterweight: an always-on 'nothing ran' line would be noise."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert result.lens_count == 1
+    assert not any("NO LENS RAN" in skip for skip in result.skips), result.skips
+
+
+# --- get_last_run: report --out needs a run's skips, not just its findings ---
+
+
+def test_get_last_run_returns_none_when_no_run_has_happened(tmp_path):
+    """A store with no run row at all is a distinct state from a run with no
+    skips -- the caller must be able to tell them apart."""
+    conn = connect(tmp_path)
+    assert get_last_run(conn) is None
+
+
+def test_get_last_run_carries_the_stored_skips(tmp_path, monkeypatch):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    conn = connect(tmp_path)
+    execute_run(
+        conn, _cfg(nosuchlens={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    last = get_last_run(conn)
+    assert last is not None
+    assert any("not installed" in skip for skip in last.skips)
+
+
+def test_get_last_run_derives_new_and_seen_from_the_findings_table(
+    tmp_path, monkeypatch
+):
+    """`runs` has no new/seen columns; fabricating them as 0 would be exactly
+    the kind of dishonest silence this project exists to forbid, so they are
+    derived from `findings.first_seen_run`/`last_seen_run` against the run's
+    own id -- the same evidence `execute_run` itself counted live."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub(count=2))
+    conn = connect(tmp_path)
+
+    execute_run(conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False)
+    first = get_last_run(conn)
+    assert (first.new, first.seen) == (2, 0)
+
+    execute_run(conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False)
+    second = get_last_run(conn)
+    assert (second.new, second.seen) == (0, 2)
+
+
+def test_get_last_run_prefers_a_later_failed_run_over_an_earlier_complete_one(
+    tmp_path, monkeypatch
+):
+    """Ordered by started_at, not finished_at or status: a run that failed
+    mid-way is exactly the one whose skips matter most to a reader of a
+    report generated afterward, so excluding failed runs from "most recent"
+    would hide the run most worth surfacing."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub())
+    register(_ImmediateBoom())
+    conn = connect(tmp_path)
+
+    execute_run(conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False)
+    with pytest.raises(RuntimeError):
+        execute_run(
+            conn, _cfg(boom={}), tmp_path, tmp_path, tier="quick", changed_only=False
+        )
+
+    failed_row = conn.execute("SELECT id FROM runs WHERE status = 'failed'").fetchone()
+    last = get_last_run(conn)
+    assert last is not None
+    assert last.run_id == failed_row["id"]
+
+
+def test_get_last_run_carries_the_status_it_selected(tmp_path, monkeypatch):
+    """`SELECT *` read tier, file_count and skipped_json out of the row and
+    left `status` behind, and `RunResult` had nowhere to put it -- so the one
+    column that says whether the run finished could not reach the report.
+
+    An interrupt records no skip at all, so the skip list cannot substitute:
+    this is the only evidence that exists in the failure case the ordering
+    rule above was written for.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub())
+    conn = connect(tmp_path)
+
+    execute_run(conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False)
+    assert get_last_run(conn).status == "complete"
+    assert get_last_run(conn).finished is True
+
+    register(_Interrupted())
+    with pytest.raises(KeyboardInterrupt):
+        execute_run(
+            conn, _cfg(interrupted={}), tmp_path, tmp_path, tier="quick",
+            changed_only=False,
+        )
+
+    last = get_last_run(conn)
+    assert last.status == "failed"
+    assert last.finished is False
+
+
+def test_get_last_run_leaves_lens_count_unknown_rather_than_claiming_zero(
+    tmp_path, monkeypatch
+):
+    """`runs` has no lens-count column. Defaulting to 0 on a reconstructed run
+    would assert that a real run examined nothing -- the same fabricated
+    silence `new`/`seen` are derived to avoid."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub())
+    conn = connect(tmp_path)
+    live = execute_run(
+        conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert live.lens_count == 1
+    assert get_last_run(conn).lens_count is None
