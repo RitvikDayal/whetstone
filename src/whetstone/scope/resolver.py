@@ -15,14 +15,19 @@ frames differ for any monorepo and the conversion is not optional.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import stat
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
+from typing import IO
 
 import pathspec
 
 from ..config.model import BoundariesConfig
-from ..errors import GitError
+from ..errors import GitError, WriteForbiddenError
 
 # A lone surrogate is what `surrogateescape` leaves behind for a byte that was
 # not valid UTF-8. Such a path cannot be opened, encoded, or stored.
@@ -176,7 +181,19 @@ def resolve_files(
 def is_write_forbidden(
     path: Path, boundaries: BoundariesConfig, *, project_root: Path
 ) -> bool:
-    """True when *path* may not be written to.
+    """True when *path* may not be written to. ADVISORY ONLY -- see below.
+
+    This classifies a path STRING, and the OS re-resolves that string at write
+    time, so the answer describes the filesystem as it was when the question was
+    asked. A junction planted in the window between the two redirects the write
+    and this function is none the wiser: proven in the PR #4 gate, where the
+    barrier returned False for `docs/deploy.yml`, a junction was planted
+    pointing `docs` at `.github/workflows`, and the write landed on
+    `.github/workflows/deploy.yml`. A hardlink defeats it outright, at any
+    timing, because there is no link to follow and both names are equally
+    canonical.
+
+    Use it to REPORT ("this path is protected"), and `guarded_write` to WRITE.
 
     *path* may be relative to *project_root* or absolute; both are normalised
     before matching. This is the only place the write barrier is enforced, so
@@ -240,3 +257,216 @@ def is_write_forbidden(
     # unrelated case variant on Linux costs one refused write, under-forbidding
     # costs the barrier.
     return _spec([p.lower() for p in boundaries.never_touch]).match_file(posix.lower())
+
+
+# Flags that differ by platform, resolved once. `O_NOFOLLOW` does not exist on
+# Windows and `O_BINARY` does not exist anywhere else; `getattr(..., 0)` is the
+# no-op in each direction.
+#
+# `O_BINARY` is set on Windows so the descriptor performs no newline
+# translation of its own -- the text wrapper opened over it does that, exactly
+# once, and matches what `Path.write_text` produced before this existed.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    """What file this IS, independent of what it is called.
+
+    `st_dev` and `st_ino` are populated on Windows as well as POSIX (CPython
+    fills them from GetFileInformationByHandle), so this is one rule rather than
+    a platform branch.
+    """
+    return (st.st_dev, st.st_ino)
+
+
+def _open_for_write(target: Path) -> tuple[int, bool]:
+    """Open *target* for writing without truncating it. Returns (fd, created).
+
+    Two phases, because whether WE created the file decides whether a later
+    refusal may remove it. `O_EXCL` answers that atomically; a prior
+    `path.exists()` would be another check-then-act window in the function whose
+    whole purpose is to close one.
+
+    NOT `O_TRUNC`: truncation happens through the descriptor after verification.
+    Truncating at open time destroys the contents of a protected file before the
+    barrier has said a word about it.
+    """
+    base = os.O_RDWR | _O_NOFOLLOW | _O_BINARY
+    try:
+        return os.open(target, base | os.O_CREAT | os.O_EXCL), True
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise WriteForbiddenError(_open_failure(target, exc)) from None
+    try:
+        return os.open(target, base), False
+    except OSError as exc:
+        raise WriteForbiddenError(_open_failure(target, exc)) from None
+
+
+def _open_failure(target: Path, exc: OSError) -> str:
+    # ELOOP is what O_NOFOLLOW reports for a symlink at the final component on
+    # POSIX. There is no Windows equivalent, which is why the verification below
+    # does not rely on this branch having fired.
+    if _O_NOFOLLOW and exc.errno in (getattr(os, "ELOOP", None), 40, 62):
+        return (
+            f"{target} is a symlink. Whetstone does not write through one: the "
+            "link decides where the bytes land, on the repository's behalf "
+            "rather than the caller's."
+        )
+    return f"{target} could not be opened for writing: {exc}"
+
+
+@contextlib.contextmanager
+def guarded_write(
+    path: Path,
+    boundaries: BoundariesConfig,
+    *,
+    project_root: Path,
+    encoding: str = "utf-8",
+) -> Iterator[IO[str]]:
+    """Open *path* for writing, verifying THROUGH THE DESCRIPTOR that it may be.
+
+    The closure for the check-then-write gap in `is_write_forbidden`. That
+    function classifies a path string and the OS re-resolves the string later;
+    this one opens first and then asks what it is holding, so the thing verified
+    and the thing written are the same object rather than the same spelling.
+
+    Order, and why each step is where it is:
+
+    1. `is_write_forbidden` up front. Cheap, and it produces the readable
+       refusal for the ordinary case without creating anything.
+    2. Open without `O_TRUNC`, with `O_EXCL` first so we learn atomically
+       whether this call created the file.
+    3. `fstat` the descriptor. `st_nlink > 1` is refused: a hardlink is a second
+       name for these exact bytes, that name may be a protected one, and no
+       path-string check can see it -- which is the residual issue #11 records
+       against the old barrier. A non-regular file is refused too, which is what
+       catches a Windows character device (`--out NUL` wrote successfully,
+       discarded every byte, and left nothing on disk).
+    4. `is_write_forbidden` AGAIN. `Path.resolve()` follows a junction, a
+       symlink and a reparse-point chain alike, so a redirection planted before
+       the open is visible here even though it was not visible at step 1.
+    5. Confirm the path still names the file we are holding, by identity. If a
+       redirection appeared between the open and step 4, the identities diverge
+       and the write is refused. This direction FAILS CLOSED: the fd we hold is
+       the honest file, and refusing it costs a write that would have been fine.
+    6. Only now truncate, through the descriptor.
+
+    On refusal, a file this call created is removed -- and only after confirming
+    by identity that the name still refers to it, so a swap in that window
+    cannot turn the cleanup into a deletion of somebody else's file. A file that
+    already existed is left exactly as it was, un-truncated.
+
+    WHAT THIS ACHIEVES PER PLATFORM, stated rather than implied:
+
+    - POSIX: `O_NOFOLLOW` is passed, so a symlink at the FINAL component is
+      refused by the kernel at open time, before anything else runs. Steps 3-5
+      then cover intermediate components, hardlinks and devices.
+    - Windows: there is no `O_NOFOLLOW` and no `openat`/`dir_fd`, so `os.open`
+      follows a junction or symlink silently and the kernel refuses nothing.
+      Every guarantee here is therefore post-open: the redirection is detected
+      by step 4 and the identity check in step 5, after the descriptor exists.
+      This is strictly weaker than the POSIX case in one specific way -- a
+      redirection planted before the open is detected rather than prevented, so
+      an empty file may briefly exist at the redirected location before step 6
+      removes it. It is never written to, and it is removed before this function
+      returns.
+
+    THE RESIDUAL, on both platforms: this closes the window between the barrier
+    and the write. It does not make the operation atomic against a concurrent
+    attacker with write access to the worktree, because no filesystem API
+    reachable from Python offers that on Windows. What it guarantees is that
+    every divergence between the classified path and the opened file is detected
+    and refused, in the fail-closed direction.
+    """
+    root = project_root.resolve()
+    if is_write_forbidden(path, boundaries, project_root=project_root):
+        raise WriteForbiddenError(
+            f"writing {path} is forbidden by the boundaries for {project_root}. "
+            "It resolves outside the project root, or matches never_touch."
+        )
+
+    target = root / path
+    fd, created = _open_for_write(target)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            _refuse(
+                fd,
+                created,
+                target,
+                st,
+                f"{target} is not a regular file. Writing to a directory or a "
+                "device either fails or succeeds while discarding every byte, "
+                "and the second one reads as a successful write.",
+            )
+        if st.st_nlink > 1:
+            _refuse(
+                fd,
+                created,
+                target,
+                st,
+                f"{target} has more than one name on this filesystem (it is a "
+                "hardlink). The other name may be a protected path, and no "
+                "path check can see it -- both names are equally canonical and "
+                "there is no link to follow.",
+            )
+        if is_write_forbidden(path, boundaries, project_root=project_root):
+            _refuse(
+                fd,
+                created,
+                target,
+                st,
+                f"writing {path} became forbidden between the check and the "
+                "open: it now resolves inside never_touch or outside the "
+                "project root. A redirection was planted in that window.",
+            )
+        try:
+            landed = os.stat(target)
+        except OSError as exc:
+            _refuse(
+                fd,
+                created,
+                target,
+                st,
+                f"{target} could not be re-examined after opening it ({exc}), "
+                "so it cannot be shown to be the file that was verified.",
+            )
+        if _identity(landed) != _identity(st):
+            _refuse(
+                fd,
+                created,
+                target,
+                st,
+                f"{target} no longer names the file that was opened and "
+                "verified. Refusing rather than writing to whichever of the "
+                "two it is.",
+            )
+        os.truncate(fd, 0)
+        handle = os.fdopen(fd, "w", encoding=encoding)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
+    with handle:
+        yield handle
+
+
+def _refuse(
+    fd: int, created: bool, target: Path, st: os.stat_result, message: str
+) -> None:
+    """Close *fd*, undo a creation this call made, and raise.
+
+    The cleanup is identity-gated: the file is removed only if *target* still
+    names the object we are holding. Without that, a redirection planted in this
+    window would turn the tidy-up into a deletion of whatever the name points at
+    now -- a worse outcome than the empty file it is cleaning up.
+    """
+    os.close(fd)
+    if created:
+        with contextlib.suppress(OSError):
+            if _identity(os.stat(target)) == _identity(st):
+                os.unlink(target)
+    raise WriteForbiddenError(message)

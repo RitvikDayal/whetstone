@@ -5,9 +5,13 @@ from pathlib import Path
 import pytest
 
 from whetstone.config.model import BoundariesConfig
-from whetstone.errors import GitError
+from whetstone.errors import GitError, WriteForbiddenError
 from whetstone.scope import resolver
-from whetstone.scope.resolver import is_write_forbidden, resolve_files
+from whetstone.scope.resolver import (
+    guarded_write,
+    is_write_forbidden,
+    resolve_files,
+)
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -567,3 +571,194 @@ def test_deleted_tracked_files_are_filtered_out(repo):
     files = resolve_files(repo, BoundariesConfig(include=["src/**"]))
     assert Path("src/app.py") not in files
     assert Path("src/generated/schema.py") in files
+
+
+# --- guarded_write: check and write share one descriptor (issue #11) ----------
+#
+# `is_write_forbidden` is advisory: it takes a path string, and the path it
+# classified is re-resolved by the OS at write time. The PR #4 adversarial gate
+# proved the gap -- the barrier returned False for `docs/deploy.yml`, a junction
+# was then planted pointing `docs` at `.github/workflows`, and the write landed
+# on `.github/workflows/deploy.yml`. `guarded_write` is the closure: it opens
+# first and verifies what it is holding.
+
+_WORKFLOW_BARRIER = BoundariesConfig(never_touch=[".github/workflows/**"])
+
+
+def _plant_junction_on_first_open(monkeypatch, link: Path, target: Path) -> dict:
+    """Make the very next `os.open` happen with *link* already pointing at
+    *target*, which is the check-then-write window rendered exactly.
+
+    The seam is `os.open` rather than a hook in the production code: a test-only
+    branch inside the function under test proves the branch works, not that the
+    real path does.
+    """
+    state = {"planted": False}
+    real_open = os.open
+
+    def _spy(path, flags, *args, **kwargs):
+        if not state["planted"]:
+            state["planted"] = True
+            _link_out(link, target)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _spy)
+    return state
+
+
+def test_guarded_write_writes_an_ordinary_file(tmp_path):
+    with guarded_write(Path("notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path) as fh:
+        fh.write("hello")
+    assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "hello"
+
+
+def test_guarded_write_truncates_an_existing_file(tmp_path):
+    (tmp_path / "notes.md").write_text("a much longer previous body", encoding="utf-8")
+    with guarded_write(Path("notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path) as fh:
+        fh.write("short")
+    assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "short"
+
+
+def test_guarded_write_refuses_a_never_touch_path(tmp_path):
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    with pytest.raises(WriteForbiddenError), guarded_write(
+        Path(".github/workflows/deploy.yml"),
+        _WORKFLOW_BARRIER,
+        project_root=tmp_path,
+    ) as fh:
+        fh.write("pwned")
+    assert not (tmp_path / ".github" / "workflows" / "deploy.yml").exists()
+
+
+def test_guarded_write_refuses_a_path_outside_the_project(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    with pytest.raises(WriteForbiddenError), guarded_write(
+        Path("../escaped.txt"), _WORKFLOW_BARRIER, project_root=project_root
+    ) as fh:
+        fh.write("pwned")
+    assert not (tmp_path / "escaped.txt").exists()
+
+
+def test_a_junction_planted_between_the_check_and_the_write_is_refused(
+    tmp_path, monkeypatch
+):
+    """The PR #4 proof, reproduced. The barrier passes `docs/deploy.yml`, the
+    junction appears, and the open lands inside `.github/workflows`."""
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    assert not is_write_forbidden(
+        Path("docs/deploy.yml"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ), "the pre-check must PASS, or this test is not exercising the window"
+
+    state = _plant_junction_on_first_open(
+        monkeypatch, tmp_path / "docs", tmp_path / ".github" / "workflows"
+    )
+    with pytest.raises(WriteForbiddenError), guarded_write(
+        Path("docs/deploy.yml"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("pwned")
+
+    assert state["planted"], "the junction was never planted; the window never opened"
+    assert not (
+        tmp_path / ".github" / "workflows" / "deploy.yml"
+    ).exists(), "the refused write left a file behind inside never_touch"
+
+
+def test_a_junction_already_in_place_is_refused_too(tmp_path):
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    _link_out(tmp_path / "docs", tmp_path / ".github" / "workflows")
+    with pytest.raises(WriteForbiddenError), guarded_write(
+        Path("docs/deploy.yml"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("pwned")
+    assert not (tmp_path / ".github" / "workflows" / "deploy.yml").exists()
+
+
+def test_a_hardlink_is_refused_by_link_count(tmp_path):
+    """A hardlink defeats every path-string check: both names are equally
+    canonical, `resolve()` has no link to follow, and `is_symlink()` is False.
+    Only file identity reveals it, and identity is what a descriptor carries."""
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    protected = tmp_path / ".github" / "workflows" / "deploy.yml"
+    protected.write_text("real workflow", encoding="utf-8")
+    alias = tmp_path / "notes.md"
+    try:
+        os.link(protected, alias)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - platform
+        pytest.skip(f"cannot create a hardlink here: {exc}")
+
+    assert not is_write_forbidden(
+        Path("notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ), "no path-string check can see a hardlink; that is the premise of this test"
+
+    with pytest.raises(WriteForbiddenError, match="more than one name"), guarded_write(
+        Path("notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("pwned")
+    assert protected.read_text(encoding="utf-8") == "real workflow"
+
+
+def test_a_refused_write_does_not_truncate_the_file_it_refused(tmp_path):
+    """Truncation happens through the descriptor AFTER verification. Opening
+    with O_TRUNC would destroy the protected file's contents before the barrier
+    ever spoke."""
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    protected = tmp_path / ".github" / "workflows" / "deploy.yml"
+    protected.write_text("real workflow", encoding="utf-8")
+    with pytest.raises(WriteForbiddenError), guarded_write(
+        Path(".github/workflows/deploy.yml"),
+        _WORKFLOW_BARRIER,
+        project_root=tmp_path,
+    ) as fh:
+        fh.write("pwned")
+    assert protected.read_text(encoding="utf-8") == "real workflow"
+
+
+def test_guarded_write_refuses_a_directory(tmp_path):
+    (tmp_path / "adir").mkdir()
+    with pytest.raises(WriteForbiddenError), guarded_write(
+        Path("adir"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("x")
+
+
+def test_guarded_write_refuses_a_character_device(tmp_path):
+    """`--out NUL` on Windows writes successfully, discards every byte, and
+    leaves nothing on disk. A descriptor knows it is not a regular file."""
+    if os.name != "nt":  # pragma: no cover - platform
+        device = Path("/dev/null")
+        if not device.exists():
+            pytest.skip("no character device to point at")
+        with pytest.raises(WriteForbiddenError), guarded_write(
+            device, _WORKFLOW_BARRIER, project_root=Path("/dev")
+        ) as fh:
+            fh.write("x")
+        return
+    with pytest.raises(WriteForbiddenError, match="regular file"), guarded_write(
+        Path("NUL"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("x")
+
+
+def test_a_write_that_raises_still_closes_the_descriptor(tmp_path):
+    """A leaked descriptor on Windows keeps the file locked, so the next run
+    fails on a file the previous run only failed to close."""
+    with pytest.raises(RuntimeError), guarded_write(
+        Path("notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ):
+        raise RuntimeError("boom")
+    (tmp_path / "notes.md").unlink()
+
+
+def test_the_barrier_scan_is_not_vacuous(tmp_path):
+    """Every refusal test above asserts an exception. This one asserts the
+    permitted population is non-empty: a `guarded_write` that refused
+    everything would satisfy all of them and be useless."""
+    permitted = [Path("notes.md"), Path("src/app.py"), Path("docs/readme.md")]
+    (tmp_path / "src").mkdir()
+    (tmp_path / "docs").mkdir()
+    assert permitted
+    for target in permitted:
+        with guarded_write(target, _WORKFLOW_BARRIER, project_root=tmp_path) as fh:
+            fh.write("ok")
+        assert (tmp_path / target).read_text(encoding="utf-8") == "ok"

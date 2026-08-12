@@ -276,7 +276,7 @@ def report(
             run = get_last_run(conn)
         target = _report_target(project_root, out)
         html = render_report(rows, project_name=cfg.project.name, run=run)
-        written = write_report(target, html)
+        written = write_report(target, html, project_root=project_root)
     except WhetstoneError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc

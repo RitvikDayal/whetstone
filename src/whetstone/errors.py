@@ -44,6 +44,16 @@ class StoreError(WhetstoneError):
     """
 
 
+class WriteForbiddenError(WhetstoneError):
+    """A write was refused by the boundary barrier, or by what it opened.
+
+    Raised by `scope.resolver.guarded_write`, which holds the descriptor it
+    verified. Distinct from `ReportError`: that one says a user-supplied
+    `--out` was wrong, this one says the write barrier stopped a write that
+    would have landed somewhere it may not.
+    """
+
+
 class GitError(WhetstoneError):
     """A git invocation failed."""
 

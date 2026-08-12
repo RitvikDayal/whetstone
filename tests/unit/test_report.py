@@ -236,7 +236,7 @@ def test_write_report_refuses_a_symlinked_target(tmp_path, monkeypatch):
         Path, "is_symlink", lambda self: self == target or real_is_symlink(self)
     )
     with pytest.raises(ReportError, match="symlink"):
-        write_report(target, "<html></html>")
+        write_report(target, "<html></html>", project_root=tmp_path)
     assert not target.exists()
 
 
@@ -244,7 +244,7 @@ def test_write_report_refuses_a_directory_target(tmp_path):
     target = tmp_path / "report-dir"
     target.mkdir()
     with pytest.raises(ReportError, match="directory"):
-        write_report(target, "<html></html>")
+        write_report(target, "<html></html>", project_root=tmp_path)
 
 
 def test_write_report_wraps_an_os_error_instead_of_raising_raw(tmp_path):
@@ -252,7 +252,7 @@ def test_write_report_wraps_an_os_error_instead_of_raising_raw(tmp_path):
     that must reach the CLI as a named WhetstoneError, not a bare traceback."""
     target = tmp_path / "does-not-exist" / "report.html"
     with pytest.raises(ReportError):
-        write_report(target, "<html></html>")
+        write_report(target, "<html></html>", project_root=tmp_path)
 
 
 def test_write_report_refuses_a_hardlinked_target(tmp_path):
@@ -271,7 +271,7 @@ def test_write_report_refuses_a_hardlinked_target(tmp_path):
     os.link(outside, target)
 
     with pytest.raises(ReportError, match="hardlink"):
-        write_report(target, "<html>new</html>")
+        write_report(target, "<html>new</html>", project_root=tmp_path)
     assert outside.read_text(encoding="utf-8") == "original"
 
 
@@ -280,7 +280,7 @@ def test_write_report_still_accepts_an_ordinary_existing_file(tmp_path):
     already there is the normal case and must keep working."""
     target = tmp_path / "report.html"
     target.write_text("old", encoding="utf-8")
-    assert write_report(target, "<html>new</html>") == target
+    assert write_report(target, "<html>new</html>", project_root=tmp_path) == target
     assert target.read_text(encoding="utf-8") == "<html>new</html>"
 
 
@@ -298,4 +298,4 @@ def test_write_report_refuses_a_reserved_device_name(tmp_path, name):
     # that it exists, because the device does. That is the defect, not a
     # side-effect of it.
     with pytest.raises(ReportError, match="reserved device"):
-        write_report(tmp_path / name, "<html></html>")
+        write_report(tmp_path / name, "<html></html>", project_root=tmp_path)

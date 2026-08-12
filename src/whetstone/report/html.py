@@ -10,8 +10,10 @@ from pathlib import Path
 
 from jinja2 import Environment, select_autoescape
 
-from ..errors import ReportError
+from ..config.model import BoundariesConfig
+from ..errors import ReportError, WriteForbiddenError
 from ..runner import RunResult
+from ..scope.resolver import guarded_write
 from ..store.findings import Finding
 
 _TEMPLATE = """\
@@ -203,7 +205,7 @@ def _link_count(path: Path) -> int:
         return 1
 
 
-def write_report(path: Path, html: str) -> Path:
+def write_report(path: Path, html: str, *, project_root: Path) -> Path:
     """Write *html* to *path*, refusing a symlink, a directory, or a device.
 
     `--out` is user-supplied, the same shape of problem
@@ -221,17 +223,20 @@ def write_report(path: Path, html: str) -> Path:
     signal that remains is the link count, which is >1 for exactly the file
     that has another name somewhere else.
 
-    WHAT THIS DOES NOT CLOSE, stated rather than implied: the check and the
-    write are separate syscalls on a path, with no `O_NOFOLLOW` and no held
-    descriptor between them, so a link created in that window is not seen by
-    either layer. Closing that needs an fd-based write, and `O_NOFOLLOW` does
-    not exist on Windows, so it is not a portable M0 fix -- filed rather than
-    faked. The practical bound on all of this is that git cannot carry a
-    hardlink: reaching this state means something on the machine already made
-    one.
+    The three checks above are kept for their MESSAGES: they name the specific
+    thing that is wrong before anything is opened. The write itself now goes
+    through `scope.resolver.guarded_write`, which re-verifies through the
+    descriptor it is holding and so closes the window this docstring used to
+    record as open -- a link created between a path check and a path write was
+    seen by neither layer. `O_NOFOLLOW` still does not exist on Windows, so
+    there the redirection is detected after the open rather than prevented at
+    it; `guarded_write`'s docstring states the per-platform position in full
+    rather than implying parity.
 
-    Raises ReportError rather than letting write_text's OSError (a directory,
-    a missing parent, a permission failure) reach the CLI as a bare traceback.
+    Raises ReportError rather than letting an OSError (a directory, a missing
+    parent, a permission failure) reach the CLI as a bare traceback. The
+    barrier's own refusals are re-raised as ReportError too, so `--out` has one
+    failure type rather than two.
     """
     device = _reserved_device_name(path)
     if device is not None:
@@ -262,7 +267,15 @@ def write_report(path: Path, html: str) -> Path:
             "it, or point --out at a fresh path."
         )
     try:
-        path.write_text(html, encoding="utf-8")
+        # BoundariesConfig() rather than the project's own: `never_touch` is a
+        # barrier on what Whetstone edits in someone's repository, and `--out`
+        # is the user asking for a file by name. What is enforced here is
+        # containment plus everything guarded_write establishes through the
+        # descriptor.
+        with guarded_write(path, BoundariesConfig(), project_root=project_root) as fh:
+            fh.write(html)
+    except WriteForbiddenError as exc:
+        raise ReportError(f"could not write the report to {path}: {exc}") from None
     except OSError as exc:
         raise ReportError(f"could not write the report to {path}: {exc}") from exc
     return path
