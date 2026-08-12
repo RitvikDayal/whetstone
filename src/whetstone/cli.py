@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
 import typer
@@ -194,15 +195,15 @@ def run(
     """
     try:
         cfg, project_root, root = _load(path.resolve())
-        conn = connect(root)
-        result = execute_run(
-            conn,
-            cfg,
-            project_root,
-            root,
-            tier=str(tier or cfg.budget.tier),
-            changed_only=not full,
-        )
+        with contextlib.closing(connect(root)) as conn:
+            result = execute_run(
+                conn,
+                cfg,
+                project_root,
+                root,
+                tier=str(tier or cfg.budget.tier),
+                changed_only=not full,
+            )
     except WhetstoneError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -234,9 +235,9 @@ def findings(
     """
     try:
         cfg, _, root = _load(path.resolve())
-        conn = connect(root)
-        rows = list_findings(conn, state=str(state))
-        last = get_last_run(conn)
+        with contextlib.closing(connect(root)) as conn:
+            rows = list_findings(conn, state=str(state))
+            last = get_last_run(conn)
     except WhetstoneError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -265,14 +266,14 @@ def report(
     """Write a self-contained HTML report."""
     try:
         cfg, project_root, root = _load(path.resolve())
-        conn = connect(root)
-        rows = list_findings(conn, state="queued")
-        # The most recent run's skips, not None: a report standing in for a
-        # run that examined less than it claimed must say so, and it can only
-        # say so if the run that produced this state actually reaches the
-        # template. See runner.get_last_run for why "most recent" includes a
-        # failed run rather than filtering it out.
-        run = get_last_run(conn)
+        with contextlib.closing(connect(root)) as conn:
+            rows = list_findings(conn, state="queued")
+            # The most recent run's skips, not None: a report standing in for
+            # a run that examined less than it claimed must say so, and it
+            # can only say so if the run that produced this state actually
+            # reaches the template. See runner.get_last_run for why "most
+            # recent" includes a failed run rather than filtering it out.
+            run = get_last_run(conn)
         target = _report_target(project_root, out)
         html = render_report(rows, project_name=cfg.project.name, run=run)
         written = write_report(target, html)
