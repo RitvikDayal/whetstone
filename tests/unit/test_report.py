@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -194,10 +195,18 @@ def test_long_unbroken_detail_text_can_wrap():
     GitHub Security Advisory URL gave documentScrollWidth 429 against
     clientWidth 390 before this rule and 390/390 after, and a single
     200,000-character token gave 1,935,097px before and 390px after.
+
+    `"overflow-wrap: anywhere" in css` and `".detail" in css` each hold on
+    their own even when the two live in unrelated rules -- restating that
+    both constants exist proves neither is attached to the other. Parsed
+    into rule blocks instead, so the assertion is that `.detail`'s own block
+    is the one carrying the wrapping declaration; a later edit that moves
+    the declaration to `.meta` while leaving `.detail` untouched fails this.
     """
     css = render_report([FINDING], project_name="demo", run=RUN).split("</style>")[0]
-    assert "overflow-wrap: anywhere" in css
-    assert ".detail" in css
+    rules = re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+    wrapping = [selector for selector, body in rules if "overflow-wrap: anywhere" in body]
+    assert any(".detail" in selector for selector in wrapping), css
 
 
 def test_html_is_escaped():
