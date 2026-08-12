@@ -198,13 +198,20 @@ def test_connect_refuses_a_mismatched_schema_version(tmp_path):
 
 @pytest.mark.parametrize("field", ["lens", "rule_id", "title", "detail"])
 def test_a_missing_required_field_raises_instead_of_reporting_seen(tmp_path, field):
-    """`Candidate` is frozen but unvalidated, so a lens returning None for one
-    field is a NOT NULL violation -- which is also an `sqlite3.IntegrityError`.
-    A handler written for the dedupe-key race used to swallow it, report the
-    finding as already seen, and drop it on the floor.
+    """A None in one field is a NOT NULL violation -- which is also an
+    `sqlite3.IntegrityError`. A handler written for the dedupe-key race used to
+    swallow it, report the finding as already seen, and drop it on the floor.
+
+    `Candidate.__post_init__` now refuses this candidate at construction (issue
+    #14), so the field is planted through `object.__setattr__` to reach the
+    store's own handler regardless. The two layers are independent and the
+    inner one keeps its own test: a future field that is NOT NULL in the schema
+    but not yet covered by the lens contract would otherwise have no gate at
+    all, which is how this defect arrived the first time.
     """
     conn = connect(tmp_path)
-    candidate = replace(_candidate(), **{field: None})
+    candidate = _candidate()
+    object.__setattr__(candidate, field, None)
     with pytest.raises(sqlite3.IntegrityError):
         upsert(conn, candidate, "run-1", NOW)
     assert count_by_state(conn) == {}

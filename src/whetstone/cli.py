@@ -67,10 +67,12 @@ def _load(path: Path):
     config_path = find_config(path)
     cfg = load_config(config_path)
     project_root = config_path.parent
-    # `state_dir` is a SecretStr (it may hold a resolved `${env:...}` value;
-    # see config/model.py), and `state_root` wants the plain string it wraps.
-    override = cfg.state_dir.get_secret_value() if cfg.state_dir is not None else None
-    root = state_root(project_root, override)
+    # The SecretStr goes in WRAPPED. Unwrapping it here bound the plaintext to
+    # a local of this frame, and `capture_locals` renders every frame a raise
+    # passes through -- so a state_dir failure printed the credential in full
+    # even after paths.py had scrubbed its own frames. state_root unwraps it
+    # internally, where no frame on the traceback holds the result.
+    root = state_root(project_root, cfg.state_dir)
     return cfg, project_root, root
 
 
@@ -276,7 +278,7 @@ def report(
             run = get_last_run(conn)
         target = _report_target(project_root, out)
         html = render_report(rows, project_name=cfg.project.name, run=run)
-        written = write_report(target, html)
+        written = write_report(target, html, project_root=project_root)
     except WhetstoneError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc

@@ -7,6 +7,8 @@ import os
 import re
 from pathlib import Path
 
+from pydantic import SecretStr
+
 from .errors import ConfigError, StateDirError, UnsafeStatePathError
 
 # Substrings that indicate a file-replacing sync client owns the directory.
@@ -38,7 +40,7 @@ _CLOUD_MARKERS = (
 # "omega" and "megabyte", which are ordinary directory names.
 _CLOUD_COMPONENTS = frozenset({"mega"})
 
-# An unexpanded variable left over after os.path.expandvars — the name was not
+# An unexpanded variable left over after os.path.expandvars -- the name was not
 # set in the environment, and creating the path would make a directory named
 # after the reference. WHICH spellings count is platform-specific, because which
 # ones are legal in a path is platform-specific.
@@ -49,7 +51,7 @@ _CLOUD_COMPONENTS = frozenset({"mega"})
 # Windows: `%VAR%` is the native spelling and the one a Windows user writes, and
 # ntpath.expandvars leaves it literal when the name is unset. `$` is deliberately
 # NOT flagged there: it is a legal filename character that real system
-# directories use — `$Recycle.Bin`, `$WINDOWS.~BT` — so treating `$Recycle` as a
+# directories use -- `$Recycle.Bin`, `$WINDOWS.~BT` -- so treating `$Recycle` as a
 # failed expansion rejects valid paths, which is the same defect pointed the
 # other way. ntpath.expandvars still expands `$VAR` when the name IS set; only
 # the unset case goes unreported on Windows, and it is not the spelling anyone
@@ -105,8 +107,78 @@ def assert_not_cloud_synced(path: Path, *, override: str | None = None) -> None:
         )
 
 
-def state_root(project_root: Path, override: str | None = None) -> Path:
-    """Resolve, validate, and create the state directory for *project_root*."""
+def _plain(override: SecretStr | str | None) -> str | None:
+    """Unwrap a `SecretStr` here, so no CALLER has to hold the plaintext.
+
+    Returned rather than assigned anywhere on purpose: a `return` puts the value
+    on the value stack, and `capture_locals` reads `frame.f_locals`. Binding it
+    to a name in any frame that a raise passes through is the whole defect this
+    guards.
+    """
+    return (
+        override.get_secret_value() if isinstance(override, SecretStr) else override
+    )
+
+
+def state_root(
+    project_root: Path, override: SecretStr | str | None = None
+) -> Path:
+    """Resolve, validate, and create the state directory for *project_root*.
+
+    A thin wrapper whose only job is issue #3: keeping the resolved `state_dir`
+    out of every frame a traceback renderer can reach.
+
+    *override* takes the `SecretStr` straight off the config. That is the point,
+    not a convenience: the first fix for this issue scrubbed paths.py's own
+    frames and left `cli._load` binding
+    `cfg.state_dir.get_secret_value()` one frame up, so a `capture_locals`
+    rendering of a real CLI failure still printed the credential in full and the
+    issue's headline scenario -- a Sentry user shipping it to a third party --
+    still happened verbatim. A helper that only cleans its own frames leaves
+    that trap set for every caller. Unwrapping HERE means no caller ever holds
+    the plaintext, and `tests/unit/test_cli.py` scans `src/` to keep it that
+    way. A plain `str` is still accepted, for the tests that construct one
+    directly.
+
+    `traceback.TracebackException(capture_locals=True)` renders each local with
+    `repr()`, and `rich`, `better-exceptions` and every Sentry-style reporter
+    turn it on. `_state_root`'s `root` and `_make_dir`'s `root` are Paths built
+    from the resolved override, so a user with any of those installed got the
+    credential in their error output -- past the `<elided>` message, because
+    message-level elision never reaches a frame's locals, and a Sentry user
+    shipped it to a third party.
+
+    Message-level elision cannot be extended to cover this, so the frames
+    themselves are removed instead. A failure with an override behind it is
+    re-raised from HERE, which gives the new exception a traceback that starts
+    at this frame -- the inner frames belonged to the caught exception and do
+    not carry over -- and `override` is deleted before the raise so this frame
+    holds nothing either. The re-raise is OUTSIDE the except block for the
+    reason `_make_dir` already documents: inside it, Python attaches the
+    original as `__context__` and every chain-walking renderer prints its
+    locals anyway.
+
+    The cost is the inner frames' location detail on an override failure. That
+    is the trade: a state_dir error already tells the user which setting is
+    wrong, which is the actionable half.
+
+    With NO override there is no secret and nothing is elided, so the original
+    exception propagates untouched and keeps its full traceback.
+    """
+    try:
+        return _state_root(project_root, _plain(override))
+    except (StateDirError, UnsafeStatePathError, ConfigError) as exc:
+        if override is None:
+            raise
+        failure, message = type(exc), str(exc)
+    # `del` even though a SecretStr already masks its own repr: a caller may
+    # legitimately pass a plain str, and this frame must be clean either way.
+    del override
+    raise failure(message)
+
+
+def _state_root(project_root: Path, override: str | None) -> Path:
+    """Resolve, validate, and create the state directory. See `state_root`."""
     if override is None:
         digest = hashlib.sha256(
             str(project_root.resolve()).encode("utf-8")
@@ -116,16 +188,60 @@ def state_root(project_root: Path, override: str | None = None) -> Path:
         root = _root_from_override(override)
         # A relative `state_dir` is relative to the PROJECT, not to wherever the
         # user happened to be standing. find_config walks up to locate the
-        # config, so the CWD is routinely somewhere below project_root — or, for
+        # config, so the CWD is routinely somewhere below project_root -- or, for
         # a tool pointed at someone else's repository, somewhere else entirely.
         # Resolving against the CWD would scatter a project's state across every
         # directory it was ever invoked from.
         if not root.is_absolute():
             root = project_root / root
-    root = root.resolve()
+    root = _resolve_root(root, override)
     assert_not_cloud_synced(root, override=override)
     _make_dir(root, override)
     return root
+
+
+def _resolve_root(root: Path, override: str | None) -> Path:
+    """`Path.resolve()`, plus the two failures it raises that are not OSError.
+
+    `resolve()` raises `RuntimeError` for a symlink loop and `ValueError` for an
+    embedded NUL. Neither is an `OSError`, so neither was in `state_root`'s
+    except clause, and an override-derived path took both straight past the one
+    place that removes the frames `capture_locals` reads. The `RuntimeError` is
+    the worse of the two: CPython builds its message as `Symlink loop from
+    '<path>'`, so the resolved `state_dir` was in the message text as well.
+
+    Which of them is reachable is platform-specific -- POSIX raises `ValueError`
+    for a NUL where Windows resolves the same string without complaint -- so
+    both are converted here rather than only the one this host can produce.
+    `ConfigError` is already in `state_root`'s clause, so converting is all this
+    needs to do; the frame removal is that function's job and stays there.
+    """
+    try:
+        return root.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        source = (
+            "`state_dir` in whetstone.yaml"
+            if override is not None
+            else "the default state directory"
+        )
+        # The exception's own text is elided with everything else. It is not
+        # incidentally safe: the symlink-loop message interpolates the path.
+        detail = (
+            type(exc).__name__
+            if override is not None
+            else f"{type(exc).__name__}: {exc}"
+        )
+        message = (
+            f"{source} names {_shown(root, override)}, which cannot be resolved "
+            f"to a real location ({detail}).\n"
+            "A symlink loop in the path, or a NUL byte in the value, both land "
+            "here. Point `state_dir` at a plain directory."
+            + (_ELISION_NOTE if override is not None else "")
+        )
+    # Outside the except block, for the reason `_make_dir` documents at length:
+    # inside it Python attaches the caught exception as `__context__`, and every
+    # chain-walking renderer then prints the text this message exists to elide.
+    raise ConfigError(message)
 
 
 def _root_from_override(override: str) -> Path:

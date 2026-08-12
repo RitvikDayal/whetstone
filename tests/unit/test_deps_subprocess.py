@@ -547,7 +547,7 @@ def test_exit_one_is_success_because_that_is_how_advisories_are_reported(
     ctx = _ctx(tmp_path)
     found = list(DepsDetector().detect(ctx))
     assert [c.rule_id for c in found] == ["PYSEC-2018-28"]
-    assert ctx.skips == []
+    assert ctx.skips == ()
 
 
 def test_unparseable_json_skips_loudly(tmp_path, monkeypatch):

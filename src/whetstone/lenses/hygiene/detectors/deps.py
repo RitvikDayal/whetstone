@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import tomllib
 from collections.abc import Iterator
@@ -25,7 +24,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ...._subprocess import close_pipes, kill_and_reap, new_group
-from ...base import Candidate, Evidence, EvidenceKind, RunContext, Severity
+from ...base import (
+    Candidate,
+    Evidence,
+    EvidenceKind,
+    RunContext,
+    Severity,
+    unstorable,
+)
 
 _PYPROJECT = "pyproject.toml"
 _REQUIREMENTS = "requirements.txt"
@@ -72,32 +78,19 @@ def _pyproject_state(path: Path) -> str:
 # Text that cannot be encoded as UTF-8, so it cannot be stored, printed, or
 # acted on. `errors="surrogateescape"` above is what keeps a non-UTF-8 byte
 # from killing the reader thread, but decoding is only half the job: the
-# resolver pairs it with a containment check (scope/resolver.py:29) precisely
-# so surrogates never travel downstream. This detector had the decode and not
-# the guard, so a bad byte inside a package name or an advisory description
-# reached sqlite as a lone surrogate and killed the whole run with
-# UnicodeEncodeError -- from `runner.upsert`, which is outside the
-# per-detector guard in pack.py and so was not caught by it.
+# resolver pairs it with a containment check (scope/resolver.py) precisely so
+# surrogates never travel downstream. This detector had the decode and not the
+# guard, so a bad byte inside a package name or an advisory description reached
+# sqlite as a lone surrogate and killed the whole run with UnicodeEncodeError --
+# from `runner.upsert`, which is outside the per-detector guard in pack.py and
+# so was not caught by it.
 #
-# Wider than the resolver's `[\udc80-\udcff]` on purpose. That range is exactly
-# what surrogateescape produces from bytes. This input is JSON, which can also
-# carry an explicit `\ud800` escape that json.loads decodes into a lone
-# surrogate without any byte ever being malformed.
-#
-# The right long-term home for this is `Evidence`/`Candidate` refusing
-# unstorable text at construction, so every lens inherits it instead of each
-# one remembering -- see issue #14. Until then this is the second copy, and
-# the comment above names the first.
-_SURROGATE = re.compile("[\ud800-\udfff]")
-
-
-def _unstorable(value: object) -> bool:
-    """True when *value* holds text UTF-8 cannot represent."""
-    if isinstance(value, str):
-        return _SURROGATE.search(value) is not None
-    if isinstance(value, (list, tuple)):
-        return any(_unstorable(item) for item in value)
-    return False
+# This used to be a second copy of the pattern. It now imports the one on
+# `lenses/base.py`, which is the long-term home the comment here asked for:
+# `Candidate` refuses unstorable text at construction, so every lens inherits
+# it. The check is KEPT here as well as there, and that is not redundancy --
+# refusing early lets this detector record a SKIP naming the package, where
+# `Candidate` refusing late would cost the whole run.
 
 
 def _as_text(value: object) -> str | None:
@@ -105,7 +98,7 @@ def _as_text(value: object) -> str | None:
 
     Deliberately not `str(value)`. Container types are validated below, and the
     scalars pulled out of them were not: `{"name": 42}` or `{"id": {"a": 1}}`
-    passes every shape check, and `_unstorable` returns False for anything that
+    passes every shape check, and `unstorable` returns False for anything that
     is neither str nor sequence. The value then reaches `Candidate.subject`,
     whose `dedupe_key` calls `.replace()` on it, and `upsert` binds it to
     sqlite -- both in runner.py, OUTSIDE the per-detector guard in pack.py, so
@@ -113,8 +106,9 @@ def _as_text(value: object) -> str | None:
     comment above describes. Coercing instead of refusing would invent an
     identity that then feeds the dedupe key.
 
-    Same long-term home as `_SURROGATE`: `Candidate` refusing unusable values
-    at construction, so every lens inherits it -- see issue #14.
+    `Candidate` now refuses unusable values at construction too, so every lens
+    inherits that half; this stays because refusing HERE can name the package in
+    a skip line, where refusing there costs the run.
     """
     return value if isinstance(value, str) else None
 
@@ -122,7 +116,7 @@ def _as_text(value: object) -> str | None:
 def _as_versions(value: object) -> list[str] | None:
     """A list of version strings, otherwise None.
 
-    A bare string passes `_unstorable`, and then `', '.join("2.0")` renders
+    A bare string passes `unstorable`, and then `', '.join("2.0")` renders
     `2, ., 0` while `evidence.data["fix_versions"]` stores a string where every
     consumer expects a list.
     """
@@ -327,7 +321,7 @@ class DepsDetector:
             # name you cannot type, and `subject` feeds the dedupe key. Drop
             # the whole entry and say so, rather than storing text that kills
             # the run three frames later inside `upsert`.
-            if _unstorable(name) or _unstorable(version):
+            if unstorable(name) or unstorable(version):
                 ctx.skip(
                     "hygiene/deps: pip-audit reported a dependency whose name "
                     f"or version is not valid UTF-8 (name={ascii(name)}, "
@@ -382,7 +376,7 @@ class DepsDetector:
                 # Same rule as the package name: the advisory id is the finding's
                 # identity and the fix versions are the remedy, so neither can be
                 # text nobody can store or type.
-                if _unstorable(advisory) or _unstorable(fixes):
+                if unstorable(advisory) or unstorable(fixes):
                     ctx.skip(
                         f"hygiene/deps: {name} has an advisory whose id or fix "
                         f"versions are not valid UTF-8 (id={ascii(advisory)}); "
@@ -404,7 +398,7 @@ class DepsDetector:
                         "was recorded without it."
                     )
                     description = "No description provided."
-                elif _unstorable(description):
+                elif unstorable(description):
                     # Unlike identity, prose is not what the user acts on. A
                     # real advisory is not worth discarding over one bad byte in
                     # its text, so the text is escaped and the substitution is

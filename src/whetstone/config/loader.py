@@ -8,22 +8,41 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from ..errors import ConfigError, LiteralSecretError
 from .model import WhetstoneConfig
 
+
+class _ResolvedSecrets(dict):
+    """{resolved value: `${env:...}` reference}, with repr() masked.
+
+    A plain dict here was issue #3. `traceback.TracebackException(
+    capture_locals=True)` renders every local with repr(), and `rich`,
+    `better-exceptions` and every Sentry-style reporter turn that on. So the
+    registry of what was resolved -- which is by construction a list of live
+    credentials -- printed in full into the user's error output, past the
+    message-level redaction, which never reaches a frame's locals. A Sentry user
+    shipped it to a third party.
+
+    A dict subclass rather than a wrapper object so every existing use site
+    keeps working; the ONE behaviour that changes is the one that leaked.
+    """
+
+    def __repr__(self) -> str:
+        return f"<{len(self)} resolved secret(s), redacted>"
+
 CONFIG_NAME = "whetstone.yaml"
 
-# Matches ${env:VAR_NAME} (env prefix case-insensitive, variable name is not —
+# Matches ${env:VAR_NAME} (env prefix case-insensitive, variable name is not --
 # environment variable names are case-sensitive). Deliberately narrower than
-# ${VAR} so that runtime placeholders Whetstone substitutes itself —
-# ${WHETSTONE_PORT} — pass through.
+# ${VAR} so that runtime placeholders Whetstone substitutes itself --
+# ${WHETSTONE_PORT} -- pass through.
 _ENV_REF = re.compile(r"\$\{[Ee][Nn][Vv]:([A-Za-z_][A-Za-z0-9_]*)\}")
 
 # Words that name a secret. Matched as whole WORDS, never as substrings.
 # Substring matching caught every conventional spelling and a pile of ordinary
-# config with it — `max_tokens`, `tokenizer`, `secretary`, `credentialing`,
+# config with it -- `max_tokens`, `tokenizer`, `secretary`, `credentialing`,
 # `passwords_enabled` were all rejected, and a tool that will not load someone's
 # valid config is its own defect.
 #
@@ -31,7 +50,7 @@ _ENV_REF = re.compile(r"\$\{[Ee][Nn][Vv]:([A-Za-z_][A-Za-z0-9_]*)\}")
 # quantity or a collection rather than one secret value: `max_tokens` is an LLM
 # setting, `passwords_enabled` a feature flag. Demanding `${env:...}` there
 # makes ordinary documents unloadable with no escape hatch. `credentials` stays
-# because that is simply how the thing is spelled — nobody writes `credential:`
+# because that is simply how the thing is spelled -- nobody writes `credential:`
 # for an auth blob.
 _SECRET_WORDS = frozenset(
     {
@@ -135,7 +154,7 @@ def load_config(path: Path) -> WhetstoneConfig:
         ) from exc
     except OSError as exc:
         # Covers IsADirectoryError, PermissionError, and the assorted platform
-        # spellings of the same two mistakes — Windows raises PermissionError
+        # spellings of the same two mistakes -- Windows raises PermissionError
         # where POSIX raises IsADirectoryError for a directory.
         detail = "it is a directory" if path.is_dir() else str(exc)
         raise ConfigError(f"{path} could not be read: {detail}") from exc
@@ -149,13 +168,20 @@ def load_config(path: Path) -> WhetstoneConfig:
 
     _reject_literal_secrets(raw, [])
     # Interpolation puts real secret values into the tree. Anything that
-    # stringifies that tree afterwards — Pydantic renders `input_value=` verbatim
-    # — would print them, so record what was resolved and scrub it back out.
-    resolved_secrets: dict[str, str] = {}
-    resolved = _interpolate(raw, resolved_secrets)
+    # stringifies that tree afterwards -- Pydantic renders `input_value=`
+    # verbatim -- would print them, so record what was resolved and scrub it
+    # back out.
+    resolved_secrets = _ResolvedSecrets()
 
+    # The interpolated tree is deliberately NOT bound to a local here. It is
+    # the one structure in this function that can hold a plaintext value under
+    # a NON-secret-shaped key (`state_dir`, which the model then wraps), and a
+    # local survives to the `raise` below where capture_locals would render it.
+    # Passed straight through, it is a temporary that no frame on the traceback
+    # holds. Secret-SHAPED keys are already SecretStr by the time they get here
+    # -- see _interpolate.
     try:
-        return WhetstoneConfig.model_validate(resolved)
+        return WhetstoneConfig.model_validate(_interpolate(raw, resolved_secrets))
     except ValidationError as exc:
         detail = _redact(str(exc), resolved_secrets)
 
@@ -251,13 +277,44 @@ def _describe(value: Any) -> str:
     return f"a literal {type(value).__name__}"
 
 
-def _interpolate(node: Any, resolved: dict[str, str]) -> Any:
+def _interpolate(node: Any, resolved: dict[str, str], *, secret: bool = False) -> Any:
+    """Resolve `${env:...}` references, wrapping the ones under secret keys.
+
+    THE DESIGN CALL FOR ISSUE #2. A resolved value under a secret-shaped key
+    comes back as a `SecretStr`, not a plain string, so the consumer says
+    `.get_secret_value()`.
+
+    Three options were on the table: hand back the resolved string (the status
+    quo, and the defect -- `repr(config)` printed a live credential from a
+    free-form dict while `state_dir`, one field away in the same object,
+    rendered as `**********`); hand back a `SecretStr`; or invent an accessor.
+
+    `SecretStr` wins on three counts. It is already this codebase's answer to
+    exactly this problem for `state_dir`, so there is one rule -- "a
+    secret-shaped key holds a SecretStr" -- rather than two that differ by where
+    the key happens to sit. It masks `repr`, `str`, `model_dump` and
+    `model_dump_json` in one move, which is the whole set of surfaces issue #2
+    names. And it costs one explicit `.get_secret_value()` at the consumer,
+    which reads as the marker it is. An accessor would buy laziness, which is
+    not the problem here.
+
+    There is no false-positive class to trade against: `_reject_literal_secrets`
+    GUARANTEES a secret-shaped key holds a single `${env:...}` reference, so
+    after interpolation that value is always a real credential.
+
+    This changed the contract `test_env_reference_is_interpolated` asserted --
+    a plain string back. That contract was the bug.
+    """
     if isinstance(node, dict):
-        return {key: _interpolate(value, resolved) for key, value in node.items()}
+        return {
+            key: _interpolate(value, resolved, secret=_is_secret_key(key))
+            for key, value in node.items()
+        }
     if isinstance(node, list):
-        return [_interpolate(value, resolved) for value in node]
+        return [_interpolate(value, resolved, secret=secret) for value in node]
     if isinstance(node, str):
-        return _ENV_REF.sub(lambda match: _substitute(match, resolved), node)
+        substituted = _ENV_REF.sub(lambda match: _substitute(match, resolved), node)
+        return SecretStr(substituted) if secret else substituted
     return node
 
 
