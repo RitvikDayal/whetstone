@@ -68,6 +68,37 @@ def unstorable(value: object) -> bool:
     return False
 
 
+def _non_string_key(value: object) -> tuple[object] | None:
+    """The first mapping key that is not a `str`, at any depth, wrapped in a
+    1-tuple; None when there is none.
+
+    `json.dumps` does not refuse these, it RENAMES them: `{1: "x"}` serialises
+    to `{"1": "x"}`, and `{True: "x"}` to `{"true": "x"}`. The document that
+    comes back out of the store is then a different document from the one the
+    lens handed over, and nothing anywhere said so. A uniform int-keyed mapping
+    sorts without complaint under `sort_keys=True`, so the serialiser cannot be
+    relied on to raise even by accident.
+
+    WRAPPED because the offending key can itself be `None`, and returning it
+    bare made `{None: "x"}` -- a key a model produces readily -- indistinguishable
+    from "nothing was wrong". The first version of this function had that bug and
+    its own test caught it.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                return (key,)
+            found = _non_string_key(item)
+            if found is not None:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = _non_string_key(item)
+            if found is not None:
+                return found
+    return None
+
+
 def _require_text(owner: str, field_name: str, value: object) -> None:
     """Refuse anything that is not non-blank, storable text.
 
@@ -174,6 +205,13 @@ class Evidence:
     summary: str
     data: dict[str, Any]
     artifacts: tuple[str, ...] = ()
+    # The validated state, serialised once at construction. `data` is a mutable
+    # dict inside a frozen dataclass and `artifacts` may arrive as a list, so
+    # the fields themselves cannot be trusted to still hold what was checked.
+    # Excluded from `compare` and `repr` because it is derived: two evidences
+    # equal on their real fields are equal, and printing the JSON twice helps
+    # nobody.
+    _canonical: str = field(init=False, repr=False, compare=False, default="")
 
     def __post_init__(self) -> None:
         """Validate at construction, for the reason argued on `Candidate`.
@@ -206,17 +244,15 @@ class Evidence:
                 "on the way out, so the failure lands on a later reader rather "
                 "than on the lens that produced it."
             )
-        try:
-            # `allow_nan=False` because the default emits a bare `NaN`, which
-            # every JSON parser outside Python rejects: `to_json` would produce
-            # a document the store accepts and no other consumer can read.
-            json.dumps(self.data, sort_keys=True, allow_nan=False)
-        except (TypeError, ValueError) as exc:
+        found = _non_string_key(self.data)
+        if found is not None:
+            (renamed,) = found
             raise LensError(
-                f"evidence data is not storable as JSON ({exc}). It is stored "
-                "as UTF-8 JSON, so a value that cannot be encoded fails inside "
-                "the store's transaction rather than here."
-            ) from None
+                f"evidence data has the non-string mapping key {renamed!r} "
+                f"({type(renamed).__name__}). json.dumps does not refuse these, "
+                "it renames them, so the document read back out of the store "
+                "would not be the document the lens handed over."
+            )
         # `isinstance(artifacts, str)` first: a string is a sequence, so
         # `tuple("a.txt")` turns one path into eight single-character ones and
         # every per-item check below then passes.
@@ -233,28 +269,50 @@ class Evidence:
                     f"evidence artifacts[{index}] must be a string, not "
                     f"{type(artifact).__name__} ({artifact!r})."
                 )
+        object.__setattr__(self, "_canonical", self._serialise())
 
-    def to_json(self) -> str:
+    def _serialise(self) -> str:
         """Deterministic JSON -- key order must not affect stored bytes.
 
-        `allow_nan=False` matches the construction-time probe. `data` is a
-        mutable dict inside a frozen dataclass, so a lens CAN put a NaN or a
-        surrogate in after construction and reinstate the failure the probe
-        exists to prevent; freezing it would mean a deep copy on every
-        candidate. Raising here rather than emitting a bare `NaN` keeps the
-        worst case a loud failure instead of a stored document no JSON parser
-        outside Python will read.
+        `allow_nan=False` because the default emits a bare `NaN`, which every
+        JSON parser outside Python rejects: the store would hold a document it
+        accepted and no other consumer can read.
         """
-        return json.dumps(
-            {
-                "kind": str(self.kind),
-                "summary": self.summary,
-                "data": self.data,
-                "artifacts": list(self.artifacts),
-            },
-            sort_keys=True,
-            allow_nan=False,
-        )
+        try:
+            return json.dumps(
+                {
+                    "kind": str(self.kind),
+                    "summary": self.summary,
+                    "data": self.data,
+                    "artifacts": list(self.artifacts),
+                },
+                sort_keys=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise LensError(
+                f"evidence data is not storable as JSON ({exc}). It is stored "
+                "as UTF-8 JSON, so a value that cannot be encoded fails inside "
+                "the store's transaction rather than here."
+            ) from None
+
+    def to_json(self) -> str:
+        """The snapshot taken at construction, not a fresh serialisation.
+
+        `data` is a mutable dict inside a frozen dataclass, so a lens can put a
+        NaN, a surrogate or an unserialisable object into it AFTER construction
+        and reinstate exactly the failure the validation exists to prevent --
+        and `to_json` is called by the store, inside the transaction, three
+        layers from the lens that caused it and with the `runs` row already
+        open. Serialising once at construction and handing back that string
+        makes the validated state the state that gets stored.
+
+        This is not a deep copy: the cost is the one `json.dumps` the
+        construction check was already paying, moved rather than added. A lens
+        that mutates `data` afterwards still sees its own mutation on the
+        attribute; what it cannot do is change what the store receives.
+        """
+        return self._canonical
 
 
 @dataclass(frozen=True)

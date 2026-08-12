@@ -171,6 +171,48 @@ def test_evidence_data_must_be_json_encodable():
         Evidence(EvidenceKind.metric, "s", {"when": object()})
 
 
+@pytest.mark.parametrize(
+    "data",
+    [
+        {1: "value"},
+        {True: "value"},
+        {None: "value"},
+        {"outer": {2: "value"}},
+        {"outer": [{"inner": {3.5: "value"}}]},
+    ],
+    ids=["int", "bool", "none", "nested-dict", "nested-through-a-list"],
+)
+def test_evidence_data_refuses_a_non_string_mapping_key(data):
+    """`json.dumps` does not refuse these, it renames them: `{1: "v"}` stores as
+    `{"1": "v"}` and `{True: "v"}` as `{"true": "v"}`. The document read back out
+    is a different document from the one the lens handed over, and a uniform
+    int-keyed mapping sorts cleanly under `sort_keys=True`, so the serialiser
+    never raises by accident either."""
+    with pytest.raises(LensError, match="key"):
+        Evidence(EvidenceKind.metric, "s", data)
+
+
+def test_to_json_serialises_the_state_that_was_validated():
+    """`data` is a mutable dict inside a frozen dataclass, so a lens can put an
+    unserialisable object in after construction. Serialising then failed inside
+    the store's transaction, which is exactly what validating at construction
+    exists to prevent -- the check was real and the window after it was open."""
+    evidence = Evidence(EvidenceKind.metric, "s", {"pct": 1.0})
+    evidence.data["when"] = object()
+    assert evidence.to_json() == (
+        '{"artifacts": [], "data": {"pct": 1.0}, "kind": "metric", "summary": "s"}'
+    )
+
+
+def test_a_mutated_artifacts_list_does_not_reach_the_store():
+    """The same window, through the other field. A list passed for `artifacts`
+    stays the caller's list."""
+    artifacts = ["repro.py"]
+    evidence = Evidence(EvidenceKind.metric, "s", {}, artifacts=artifacts)
+    artifacts.append(object())
+    assert '"artifacts": ["repro.py"]' in evidence.to_json()
+
+
 def test_evidence_artifacts_must_be_a_sequence_of_text():
     with pytest.raises(LensError, match="artifacts"):
         Evidence(EvidenceKind.metric, "s", {}, artifacts=(1, 2))
