@@ -110,8 +110,16 @@ def test_every_command_reports_a_missing_config_by_name_not_a_traceback(
 
 
 def test_no_merge_or_deploy_command_is_registered():
-    """The help *text* says 'never merges'. No *command* may be named either."""
+    """The help *text* says 'never merges'. No *command* may be named either.
+
+    `names` empty (an unregistered app, or a walk over the wrong attribute
+    after a Typer upgrade) satisfies the exclusion below for free, so the
+    known command surface is asserted present first -- the scan has to have
+    looked at something before its silence means anything.
+    """
     names = {command.name or command.callback.__name__ for command in app.registered_commands}
+    expected = {"version", "init", "doctor", "run", "findings", "report"}
+    assert expected <= names, f"expected commands missing from {names}"
     assert not {name for name in names if "merge" in name or "deploy" in name}
 
 
@@ -120,12 +128,19 @@ def test_source_contains_no_merge_or_push_invocation():
 
     This test file names the forbidden strings itself, so it excludes itself
     from the scan rather than trying to reason about surrounding context.
+
+    The file list is bound and its size asserted before the offender scan: a
+    directory move or packaging change that made `src.rglob("*.py")` come up
+    empty would otherwise leave `offenders == []` trivially true and this
+    invariant silently stops running.
     """
     forbidden = ("git merge", "git push", "gh pr merge", "kubectl apply")
     src = Path(__file__).resolve().parents[2] / "src" / "whetstone"
+    files = sorted(src.rglob("*.py"))
+    assert len(files) >= 5, f"only found {files}; the scan is not reaching src/"
     offenders = [
         f"{path}: {needle}"
-        for path in src.rglob("*.py")
+        for path in files
         for needle in forbidden
         if needle in path.read_text(encoding="utf-8")
     ]
@@ -172,11 +187,19 @@ def test_console_output_is_ascii_only():
     Comments and docstrings stay out of scope; the codebase uses em dashes in
     prose throughout. `report/html.py` is UTF-8 HTML, not a console, and is
     exempt.
+
+    `inspected` counts every non-docstring string literal this walk actually
+    looked at, asserted non-zero before the offender assertion: an empty
+    `files` list, or an AST-walk shape change that stopped matching any
+    literal, would otherwise leave `offenders == []` trivially true.
     """
     src = Path(__file__).resolve().parents[2] / "src" / "whetstone"
     exempt = {src / "report" / "html.py"}
+    files = sorted(src.rglob("*.py"))
+    assert len(files) >= 5, f"only found {files}; the scan is not reaching src/"
     offenders: list[str] = []
-    for path in sorted(src.rglob("*.py")):
+    inspected = 0
+    for path in files:
         if path in exempt:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -196,9 +219,11 @@ def test_console_output_is_ascii_only():
                 continue
             if id(node) in docstrings or node.value in _NOT_CONSOLE_TEXT:
                 continue
+            inspected += 1
             for ch in node.value:
                 if ord(ch) > 127:
                     offenders.append(f"{path}:{node.lineno}: {ch!r} (U+{ord(ch):04X})")
+    assert inspected > 0, "no console-reachable string literals were inspected"
     assert offenders == [], offenders
 
 
