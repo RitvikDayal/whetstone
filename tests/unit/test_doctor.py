@@ -3,6 +3,7 @@ import subprocess
 import sys
 import time
 
+from whetstone import _subprocess
 from whetstone import doctor as doctor_module
 from whetstone.config.model import (
     CommandsConfig,
@@ -156,9 +157,34 @@ def test_a_successful_command_leaves_no_open_pipes(tmp_path, monkeypatch):
     assert proc.poll() is not None, "the child was left unreaped"
 
 
+def _recording_reap(monkeypatch) -> list[bool]:
+    """Wrap the real `kill_and_reap` so a test can see its drain-completed flag.
+
+    The pipes are closed if and only if that drain completed -- see
+    `_subprocess.kill_and_reap`. `run_command` discards the flag, so a test
+    asserting closure unconditionally is really asserting that the kill won a
+    race, and passes or fails on machine speed. Pinning the flag makes the
+    branch explicit and makes a drain failure report itself. Wrapping rather
+    than faking: the real kill, drain and `close_pipes` all still run.
+    """
+    drained: list[bool] = []
+
+    def _wrapper(proc):
+        result = _subprocess.kill_and_reap(proc)
+        drained.append(result)
+        return result
+
+    monkeypatch.setattr(doctor_module, "kill_and_reap", _wrapper)
+    return drained
+
+
 def test_a_timed_out_command_leaves_no_open_pipes(tmp_path, monkeypatch):
     """Same guarantee on the path that does not go through communicate()'s own
-    cleanup."""
+    cleanup -- and it is a CONDITIONAL guarantee: closed if and only if the
+    bounded drain completed. The command spawns no grandchild, so nothing but
+    the direct child holds the write end and the drain is deterministic; the
+    flag is asserted anyway so the day that stops being true this fails on the
+    premise rather than flaking on the conclusion."""
     spawned: list[subprocess.Popen] = []
     real_popen = subprocess.Popen
 
@@ -168,18 +194,25 @@ def test_a_timed_out_command_leaves_no_open_pipes(tmp_path, monkeypatch):
             spawned.append(self)
 
     monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+    drained = _recording_reap(monkeypatch)
 
     result = run_command(
         "probe", f'"{sys.executable}" -c "import time; time.sleep(30)"', tmp_path, 1
     )
 
     assert result.ok is False
+    assert drained == [True], f"the drain did not complete ({drained})"
     proc = spawned[0]
     assert proc.stdout.closed and proc.stderr.closed
 
 
 def test_an_interrupt_kills_the_command_and_closes_the_pipes(tmp_path, monkeypatch):
-    """Ctrl-C mid-command must not leave it, or anything it spawned, running."""
+    """Ctrl-C mid-command must not leave it, or anything it spawned, running.
+
+    Closure is conditional on the bounded drain completing, same as the timeout
+    test above; no grandchild here, so the drain is deterministic, and the flag
+    is asserted so it cannot quietly stop being.
+    """
     spawned: list[subprocess.Popen] = []
     interrupted: list[bool] = []
     real_popen = subprocess.Popen
@@ -198,6 +231,7 @@ def test_an_interrupt_kills_the_command_and_closes_the_pipes(tmp_path, monkeypat
             return super().communicate(*args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", _InterruptingPopen)
+    drained = _recording_reap(monkeypatch)
 
     try:
         try:
@@ -214,6 +248,7 @@ def test_an_interrupt_kills_the_command_and_closes_the_pipes(tmp_path, monkeypat
 
         proc = spawned[0]
         assert proc.poll() is not None, "the command survived the interrupt"
+        assert drained == [True], f"the drain did not complete ({drained})"
         assert proc.stdout.closed and proc.stderr.closed
     finally:
         for proc in spawned:

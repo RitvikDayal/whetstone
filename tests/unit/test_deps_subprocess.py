@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 from _pytest.outcomes import Failed, Skipped
 
+from whetstone import _subprocess
 from whetstone.lenses.base import RunContext
 from whetstone.lenses.hygiene.detectors import deps as deps_module
 from whetstone.lenses.hygiene.detectors.deps import DepsDetector
@@ -623,13 +624,49 @@ def test_run_pip_audit_actually_spawns_a_process(tmp_path, monkeypatch):
     assert any("--format" in argv and "json" in argv for argv in calls), calls
 
 
-def test_an_interrupt_mid_read_kills_the_child_and_closes_the_pipes(
-    tmp_path, monkeypatch
-):
-    """`except subprocess.TimeoutExpired` was the only recovery path, so any
-    other exit from communicate() -- Ctrl-C being the ordinary one -- walked
-    straight out leaving pip-audit and the pip it shelled out to alive with the
-    pipes still open. The timeout is not the only way out of a read."""
+# The pipes are closed IF AND ONLY IF the reap's drain completed. That is the
+# contract `kill_and_reap` was given deliberately: when the drain hits its bound
+# the pipes are left open, because closing them there blocks on the reader
+# thread holding the buffer lock -- 60.1s against a 1s timeout, measured -- and
+# leaking two handles until the surviving process exits beats hanging the tool
+# forever. A test asserting "the pipes are closed" full stop is asserting the
+# convenient half of that, and passes or fails on whether the kill won a race.
+#
+# Both branches below are therefore made deterministic and tested separately,
+# rather than one assertion left to whichever branch the machine picks.
+#
+# The contract does NOT differ by platform, but its RELIABILITY does, which is
+# why this surfaced on windows-latest alone. `kill_tree`'s POSIX branch is
+# `killpg` against a session the child was placed in at spawn: a grandchild is
+# in that group from the instant it is forked, so the signal cannot miss it. The
+# Windows branch is `taskkill /T`, which walks the tree from a snapshot -- a
+# grandchild spawned between the snapshot and the kill survives, keeps the
+# inherited stdout/stderr write handles, and the drain then times out. The old
+# test's fake tool spawned a grandchild immediately before sleeping, so it raced
+# the kill on Windows and only there. Neither test below depends on that race.
+
+
+def _recording_reap(monkeypatch) -> list[bool]:
+    """Wrap the real `kill_and_reap` so a test can see its drain-completed flag.
+
+    `_run_pip_audit` discards the return value -- it has nothing to do with it,
+    it is re-raising -- so the signal that decides whether the pipes are closed
+    is invisible from outside. Wrapping rather than faking: the real kill, the
+    real bounded drain and the real `close_pipes` all still run.
+    """
+    drained: list[bool] = []
+
+    def _wrapper(proc):
+        result = _subprocess.kill_and_reap(proc)
+        drained.append(result)
+        return result
+
+    monkeypatch.setattr(deps_module, "kill_and_reap", _wrapper)
+    return drained
+
+
+def _interrupt_first_read(monkeypatch) -> list[subprocess.Popen]:
+    """Raise KeyboardInterrupt out of the first `communicate()`, and record spawns."""
     created: list[subprocess.Popen] = []
     interrupted: list[bool] = []
     real_popen = subprocess.Popen
@@ -649,15 +686,30 @@ def test_an_interrupt_mid_read_kills_the_child_and_closes_the_pipes(
             return super().communicate(*args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", _InterruptingPopen)
+    return created
+
+
+def test_an_interrupt_mid_read_kills_the_child_and_closes_the_pipes(
+    tmp_path, monkeypatch
+):
+    """`except subprocess.TimeoutExpired` was the only recovery path, so any
+    other exit from communicate() -- Ctrl-C being the ordinary one -- walked
+    straight out leaving pip-audit and the pip it shelled out to alive with the
+    pipes still open. The timeout is not the only way out of a read.
+
+    The drained branch, made deterministic: the fake tool spawns NO grandchild,
+    so nothing but the direct child holds the write end of those pipes and
+    killing it releases them. The tree-kill claim is not weakened by dropping
+    the grandchild here -- it belongs to `kill_tree`, not to the interrupt path,
+    and `test_timeout_is_bounded_when_a_grandchild_holds_the_pipe` above pins it
+    against a surviving grandchild without asserting anything race-dependent.
+    """
+    created = _interrupt_first_read(monkeypatch)
+    drained = _recording_reap(monkeypatch)
     monkeypatch.setattr(
         deps_module,
         "_PIP_AUDIT_ARGV",
-        _fake_tool(
-            tmp_path,
-            "import subprocess, sys, time\n"
-            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
-            "time.sleep(60)\n",
-        ),
+        _fake_tool(tmp_path, "import time\ntime.sleep(60)\n"),
     )
     (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
 
@@ -667,9 +719,76 @@ def test_an_interrupt_mid_read_kills_the_child_and_closes_the_pipes(
 
         audit = created[0]
         assert audit.poll() is not None, "pip-audit survived the interrupt"
+        # Asserted BEFORE the pipes, so a drain that failed reports itself
+        # instead of surfacing as a confusing open-pipe failure. This is also
+        # what stops the assertion below from silently becoming conditional.
+        assert drained == [True], (
+            f"the drain did not complete ({drained}), so this test is no longer "
+            "exercising the branch it names"
+        )
+        # What this pins is the OBSERVABLE guarantee -- drained implies closed --
+        # not which of the two mechanisms did it. Measured: deleting
+        # `close_pipes` from `kill_and_reap`'s drained path leaves this green,
+        # because `communicate()` closes stdout and stderr itself on the way out
+        # and stdin here is DEVNULL, not a pipe. That is `close_pipes`' own
+        # docstring ("belt and braces") holding, not a gap in the assertion;
+        # there is no input that makes the two differ on this path. The mutation
+        # that DOES turn this red is returning True without draining at all.
         assert audit.stdout.closed and audit.stderr.closed
     finally:
         # Belt and braces: a failure here must not leave a 60s sleeper behind.
+        for proc in created:
+            with contextlib.suppress(OSError, ValueError):
+                proc.kill()
+
+
+def test_a_reap_that_cannot_drain_leaves_the_pipes_open_rather_than_hanging(
+    tmp_path, monkeypatch
+):
+    """The other branch, and the one the leak-rather-than-hang decision is for.
+
+    `kill_tree` is replaced by a no-op, so the child provably survives and keeps
+    the write end: the drain CANNOT complete and the branch is reached without a
+    race. `close_pipes` must not run -- on Windows `.close()` then blocks on the
+    buffer lock the still-blocked reader thread holds, for as long as the pipe
+    stays open, which is the unbounded wait this module exists to avoid reached
+    through the cleanup instead of through `wait()`.
+
+    So this asserts the pipes are OPEN. That is not a weaker guarantee, it is
+    the guarantee: two leaked handles, released when the surviving process
+    exits, against a tool that never returns.
+    """
+    created = _interrupt_first_read(monkeypatch)
+    drained = _recording_reap(monkeypatch)
+    monkeypatch.setattr(_subprocess, "kill_tree", lambda proc: None)
+    monkeypatch.setattr(_subprocess, "REAP_SECONDS", 2)
+    monkeypatch.setattr(
+        deps_module,
+        "_PIP_AUDIT_ARGV",
+        _fake_tool(tmp_path, "import time\ntime.sleep(60)\n"),
+    )
+    (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(KeyboardInterrupt):
+            list(DepsDetector().detect(_ctx(tmp_path)))
+        elapsed = time.monotonic() - started
+
+        audit = created[0]
+        assert drained == [False], (
+            f"the drain completed ({drained}) although the kill was neutered, so "
+            "this test is no longer exercising the branch it names"
+        )
+        assert audit.poll() is None, "the child was supposed to survive the no-op kill"
+        assert not audit.stdout.closed and not audit.stderr.closed, (
+            "the pipes were closed while a reader thread was still blocked on "
+            "them; that is the unbounded wait, reached through the cleanup"
+        )
+        # The bound still has to hold: leaking is only the better trade if the
+        # caller returned.
+        assert elapsed < 15, f"the reap outlived its own bound: {elapsed:.1f}s"
+    finally:
         for proc in created:
             with contextlib.suppress(OSError, ValueError):
                 proc.kill()
