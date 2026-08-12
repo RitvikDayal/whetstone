@@ -272,6 +272,14 @@ def write_report(path: Path, html: str, *, project_root: Path) -> Path:
         # is the user asking for a file by name. What is enforced here is
         # containment plus everything guarded_write establishes through the
         # descriptor.
+        #
+        # CONSEQUENCE, recorded so nobody later reads it as an oversight: this
+        # is `guarded_write`'s only production caller, so the `never_touch` half
+        # of the barrier ships with no production coverage. That is deliberate.
+        # The first caller that passes real boundaries is M1b's implementer,
+        # which is the first thing that edits a repository rather than writing a
+        # report the user asked for by name. The unit tests in
+        # `tests/unit/test_scope.py` cover the never_touch half directly.
         with guarded_write(path, BoundariesConfig(), project_root=project_root) as fh:
             fh.write(html)
     except WriteForbiddenError as exc:

@@ -13,6 +13,8 @@ from whetstone.scope.resolver import (
     resolve_files,
 )
 
+posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX open semantics")
+
 
 def _git(repo: Path, *args: str) -> None:
     # utf-8, not the locale codec: these fixtures commit non-ASCII filenames and
@@ -714,14 +716,6 @@ def test_a_refused_write_does_not_truncate_the_file_it_refused(tmp_path):
     assert protected.read_text(encoding="utf-8") == "real workflow"
 
 
-def test_guarded_write_refuses_a_directory(tmp_path):
-    (tmp_path / "adir").mkdir()
-    with pytest.raises(WriteForbiddenError), guarded_write(
-        Path("adir"), _WORKFLOW_BARRIER, project_root=tmp_path
-    ) as fh:
-        fh.write("x")
-
-
 def test_guarded_write_refuses_a_character_device(tmp_path):
     """`--out NUL` on Windows writes successfully, discards every byte, and
     leaves nothing on disk. A descriptor knows it is not a regular file."""
@@ -740,14 +734,126 @@ def test_guarded_write_refuses_a_character_device(tmp_path):
         fh.write("x")
 
 
-def test_a_write_that_raises_still_closes_the_descriptor(tmp_path):
-    """A leaked descriptor on Windows keeps the file locked, so the next run
-    fails on a file the previous run only failed to close."""
+def test_guarded_write_refuses_a_directory(tmp_path):
+    """Refused on both platforms, by DIFFERENT layers -- stated because the
+    earlier version of this test named `S_ISREG` and never reached it.
+
+    On Windows `os.open` on a directory fails first with EACCES, so the refusal
+    is an OSError and the `S_ISREG` branch never fires. On POSIX the open
+    succeeds and `S_ISREG` is what refuses. Asserting the union is honest;
+    asserting `WriteForbiddenError` would have been a claim about a code path
+    this platform does not execute.
+    """
+    (tmp_path / "adir").mkdir()
+    with pytest.raises((WriteForbiddenError, OSError)), guarded_write(
+        Path("adir"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("x")
+
+
+@posix_only
+def test_a_directory_is_refused_by_the_regular_file_check_on_posix(tmp_path):
+    """The half of the test above that Windows cannot reach."""
+    (tmp_path / "adir").mkdir()
+    with pytest.raises(WriteForbiddenError, match="regular file"), guarded_write(
+        Path("adir"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("x")
+
+
+def test_a_created_file_is_removed_when_the_body_raises(tmp_path):
+    """`Path.write_text` was one call and could not leave a partial file. Handing
+    the caller a descriptor makes that newly possible, so a file this call
+    created is removed when the body does not complete."""
     with pytest.raises(RuntimeError), guarded_write(
         Path("notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path
-    ):
+    ) as fh:
+        fh.write("partial")
         raise RuntimeError("boom")
-    (tmp_path / "notes.md").unlink()
+    assert not (tmp_path / "notes.md").exists(), "a partial file was left behind"
+
+
+def test_an_existing_file_is_left_truncated_when_the_body_raises(tmp_path):
+    """The honest other half. A file that already existed was truncated at step
+    6 by design and its previous contents cannot be brought back -- `write_text`
+    had exactly the same property, so nothing is lost that was ever guaranteed.
+    It is NOT deleted, because it is not ours to delete.
+
+    The `unlink` at the end is the proof the descriptor was closed: on Windows an
+    open handle makes it fail with a sharing violation.
+    """
+    target = tmp_path / "notes.md"
+    target.write_text("the previous body", encoding="utf-8")
+    with pytest.raises(RuntimeError), guarded_write(
+        Path("notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("partial")
+        raise RuntimeError("boom")
+    assert target.exists()
+    target.unlink()
+
+
+def test_a_failure_between_the_open_and_the_handle_removes_the_created_file(
+    tmp_path, monkeypatch
+):
+    """ENOSPC on the truncate, or anything else after the open. Cleanup used to
+    be wired only into the barrier's refusal path, so this left the file."""
+    real_truncate = os.truncate
+
+    def _boom(fd, length):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "truncate", _boom)
+    with pytest.raises(OSError), guarded_write(
+        Path("notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("x")
+    monkeypatch.setattr(os, "truncate", real_truncate)
+    assert not (tmp_path / "notes.md").exists()
+
+
+def test_the_descriptor_is_closed_exactly_once(tmp_path, monkeypatch):
+    """Two `os.close` calls on one number are harmless single-threaded and a
+    live hazard once M1a's provider makes threads plausible: the second can land
+    on a descriptor another thread has since been handed."""
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    protected = tmp_path / ".github" / "workflows" / "deploy.yml"
+    protected.write_text("real workflow", encoding="utf-8")
+    try:
+        os.link(protected, tmp_path / "notes.md")
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - platform
+        pytest.skip(f"cannot create a hardlink here: {exc}")
+
+    closed: list[int] = []
+    real_close = os.close
+
+    def _record(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    # The hardlink refusal, not a never_touch one: the never_touch pre-check
+    # fires BEFORE any open, so no descriptor would exist to close and this test
+    # would pass by measuring nothing.
+    monkeypatch.setattr(os, "close", _record)
+    with pytest.raises(WriteForbiddenError), guarded_write(
+        Path("notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("pwned")
+    assert closed, "no descriptor was closed at all; the test is measuring nothing"
+    assert len(closed) == len(set(closed)), f"a descriptor was closed twice: {closed}"
+
+
+def test_an_unrelated_os_error_is_not_reported_as_a_barrier_refusal(tmp_path):
+    """ENOENT from a missing parent directory is not the barrier saying no.
+    Wrapping every OSError as WriteForbiddenError with `from None` made ENOSPC,
+    EACCES and ENAMETOOLONG all read as "you are not allowed" and discarded the
+    errno that said otherwise."""
+    with pytest.raises(OSError) as caught, guarded_write(
+        Path("no-such-dir/notes.md"), _WORKFLOW_BARRIER, project_root=tmp_path
+    ) as fh:
+        fh.write("x")
+    assert not isinstance(caught.value, WriteForbiddenError)
+    assert caught.value.errno is not None
 
 
 def test_the_barrier_scan_is_not_vacuous(tmp_path):

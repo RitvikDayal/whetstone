@@ -16,6 +16,7 @@ frames differ for any monorepo and the conversion is not optional.
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import re
 import stat
@@ -291,6 +292,11 @@ def _open_for_write(target: Path) -> tuple[int, bool]:
     NOT `O_TRUNC`: truncation happens through the descriptor after verification.
     Truncating at open time destroys the contents of a protected file before the
     barrier has said a word about it.
+
+    Only a refusal BY THE BARRIER becomes `WriteForbiddenError`. Every other
+    `OSError` propagates unchanged. Wrapping them all made ENOSPC, EACCES and
+    ENAMETOOLONG read as "the barrier refused you" and threw the errno away with
+    `from None`, which is a worse diagnosis than the bare error.
     """
     base = os.O_RDWR | _O_NOFOLLOW | _O_BINARY
     try:
@@ -298,24 +304,34 @@ def _open_for_write(target: Path) -> tuple[int, bool]:
     except FileExistsError:
         pass
     except OSError as exc:
-        raise WriteForbiddenError(_open_failure(target, exc)) from None
+        _reraise_open_failure(target, exc)
     try:
         return os.open(target, base), False
     except OSError as exc:
-        raise WriteForbiddenError(_open_failure(target, exc)) from None
+        _reraise_open_failure(target, exc)
 
 
-def _open_failure(target: Path, exc: OSError) -> str:
-    # ELOOP is what O_NOFOLLOW reports for a symlink at the final component on
-    # POSIX. There is no Windows equivalent, which is why the verification below
-    # does not rely on this branch having fired.
-    if _O_NOFOLLOW and exc.errno in (getattr(os, "ELOOP", None), 40, 62):
-        return (
+# What `O_NOFOLLOW` reports when the final component is a symlink. Linux says
+# ELOOP; the BSDs, including macOS, say EMLINK. Both by NAME from `errno` -- the
+# previous spelling was `getattr(os, "ELOOP", None)`, and `ELOOP` does not live
+# on `os`, so it was always `None` and every `OSError` carrying `errno=None` was
+# misreported as "is a symlink".
+#
+# POSIX-only and unverified from this Windows host, which is exactly why it is
+# named constants rather than the raw numbers that sat here before: a wrong
+# number fails silently, a wrong name fails at import.
+_SYMLINK_REFUSED = frozenset({errno.ELOOP, errno.EMLINK})
+
+
+def _reraise_open_failure(target: Path, exc: OSError) -> None:
+    """Raise the barrier's error for a symlink refusal; re-raise anything else."""
+    if _O_NOFOLLOW and exc.errno in _SYMLINK_REFUSED:
+        raise WriteForbiddenError(
             f"{target} is a symlink. Whetstone does not write through one: the "
             "link decides where the bytes land, on the repository's behalf "
             "rather than the caller's."
-        )
-    return f"{target} could not be opened for writing: {exc}"
+        ) from None
+    raise exc
 
 
 @contextlib.contextmanager
@@ -391,82 +407,100 @@ def guarded_write(
     target = root / path
     fd, created = _open_for_write(target)
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            _refuse(
-                fd,
-                created,
-                target,
-                st,
-                f"{target} is not a regular file. Writing to a directory or a "
-                "device either fails or succeeds while discarding every byte, "
-                "and the second one reads as a successful write.",
-            )
-        if st.st_nlink > 1:
-            _refuse(
-                fd,
-                created,
-                target,
-                st,
-                f"{target} has more than one name on this filesystem (it is a "
-                "hardlink). The other name may be a protected path, and no "
-                "path check can see it -- both names are equally canonical and "
-                "there is no link to follow.",
-            )
-        if is_write_forbidden(path, boundaries, project_root=project_root):
-            _refuse(
-                fd,
-                created,
-                target,
-                st,
-                f"writing {path} became forbidden between the check and the "
-                "open: it now resolves inside never_touch or outside the "
-                "project root. A redirection was planted in that window.",
-            )
-        try:
-            landed = os.stat(target)
-        except OSError as exc:
-            _refuse(
-                fd,
-                created,
-                target,
-                st,
-                f"{target} could not be re-examined after opening it ({exc}), "
-                "so it cannot be shown to be the file that was verified.",
-            )
-        if _identity(landed) != _identity(st):
-            _refuse(
-                fd,
-                created,
-                target,
-                st,
-                f"{target} no longer names the file that was opened and "
-                "verified. Refusing rather than writing to whichever of the "
-                "two it is.",
-            )
+        _verify(fd, target, path, boundaries, project_root)
         os.truncate(fd, 0)
         handle = os.fdopen(fd, "w", encoding=encoding)
     except BaseException:
-        with contextlib.suppress(OSError):
-            os.close(fd)
+        # ONE cleanup point, for everything that can go wrong before the handle
+        # exists. `_verify` used to close the fd itself and then this block
+        # closed it again -- `os.close` twice on the same number, harmless
+        # single-threaded but a live hazard once M1a's provider makes threads
+        # plausible, because the second close can land on a descriptor another
+        # thread has since been given. It also only ran on a barrier refusal, so
+        # an ENOSPC on `os.truncate` or a failure inside `fdopen` left a file
+        # this call had created sitting on disk.
+        _discard(fd, created, target)
         raise
-    with handle:
-        yield handle
+    try:
+        with handle:
+            yield handle
+    except BaseException:
+        # The caller's body raised after being handed the descriptor. If this
+        # call created the file, remove it -- `Path.write_text` was one call and
+        # could not leave a partial file behind, and this must not be a
+        # regression on that.
+        #
+        # A file that ALREADY EXISTED is left as it is, truncated and partial.
+        # Its previous contents went at step 6 by design and cannot be brought
+        # back; `write_text` had the same property, so nothing is lost that was
+        # ever guaranteed.
+        if created:
+            with contextlib.suppress(OSError):
+                os.unlink(target)
+        raise
 
 
-def _refuse(
-    fd: int, created: bool, target: Path, st: os.stat_result, message: str
+def _verify(
+    fd: int,
+    target: Path,
+    path: Path,
+    boundaries: BoundariesConfig,
+    project_root: Path,
 ) -> None:
-    """Close *fd*, undo a creation this call made, and raise.
+    """Refuse unless the descriptor is one this write is allowed to have.
 
-    The cleanup is identity-gated: the file is removed only if *target* still
-    names the object we are holding. Without that, a redirection planted in this
-    window would turn the tidy-up into a deletion of whatever the name points at
-    now -- a worse outcome than the empty file it is cleaning up.
+    Raises and closes NOTHING -- the caller owns the descriptor and does all
+    cleanup in one place. See `guarded_write` for the argument behind each check.
     """
-    os.close(fd)
-    if created:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise WriteForbiddenError(
+            f"{target} is not a regular file. Writing to a directory or a "
+            "device either fails or succeeds while discarding every byte, and "
+            "the second one reads as a successful write."
+        )
+    if st.st_nlink > 1:
+        raise WriteForbiddenError(
+            f"{target} has more than one name on this filesystem (it is a "
+            "hardlink). The other name may be a protected path, and no path "
+            "check can see it -- both names are equally canonical and there is "
+            "no link to follow."
+        )
+    if is_write_forbidden(path, boundaries, project_root=project_root):
+        raise WriteForbiddenError(
+            f"writing {path} became forbidden between the check and the open: "
+            "it now resolves inside never_touch or outside the project root. A "
+            "redirection was planted in that window."
+        )
+    try:
+        landed = os.stat(target)
+    except OSError as exc:
+        raise WriteForbiddenError(
+            f"{target} could not be re-examined after opening it ({exc}), so it "
+            "cannot be shown to be the file that was verified."
+        ) from None
+    if _identity(landed) != _identity(st):
+        raise WriteForbiddenError(
+            f"{target} no longer names the file that was opened and verified. "
+            "Refusing rather than writing to whichever of the two it is."
+        )
+
+
+def _discard(fd: int, created: bool, target: Path) -> None:
+    """Close *fd* exactly once, and undo a creation this call made.
+
+    The removal is identity-gated against the descriptor's own `fstat`, taken
+    before the close. Without that, a redirection planted in this window would
+    turn the tidy-up into a deletion of whatever the name points at now -- a
+    worse outcome than the empty file it is cleaning up.
+    """
+    try:
+        st = os.fstat(fd)
+    except OSError:  # pragma: no cover - the fd was already unusable
+        st = None
+    with contextlib.suppress(OSError):
+        os.close(fd)
+    if created and st is not None:
         with contextlib.suppress(OSError):
             if _identity(os.stat(target)) == _identity(st):
                 os.unlink(target)
-    raise WriteForbiddenError(message)

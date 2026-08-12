@@ -193,10 +193,18 @@ def test_the_validation_error_names_the_lens_and_the_field():
     assert "severity" in message
 
 
-def test_every_first_party_candidate_construction_site_still_validates():
-    """The population guard: an assertion that no offending construction exists
-    holds trivially if nothing is constructed. Build one candidate per
-    first-party lens shape and assert the set is non-empty."""
+def test_well_formed_candidates_are_still_accepted():
+    """The counterweight to every refusal above.
+
+    Named for what it does. It used to be called
+    `test_every_first_party_candidate_construction_site_still_validates`, which
+    claimed to inspect the real construction sites in `detectors/`; it does not,
+    it hand-builds two candidates. The real coverage of those sites is in
+    `test_hygiene.py` and `test_deps_subprocess.py`, which run the detectors.
+    A test that passes for a reason other than the one its name gives is the
+    pattern this project has been bitten by repeatedly, so the name moved to
+    meet the test rather than the other way round.
+    """
     built = [
         _candidate(),
         Candidate(
