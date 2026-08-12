@@ -6,8 +6,14 @@ proposes fixes, or opens a pull request, within limits you configure per issue t
 
 It never merges and it never deploys.
 
-**Status:** early development. M0 ships the deterministic core and a zero-cost
-`hygiene` lens.
+**Status:** M0's deterministic core verified end-to-end on encode/httpcore on
+2026-08-12 -- `init` -> `doctor` -> `run` -> `findings` -> `report`, locally on
+Windows. The report's bytes were read and checked directly, not rendered in a
+browser: the shared DevTools profile used for that was locked by another
+session. Full transcript, and what remains before M0 can be called done (a
+browser render, and the Ubuntu/Windows x 3.11/3.12 CI matrix, neither run by
+this task), in
+`.superpowers/sdd/2026-08-10-whetstone-m0-plan/task-12-report.md`.
 
 ## Install
 
