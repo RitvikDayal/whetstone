@@ -1,0 +1,1 @@
+"""Static, shareable output."""
