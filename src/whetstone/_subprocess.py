@@ -33,6 +33,8 @@ import contextlib
 import os
 import signal
 import subprocess
+from dataclasses import dataclass
+from pathlib import Path
 
 # How long to wait for a killed process tree to release its pipes. Bounded, so
 # a kill that does not take cannot reintroduce the unbounded wait it exists to
@@ -157,3 +159,81 @@ def close_pipes(proc: subprocess.Popen) -> None:
         if stream is not None:
             with contextlib.suppress(OSError, ValueError):
                 stream.close()
+
+
+@dataclass(frozen=True)
+class ShellResult:
+    """What running one shell command actually did.
+
+    `doctor` only ever needed "did it exit 0", and `CheckResult` says exactly
+    that. The reproduce stage needs more: WHICH non-zero code, because pytest
+    distinguishes "a test failed" (1) from "nothing was collected" (5) from
+    "the run was broken" (2-4), and the OUTPUT, because absence has to be
+    earned by a marker rather than assumed from an exit code.
+
+    So the execution lives here and both callers take the view they need. One
+    execution path, two readings -- rather than a second Popen somewhere else
+    that drifts from this one's timeout and kill-tree handling.
+    """
+
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+
+    @property
+    def output(self) -> str:
+        """Both streams, for searching. Order is stdout then stderr because a
+        test runner writes its report to stdout and its crashes to stderr."""
+        return f"{self.stdout}\n{self.stderr}"
+
+
+def run_shell(
+    command: str, cwd: Path, timeout: int, env: dict[str, str] | None = None
+) -> ShellResult:
+    """Run *command* through the shell in *cwd*, bounded.
+
+    Extracted from `doctor.run_command`, which now calls it. Every caution in
+    that function's docstring applies here and was paid for there: `Popen`
+    without the `with` form, `kill_and_reap` on the way out of a timeout AND of
+    a KeyboardInterrupt, and `close_pipes` only once the reader threads are
+    known to be done.
+
+    *env* replaces the environment entirely when given; None inherits. The
+    reproduce stage uses it to stop the interpreter writing bytecode, because
+    a `.pyc` left in the target repository is a file Whetstone put there and
+    did not remove -- and the worktree sentinel is right to report it.
+    """
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        # A byte a declared command emits that is not valid UTF-8 -- a test
+        # runner echoing a non-ASCII fixture path -- must not crash the run.
+        # `replace` is enough: this text is displayed and searched, never
+        # stored as an identity, so there is no dedupe key a lost byte could
+        # corrupt.
+        errors="replace",
+        env=env,
+        **new_group(),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_and_reap(proc)
+        return ShellResult(returncode=-1, stdout="", stderr="", timed_out=True)
+    except BaseException:
+        # KeyboardInterrupt included: a Ctrl-C mid-command must not leave it,
+        # or anything it spawned, running with the pipes still open.
+        kill_and_reap(proc)
+        raise
+    close_pipes(proc)
+    return ShellResult(
+        returncode=proc.returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
+        timed_out=False,
+    )

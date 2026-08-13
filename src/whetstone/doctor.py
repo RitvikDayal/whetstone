@@ -44,11 +44,10 @@ so out loud before it runs anything.
 from __future__ import annotations
 
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from ._subprocess import close_pipes, kill_and_reap, new_group
+from ._subprocess import run_shell
 from .config.model import WhetstoneConfig
 from .errors import UnsafeStatePathError
 from .paths import assert_not_cloud_synced
@@ -109,52 +108,21 @@ def run_command(label: str, command: str, cwd: Path, timeout: int) -> CheckResul
     the measurement; `close_pipes` in the `finally` keeps the guarantee the
     context manager was there for.
     """
-    proc = subprocess.Popen(
-        command,
-        cwd=cwd,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        encoding="utf-8",
-        # A byte a declared command emits that is not valid UTF-8 -- a test
-        # runner echoing a non-ASCII fixture path, for instance -- must not
-        # crash doctor. `replace` is enough here: unlike deps.py's JSON, this
-        # text is only ever displayed, never parsed or stored, so there is no
-        # downstream identity or dedupe key that a lost byte could corrupt.
-        errors="replace",
-        **new_group(),
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # `kill_and_reap` kills the whole tree and then drains what's left
-        # of the pipes with its own bounded timeout, so this cannot
-        # reintroduce the unbounded wait it exists to avoid. It closes the
-        # pipes itself when that drain completes, and deliberately does not
-        # when it does not -- closing them then blocks on the reader thread.
-        kill_and_reap(proc)
+    result = run_shell(command, cwd, timeout)
+    if result.timed_out:
         return CheckResult(
             name=f"command: {label}",
             ok=False,
             detail=f"`{command}` timed out after {timeout}s.",
         )
-    except BaseException:
-        # KeyboardInterrupt included: a Ctrl-C mid-command must not leave
-        # it, or anything it spawned, running with the pipes still open.
-        kill_and_reap(proc)
-        raise
-    # `communicate()` returned, so the reader threads are done and the pipes are
-    # already closed. Stated rather than assumed.
-    close_pipes(proc)
-
-    if proc.returncode == 0:
+    if result.returncode == 0:
         return CheckResult(f"command: {label}", True, f"`{command}` exited 0.")
 
-    tail = (stderr or stdout or "").strip().splitlines()[-5:]
+    tail = (result.stderr or result.stdout or "").strip().splitlines()[-5:]
     return CheckResult(
         name=f"command: {label}",
         ok=False,
-        detail=f"`{command}` exited {proc.returncode}. " + " ".join(tail),
+        detail=f"`{command}` exited {result.returncode}. " + " ".join(tail),
     )
 
 
