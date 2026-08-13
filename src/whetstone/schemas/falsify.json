@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "falsify",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["confirmed", "strongest_counterargument", "reasoning"],
+  "properties": {
+    "confirmed": {
+      "type": "boolean",
+      "description": "Whether the defect survived the attempt to kill it."
+    },
+    "strongest_counterargument": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "REQUIRED EVEN WHEN CONFIRMED. A falsifier that agrees without stating the best case against the finding has not falsified anything, and 'I could not think of one' is an answer this field can carry -- an empty one is not."
+    },
+    "reasoning": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 3000,
+      "description": "How the counterargument was tested, and why it did or did not hold."
+    },
+    "remaining_uncertainty": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "What is still unknown. NO minItems, deliberately: a falsifier with nothing left to doubt is a real answer, and requiring an entry here would force invented content -- or produce nothing valid at all from a model that declines to invent.",
+      "items": {"type": "string", "minLength": 1, "maxLength": 500}
+    },
+    "severity_adjustment": {
+      "type": ["string", "null"],
+      "enum": ["critical", "high", "medium", "low", "info", null],
+      "description": "A revised severity, if the attempt to kill the finding changed what it is worth. Null means unchanged."
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "maxLength": 2000
+    }
+  }
+}
