@@ -21,6 +21,7 @@ because a skip means the check did not run and this one did.
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
 from string import Template
 from typing import Any, NamedTuple
 
@@ -55,8 +56,10 @@ class HuntResult(NamedTuple):
     where an empty result is indistinguishable from a declined one, which is
     the exact hole the schema's conditional `notes` was added to close.
 
-    A NamedTuple so it still unpacks positionally for anyone expecting a pair
-    to have grown, rather than failing at a call site far from here.
+    A NamedTuple for the named access, not for compatibility: it unpacks as
+    THREE values, so `candidates, skips = hunt(...)` raises `ValueError`. That
+    is the right failure -- loud, at the call site, naming the arity -- rather
+    than a pair that silently drops the notes.
     """
 
     candidates: tuple[dict[str, Any], ...]
@@ -74,6 +77,64 @@ def _angles(ctx: RunContext) -> tuple[str, ...]:
 def _max_findings(ctx: RunContext) -> int:
     value = ctx.options.get("max_findings_per_angle", _DEFAULT_MAX_FINDINGS)
     return value if isinstance(value, int) and value > 0 else _DEFAULT_MAX_FINDINGS
+
+
+def _split_subject(subject: str) -> tuple[str, int | None]:
+    """`app.py:12` -> `("app.py", 12)`; `app.py` -> `("app.py", None)`.
+
+    Only a trailing all-digit segment is treated as a line number. A Windows
+    path carries a colon after the drive letter, and a path may legitimately
+    contain one elsewhere, so splitting on the first colon would mangle both.
+    """
+    head, separator, tail = subject.rpartition(":")
+    if separator and tail.isdigit():
+        return head, int(tail)
+    return subject, None
+
+
+def _subject_problem(ctx: RunContext, subject: object) -> str | None:
+    """Why *subject* cannot be believed, or None.
+
+    A CLAIM WITH A PHYSICAL REFERENT, so it is recomputed from the world rather
+    than taken from the payload. The model controls this field completely; the
+    prompt telling it to use a path from the list is an instruction, not a
+    control. A fabricated or stale path otherwise reaches the user as a
+    finding's address -- and `read_nothing` shows that a stage which called no
+    tool at all can still produce one.
+    """
+    if not isinstance(subject, str) or not subject.strip():
+        return f"subject {subject!r} is not a path"
+
+    path_text, line = _split_subject(subject.strip())
+    candidate = PurePosixPath(path_text.replace("\\", "/"))
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return f"subject {subject!r} is not a path inside the project"
+
+    in_scope = {file.as_posix() for file in ctx.files}
+    if candidate.as_posix() not in in_scope:
+        return (
+            f"subject {subject!r} names a file that was not in scope for this "
+            f"run, so the finding cannot be placed"
+        )
+
+    target = ctx.project_root / candidate
+    try:
+        text = target.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError as exc:
+        return f"subject {subject!r} could not be read: {type(exc).__name__}"
+
+    if line is not None:
+        # splitlines(), not count("\n") + 1: a file ending in a newline has one
+        # fewer line than that arithmetic claims, so the last real line of every
+        # normally-terminated file would be off by one in the permissive
+        # direction -- the check would accept an address one past the end.
+        total = len(text.splitlines())
+        if line < 1 or line > total:
+            return (
+                f"subject {subject!r} points at line {line} of a {total}-line "
+                f"file, so the finding does not have the address it claims"
+            )
+    return None
 
 
 def _prompt_for(ctx: RunContext, angle: str) -> str:
@@ -127,8 +188,22 @@ def hunt(ctx: RunContext, provider: Provider) -> HuntResult:
                 f"discarded."
             )
             continue
-        if not result.ok or result.data is None:
-            skips.append(f"hunt [{angle}] did not run: {result.error}")
+        # Two conditions, two reasons. `StageResult` currently guarantees a
+        # failure carries an error and a success carries data, so neither
+        # fallback should fire -- and reading `result.error` into the message
+        # regardless would print "did not run: None" the day one of those
+        # guarantees moves. A reason that reaches the user has to be a reason.
+        if not result.ok:
+            skips.append(
+                f"hunt [{angle}] did not run: "
+                f"{result.error or 'the provider failed without saying why'}"
+            )
+            continue
+        if result.data is None:
+            skips.append(
+                f"hunt [{angle}] returned success with no payload, so there is "
+                f"nothing to read."
+            )
             continue
 
         findings = result.data.get("findings") or []
@@ -138,6 +213,10 @@ def hunt(ctx: RunContext, provider: Provider) -> HuntResult:
 
         # NOT retried, and not a skip. See the module docstring.
         for finding in findings:
+            problem = _subject_problem(ctx, finding.get("subject"))
+            if problem is not None:
+                skips.append(f"hunt [{angle}] discarded a finding: {problem}")
+                continue
             candidates.append(
                 {
                     **finding,

@@ -9,6 +9,7 @@ says the deterministic layer decides, and this is that layer.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -67,7 +68,14 @@ def _failed(error: str = "the CLI is not installed", **overrides) -> StageResult
 
 @pytest.fixture
 def ctx(tmp_path):
-    (tmp_path / "app.py").write_text("def add(values):\n    return values[0]\n", "utf-8")
+    # Long enough that the fixture finding's `app.py:12` is a real address.
+    # The first version of this file was two lines, and the subject check
+    # correctly rejected every finding in it -- the test data was making a
+    # claim about the world that the world did not support.
+    lines = ['"""A small module with a real defect."""', ""]
+    lines += [f"CONST_{n} = {n}" for n in range(1, 10)]
+    lines += ["", "def add(values):", "    return values[0]", ""]
+    (tmp_path / "app.py").write_text("\n".join(lines), encoding="utf-8")
     return RunContext(
         project_root=tmp_path,
         state_root=tmp_path / ".whetstone",
@@ -102,6 +110,53 @@ def test_one_stage_runs_per_angle(ctx):
 
     assert len(provider.requests) == 2
     assert len(result.candidates) == 1
+
+
+def test_the_angles_do_not_overlap(ctx):
+    """SEQUENTIAL, proven by blocking rather than by counting.
+
+    Counting `provider.requests` at the end cannot tell sequential from
+    concurrent -- both end with two. This holds the first stage open and
+    asserts the second has not started, which is the only shape a concurrent
+    implementation fails.
+
+    It matters because the budget is run-level: `--max-budget-usd` below about
+    $0.35 makes a stage a no-op, so the ceiling can only stop BETWEEN stages.
+    Firing angles concurrently commits their cost before it can react.
+    """
+    ctx.lens_options["options"]["angles"] = ["one", "two"]
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    entered: list[str] = []
+
+    class _BlockingProvider:
+        name = "blocking"
+
+        def __init__(self) -> None:
+            self.requests: list[StageRequest] = []
+
+        def run_stage(self, request: StageRequest) -> StageResult:
+            self.requests.append(request)
+            entered.append(request.prompt)
+            if len(entered) == 1:
+                first_entered.set()
+                assert release_first.wait(timeout=10), "the test released nothing"
+            return _ok({"findings": [], "notes": "nothing"})
+
+    provider = _BlockingProvider()
+    worker = threading.Thread(target=hunt, args=(ctx, provider), daemon=True)
+    worker.start()
+    try:
+        assert first_entered.wait(timeout=10), "the first stage never started"
+        # The first stage is still inside run_stage here.
+        assert len(entered) == 1, (
+            f"a second stage started while the first was still running: {len(entered)}"
+        )
+    finally:
+        release_first.set()
+        worker.join(timeout=10)
+
+    assert len(entered) == 2, "the second stage never ran"
 
 
 def test_every_candidate_records_which_angle_found_it(ctx):
@@ -259,3 +314,80 @@ def test_the_request_carries_the_hunt_schema_and_the_project_root(ctx):
         "a per-stage budget below about $0.35 makes the stage a guaranteed "
         "no-op; the ceiling is run-level"
     )
+
+
+# --- the subject is a claim about the world, so it is checked against it ---------
+
+
+def test_a_fabricated_subject_is_discarded_with_a_reason(ctx):
+    """The model controls `subject` completely, and the prompt telling it to
+    use a path from the list is an instruction rather than a control. A
+    fabricated path would otherwise reach the user as a finding's address --
+    and `read_nothing` shows a stage that called no tool at all can produce
+    one."""
+    finding = {**_FINDING, "subject": "does_not_exist.py:3"}
+    provider = _FakeProvider(_ok({"findings": [finding], "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert result.candidates == ()
+    assert len(result.skips) == 1
+    assert "does_not_exist.py" in result.skips[0]
+
+
+def test_a_subject_outside_the_scope_is_discarded(ctx):
+    """In the worktree but not in scope for this run: the finding cannot be
+    placed, and reporting it would claim the run covered something it did not."""
+    (ctx.project_root / "other.py").write_text("x = 1\n", encoding="utf-8")
+    finding = {**_FINDING, "subject": "other.py"}
+    provider = _FakeProvider(_ok({"findings": [finding], "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert result.candidates == ()
+    assert "not in scope" in result.skips[0]
+
+
+def test_a_line_number_past_the_end_of_the_file_is_discarded(ctx):
+    """A finding addressed to line 900 of a file with far fewer does not have
+    the address it claims, whatever else is true of it."""
+    finding = {**_FINDING, "subject": "app.py:900"}
+    provider = _FakeProvider(_ok({"findings": [finding], "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert result.candidates == ()
+    assert "line 900" in result.skips[0]
+
+
+def test_a_path_escaping_the_project_is_discarded(ctx):
+    finding = {**_FINDING, "subject": "../../../etc/passwd"}
+    provider = _FakeProvider(_ok({"findings": [finding], "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert result.candidates == ()
+    assert "inside the project" in result.skips[0]
+
+
+@pytest.mark.parametrize("subject", ["app.py", "app.py:1", "app.py:2"])
+def test_a_real_subject_survives(subject, ctx):
+    """The check must not be so strict that a correct finding cannot pass it."""
+    finding = {**_FINDING, "subject": subject}
+    provider = _FakeProvider(_ok({"findings": [finding], "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert len(result.candidates) == 1, result.skips
+    assert result.skips == ()
+
+
+def test_one_bad_subject_does_not_discard_the_good_ones(ctx):
+    provider = _FakeProvider(
+        _ok(
+            {
+                "findings": [{**_FINDING, "subject": "ghost.py"}, _FINDING],
+                "notes": None,
+            }
+        )
+    )
+    result = hunt(ctx, provider)
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0]["subject"] == "app.py:12"
+    assert len(result.skips) == 1
