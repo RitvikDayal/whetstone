@@ -93,8 +93,12 @@ _GIT_HARDENING = [
     "-c", "core.quotepath=false",
 ]
 
-# The parts of `.git/` that decide whether the repository is also a program.
-_GIT_EXECUTION_SURFACE = ("config", "hooks")
+# The parts of a git directory that decide whether the repository is also a
+# program. `config.worktree` is here because with `extensions.worktreeConfig`
+# set it can carry `core.hooksPath` or an alias, and it lives in the PER-
+# WORKTREE directory rather than the common one -- which `git status` never
+# lists either.
+_GIT_EXECUTION_SURFACE = ("config", "config.worktree", "hooks")
 
 # Content hashing is bounded in git mode as well as in walk mode. A checkout
 # with a large untracked build tree that `.gitignore` does not cover would
@@ -235,8 +239,12 @@ def _status_records(raw: str) -> list[tuple[str, str]]:
     return out
 
 
-def _surface_of(git_dir: Path) -> list[str]:
-    """Config and hooks under a resolved git directory, hashed."""
+def _surface_of(git_dir: Path, label: str = ".git") -> list[str]:
+    """Config and hooks under a resolved git directory, hashed.
+
+    *label* distinguishes the common directory from a linked worktree's own,
+    so two entries for the same filename are two lines rather than a collision.
+    """
     entries: list[str] = []
     for name in _GIT_EXECUTION_SURFACE:
         target = git_dir / name
@@ -244,13 +252,13 @@ def _surface_of(git_dir: Path) -> list[str]:
             for child in sorted(target.rglob("*")):
                 if child.is_file():
                     rel = child.relative_to(git_dir).as_posix()
-                    entries.append(f".git/{rel} {_digest(child)}")
+                    entries.append(f"{label}/{rel} {_digest(child)}")
         elif target.exists():
-            entries.append(f".git/{name} {_digest(target)}")
+            entries.append(f"{label}/{name} {_digest(target)}")
     return entries
 
 
-def _git_surface(root: Path, common_dir: str) -> list[str]:
+def _git_surface(root: Path, common_dir: str, git_dir: str) -> list[str]:
     """The parts of the git directory that decide whether the repository is
     also a program.
 
@@ -265,10 +273,22 @@ def _git_surface(root: Path, common_dir: str) -> list[str]:
     the layout Whetstone will use once it starts working in worktrees.
     """
     entries: list[str] = []
-    resolved = Path(common_dir)
-    if not resolved.is_absolute():
-        resolved = root / resolved
-    entries.extend(_surface_of(resolved))
+
+    def _resolve(value: str) -> Path:
+        path = Path(value)
+        return path if path.is_absolute() else root / path
+
+    common = _resolve(common_dir)
+    entries.extend(_surface_of(common))
+
+    # The PER-WORKTREE directory too. In a linked worktree `--git-dir` points at
+    # `.git/worktrees/<name>/`, and with `extensions.worktreeConfig` set its
+    # `config.worktree` can set `core.hooksPath` or an alias -- so it is part of
+    # the execution surface, and `git status` never lists a path under a git
+    # directory either.
+    own = _resolve(git_dir)
+    if own.resolve() != common.resolve():
+        entries.extend(_surface_of(own, label="git-dir"))
     refs, why = _git(root, ["for-each-ref", "--format=%(refname) %(objectname)"])
     if refs is None:
         entries.append(f"refs unreadable ({why})")
@@ -372,9 +392,11 @@ def fingerprint(root: Path) -> str:
     # One `rev-parse` for both directories rather than two, plus a second for
     # HEAD. This runs twice per stage, so every spawn is paid ten times over a
     # four-stage lens.
-    dirs, dirs_why = _git(root, ["rev-parse", "--show-toplevel", "--git-common-dir"])
+    dirs, dirs_why = _git(
+        root, ["rev-parse", "--show-toplevel", "--git-common-dir", "--git-dir"]
+    )
     parts = [line.strip() for line in dirs.splitlines() if line.strip()] if dirs else []
-    if len(parts) != 2:
+    if len(parts) != 3:
         # FAIL CLOSED. Status paths are relative to the REPOSITORY ROOT, never
         # to cwd, so without the toplevel there is no way to resolve them --
         # and falling back to `base = root` was silently catastrophic when
@@ -386,11 +408,11 @@ def fingerprint(root: Path) -> str:
         # That is a fail-open inside the one check whose entire job is to not
         # fail open. Degrading to the walk still watches the directory, and the
         # mode line carries the reason.
-        reason = dirs_why or f"rev-parse returned {len(parts)} of 2 paths"
+        reason = dirs_why or f"rev-parse returned {len(parts)} of 3 paths"
         return "\n".join(
             [f"mode git-unavailable (git directories unresolved: {reason})", *_walk(root)]
         )
-    toplevel, common_dir = parts
+    toplevel, common_dir, git_dir = parts
     base = Path(toplevel)
 
     # NOT `unborn` when this fails. A non-zero exit covers an unborn branch, a
@@ -457,7 +479,7 @@ def fingerprint(root: Path) -> str:
     # `lines` is NOT re-sorted here. It is already in path order, and sorting
     # the formatted strings would order them by their leading status letters
     # instead -- silently undoing the path ordering the hash budget depends on.
-    return "\n".join([*header, *lines, *_git_surface(root, common_dir)])
+    return "\n".join([*header, *lines, *_git_surface(root, common_dir, git_dir)])
 
 
 def assert_unchanged(root: Path, before: str) -> str | None:

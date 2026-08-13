@@ -620,6 +620,42 @@ def test_a_linked_worktree_is_covered_at_all(tmp_path):
 
 
 @needs_git
+def test_a_linked_worktrees_OWN_config_is_covered_too(tmp_path):
+    """`--git-common-dir` covers the shared `config` and `hooks`. The PER-
+    WORKTREE directory is a second one: in a linked worktree `--git-dir` points
+    at `.git/worktrees/<name>/`, and with `extensions.worktreeConfig` set its
+    `config.worktree` can carry `core.hooksPath` or an alias.
+
+    `git status` never lists a path under a git directory, so a write there was
+    reported as a clean worktree.
+    """
+    main = tmp_path / "main"
+    main.mkdir()
+    _git(main, "init", "--quiet")
+    _git(main, "config", "user.email", "t@example.invalid")
+    _git(main, "config", "user.name", "T")
+    (main / "README.md").write_text("start\n", encoding="utf-8")
+    _git(main, "add", "README.md")
+    _git(main, "commit", "--quiet", "-m", "first", "--no-gpg-sign")
+
+    linked = tmp_path / "linked"
+    _git(main, "worktree", "add", "--quiet", str(linked), "-b", "side")
+    _git(linked, "config", "extensions.worktreeConfig", "true")
+
+    before = fingerprint(linked)
+    _git(linked, "config", "--worktree", "core.hooksPath", "planted-by-the-stage")
+
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=linked, capture_output=True, text=True, check=True,
+        env=sentinel_module._git_env(),
+    ).stdout
+    assert porcelain == "", "the premise: status reports nothing for this write"
+
+    assert assert_unchanged(linked, before) is not None
+
+
+@needs_git
 @pytest.mark.skipif(
     os.name == "nt",
     reason="Windows forbids '\"' in a filename, so this path cannot exist here",
