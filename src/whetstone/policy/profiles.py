@@ -2,6 +2,37 @@
 
 Behaviour lives in declarative units. A stage's powers are read off this table,
 not assembled in code, so an audit is a diff of this file.
+
+READ `available_tools` AS THE WHOLE LIST. It is not "these and the defaults";
+it is the complete set of tools that exist for that stage. `denied_tools` is
+kept alongside it and is deliberately redundant: a name that is not available
+cannot be called anyway, so the deny list only bites if a future CLI release
+changes what `--tools` means. It cost nothing and the last time this module
+trusted one flag's meaning it was wrong.
+
+NO M1a STAGE GETS A SHELL, and that is a decision rather than an oversight.
+
+An earlier version granted `Bash` to `reproduce` and `falsify` with an empty
+`bash_allowlist`, on the belief that an unapproved tool is a refused tool. That
+was measured wrong. Refusal was sampled with a prompt that asked the model to
+CREATE A FILE, so every attempt was mutating, and mutating commands really are
+refused and really are recorded. A reviewer ran the same profile asking for
+read-only commands and got `echo`, `ls`, `cat README.md`, `find`, `git log` and
+`git config --get user.email` to EXECUTE -- six commands, `permission_denials:
+[]`, and the stage reported a clean success.
+
+The CLI carries its own read-only-command classifier that auto-approves
+independently of `--allowedTools` and records nothing when it does. So an empty
+`bash_allowlist` bounds nothing; the real bound is an undocumented heuristic
+inside somebody else's binary. `cat .env` is the sharp end, and reads are not
+confined to the worktree either.
+
+`bash_allowlist` stays on `PermissionSet` because it is still the right shape --
+but its consumer is the CONTROLLER, not the model. M1a's invariant 2 already
+says the deterministic layer holds authority and a model's self-assessment is
+recomputed from the world; a stage running its own repro command was always in
+tension with that. Task 7 executes the command itself and hands the stage the
+result.
 """
 
 from __future__ import annotations
@@ -19,28 +50,33 @@ _READ_DENIED = (
 
 _NO_WRITES = frozenset({"Edit", "Write", "NotebookEdit"})
 
+# Read-only inspection, and the whole of it. Auto-approved because a prompt in
+# `-p` mode has nobody to answer it and becomes a silent refusal.
+_INSPECT = frozenset({"Read", "Grep", "Glob"})
+
+# Never grantable in M1a. `Bash` for the reason in the module docstring; `Agent`
+# and `TaskCreate` because a subagent is an unbounded tool set reachable from a
+# bounded one -- a reviewer spawned one from a profile that granted neither, and
+# when its `Write` was refused it fell back to `Bash` and wrote the file anyway.
+FORBIDDEN_IN_M1A = frozenset({"Bash", "Agent", "TaskCreate"})
+
+_READ_ONLY = PermissionSet(
+    available_tools=_INSPECT,
+    auto_approve=_INSPECT,
+    denied_tools=_NO_WRITES,
+    bash_allowlist=frozenset(),
+    read_denied=_READ_DENIED,
+    write_root=None,
+)
+
+# All three stages hold the same powers and differ only in their prompt. That is
+# the honest shape of M1a: the separation between hunt, reproduce and falsify is
+# what each is ASKED, plus the process boundary between them, not what each may
+# touch.
 PROFILES: dict[str, PermissionSet] = {
-    "hunt": PermissionSet(
-        allowed_tools=frozenset({"Read", "Grep", "Glob"}),
-        denied_tools=_NO_WRITES,
-        bash_allowlist=frozenset(),
-        read_denied=_READ_DENIED,
-        write_root=None,
-    ),
-    "reproduce": PermissionSet(
-        allowed_tools=frozenset({"Read", "Grep", "Glob", "Bash"}),
-        denied_tools=_NO_WRITES,
-        bash_allowlist=frozenset(),
-        read_denied=_READ_DENIED,
-        write_root=None,
-    ),
-    "falsify": PermissionSet(
-        allowed_tools=frozenset({"Read", "Grep", "Glob", "Bash"}),
-        denied_tools=_NO_WRITES,
-        bash_allowlist=frozenset(),
-        read_denied=_READ_DENIED,
-        write_root=None,
-    ),
+    "hunt": _READ_ONLY,
+    "reproduce": _READ_ONLY,
+    "falsify": _READ_ONLY,
 }
 
 
