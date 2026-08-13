@@ -8,11 +8,20 @@ the payload is exactly such an assessment. The exit code overwrites it. Seven
 runs on the predecessor project recorded a verdict about a defect none of them
 could execute against.
 
-WHAT IS EXECUTED, AND WHAT IS NOT. Only `kind: "pytest"`, and only through the
-target's own declared test command. `script` and `command` are refused. The
-user already lets Whetstone run their test suite -- `doctor` does it -- so this
-adds a file to something they already trust, rather than making Whetstone a way
-to run arbitrary text a model produced.
+WHAT IS EXECUTED, AND WHERE. Only `kind: "pytest"`, only through the target's
+own declared test command, and only INSIDE A CONTAINER.
+
+The container is not belt and braces. `kind: "pytest"` bounds what invokes the
+artifact and nothing whatever about what the artifact can do -- a pytest file
+is an arbitrary Python program. The first version of this module leaned on that
+distinction and was wrong about it. `sandbox.py` supplies the boundary the
+policy gate cannot: no network, one mount, dropped capabilities.
+
+NO SANDBOX, NO EXECUTION. An unconfigured image, a missing Docker, or a daemon
+that will not answer all produce the same outcome -- the artifact is not run,
+the reason reaches the user, and the finding caps at grade B under invariant 3.
+That is checked BEFORE the artifact is written, so a refusal leaves nothing
+behind.
 
 THE EXIT-CODE CONVENTION IS THE OPPOSITE OF A REGRESSION TEST. The artifact
 PASSES while the defect is present, because it asserts the broken behaviour. So
@@ -37,30 +46,26 @@ that was supposed to check the defect went unchecked. `--junit-xml` is written
 by pytest rather than by the model, so the failure it attributes is one the
 controller owns.
 
-WHAT THIS MODULE STILL DOES NOT BOUND, and it is the important gap: the
-artifact is arbitrary Python. `kind: "pytest"` restricts what INVOKES it, not
-what it can do -- a pytest file can write outside the worktree, reach into
-`.git`, or spawn any process at all, including the version-control operations
-this repository forbids itself from ever performing. The permission profile
-bounds the provider stage and not this, and the sentinel reports mutations only
-after the fact and only inside `project_root`. Closing it needs an OS-enforced
-boundary, which is not M1a's. See the M1a plan's execution decision.
+WHAT REMAINS UNBOUNDED, stated so nobody reads the container as total: the
+artifact still reads and writes the worktree, which is the point of running it,
+so the sentinel is still the thing that reports what it touched there. A
+container is not a boundary against a kernel exploit. And the image belongs to
+the user -- Whetstone knows it is the one they named and nothing else about it.
 """
 
 from __future__ import annotations
 
 import contextlib
-import os
 import uuid
 from pathlib import Path
 from string import Template
 from typing import Any
 from xml.etree import ElementTree
 
-from ..._subprocess import run_shell
 from ...policy.profiles import profile_for
 from ...provider import sentinel
 from ...provider.base import Provider, StageRequest
+from ...sandbox import availability, run_sandboxed
 from ...schemas import load_schema
 from ..base import RunContext
 from .prompts import load_prompt
@@ -187,6 +192,7 @@ def reproduce(
     ctx: RunContext,
     provider: Provider,
     test_command: str,
+    sandbox_image: str | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Ask for a reproduction, then run it and believe the run.
 
@@ -255,29 +261,41 @@ def reproduce(
 
     outcome["has_runnable_artifact"] = True
 
+    # CHECKED BEFORE ANYTHING IS WRITTEN. No sandbox means the artifact is not
+    # run at all -- not run unsandboxed, and not written and then abandoned.
+    # `kind: "pytest"` bounds what invokes the artifact and nothing about what
+    # it can do, so the container is the only thing standing between a model's
+    # output and the user's machine.
+    blocked = availability(sandbox_image)
+    if blocked is not None:
+        outcome["verdict"] = "not executed"
+        skips.append(f"the reproduction was not run: {blocked.reason}")
+        return outcome, skips
+
     # A name nothing else will collide with, at the project root so the
     # project's own test command finds it and its imports resolve the way the
     # project's do.
     stem = f"whetstone_repro_{uuid.uuid4().hex[:12]}"
     path = ctx.project_root / f"test_{stem}.py"
-    # The report goes OUTSIDE the worktree: it is Whetstone's bookkeeping, not
-    # the project's, and writing it inside would be a file we put in the user's
-    # repository for the sentinel to find.
-    report = ctx.state_root / f"{stem}.xml"
-    report.parent.mkdir(parents=True, exist_ok=True)
+    # Inside the worktree, because that is the container's only writable
+    # location -- and removed again below, so it is not a file left in the
+    # user's repository.
+    report = ctx.project_root / f"{stem}.xml"
     before = sentinel.fingerprint(ctx.project_root)
     try:
         path.write_text(content, encoding="utf-8")
-        shell = run_shell(
-            f'{test_command} "{path.name}" --junit-xml="{report}"',
-            ctx.project_root,
-            _TEST_TIMEOUT_SECONDS,
-            # No bytecode. Without this, running the artifact leaves a `.pyc`
-            # for it in `__pycache__` -- a file Whetstone put in the user's
-            # repository and did not remove, which the sentinel then reports as
-            # a mutation, correctly. Preventing the write beats cleaning up
-            # after it: there is nothing to miss.
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        # The report goes to the worktree under a name we control, because the
+        # container can only write there -- and is read and deleted from the
+        # host immediately afterwards. PYTHONDONTWRITEBYTECODE keeps the
+        # artifact from leaving a `.pyc` behind: a file Whetstone put in the
+        # user's repository and did not remove, which the sentinel then
+        # reports, correctly.
+        inner = (
+            f"PYTHONDONTWRITEBYTECODE=1 {test_command} "
+            f'"{path.name}" --junit-xml="{report.name}"'
+        )
+        shell = run_sandboxed(
+            inner, ctx.project_root, sandbox_image or "", _TEST_TIMEOUT_SECONDS
         )
     finally:
         # `missing_ok` rather than a guard: a reproduction that deleted its own
