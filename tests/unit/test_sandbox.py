@@ -216,13 +216,33 @@ def test_a_write_ABOVE_the_worktree_cannot_reach_the_host(tmp_path):
     outside = tmp_path.parent / "escaped.txt"
     assert not outside.exists(), "the premise: nothing there before the run"
 
+    # The probe reports BOTH outcomes rather than assuming one.
+    #
+    # The first version asserted the write succeeded inside the container and
+    # merely failed to reach the host. On CI it was refused outright --
+    # `PermissionError` -- because `--user` runs the container as the invoking
+    # uid, which cannot write to the container's own root either. That is the
+    # boundary holding harder than the test expected, and a test that demands
+    # one particular way of satisfying a property fails when the property gets
+    # stronger. What matters is only that the host is untouched.
     (tmp_path / "escape.py").write_text(
-        "open('../escaped.txt', 'w').write('x')\nprint('WROTE-ABOVE')\n",
+        "print('CONTAINER-STARTED', flush=True)\n"
+        "try:\n"
+        "    open('../escaped.txt', 'w').write('x')\n"
+        "    print('WROTE-ABOVE-INSIDE')\n"
+        "except OSError as exc:\n"
+        "    print('REFUSED-INSIDE', type(exc).__name__)\n",
         encoding="utf-8",
     )
     result = sandbox.run_sandboxed("python escape.py", tmp_path, _IMAGE, timeout=180)
 
-    assert "WROTE-ABOVE" in result.output, f"the container never ran: {result.output}"
+    assert "CONTAINER-STARTED" in result.output, (
+        f"the container never ran, so nothing about the boundary was tested: "
+        f"{result.output}"
+    )
+    assert (
+        "WROTE-ABOVE-INSIDE" in result.output or "REFUSED-INSIDE" in result.output
+    ), f"the write was never attempted: {result.output}"
     assert not outside.exists(), "a write above the worktree reached the host"
 
 
@@ -299,3 +319,46 @@ def test_a_timed_out_container_is_removed(monkeypatch):
     name = calls[0][calls[0].index("--name") + 1]
     assert calls[1][:3] == ["docker", "rm", "-f"]
     assert calls[1][3] == name, "a different container was removed"
+
+
+def test_an_interrupted_run_still_removes_the_container(monkeypatch):
+    """A Ctrl-C re-raises out of `run_argv` after it kills the docker CLIENT,
+    which skipped the timeout branch entirely -- and killing the client does not
+    stop the container. It would keep running with write access to the worktree
+    after the controller had already exited.
+
+    The original interrupt must still reach the caller.
+    """
+    calls: list[list[str]] = []
+
+    def fake(argv, *_a, **_k):
+        calls.append(list(argv))
+        if argv[1] == "run":
+            raise KeyboardInterrupt
+        return sandbox.ShellResult(
+            returncode=0, stdout="", stderr="", timed_out=False
+        )
+
+    monkeypatch.setattr(sandbox, "run_argv", fake)
+
+    with pytest.raises(KeyboardInterrupt):
+        sandbox.run_sandboxed("sleep 999", Path("/tmp/w"), _IMAGE, timeout=60)
+
+    assert len(calls) == 2, calls
+    name = calls[0][calls[0].index("--name") + 1]
+    assert calls[1][:3] == ["docker", "rm", "-f"]
+    assert calls[1][3] == name
+
+
+def test_cleanup_failure_does_not_replace_the_interrupt(monkeypatch):
+    """`_remove` runs on the interrupt path, so an exception from it would
+    replace the interrupt the caller needs to see -- the same reason
+    `_subprocess.kill_tree` cannot raise."""
+
+    def fake(argv, *_a, **_k):
+        raise KeyboardInterrupt if argv[1] == "run" else OSError("docker is gone")
+
+    monkeypatch.setattr(sandbox, "run_argv", fake)
+
+    with pytest.raises(KeyboardInterrupt):
+        sandbox.run_sandboxed("sleep 999", Path("/tmp/w"), _IMAGE, timeout=60)

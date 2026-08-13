@@ -37,6 +37,7 @@ and nothing else about it.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import uuid
@@ -195,6 +196,17 @@ def docker_argv(
     return argv
 
 
+def _remove(name: str, cwd: Path) -> None:
+    """Force-remove a container. Cannot raise.
+
+    Called from an interrupt path, where an exception raised here would replace
+    the interrupt the caller needs to see -- the same reason
+    `_subprocess.kill_tree` cannot raise.
+    """
+    with contextlib.suppress(BaseException):
+        run_argv([_DOCKER, "rm", "-f", name], cwd, _STOP_TIMEOUT)
+
+
 def run_sandboxed(
     command: str,
     worktree: Path,
@@ -209,10 +221,20 @@ def run_sandboxed(
     """
     name = f"whetstone-repro-{uuid.uuid4().hex[:12]}"
     argv = docker_argv(command, worktree, image, name, env or {})
-    result = run_argv(argv, worktree, timeout)
+    try:
+        result = run_argv(argv, worktree, timeout)
+    except BaseException:
+        # BaseException, so a Ctrl-C is included. `run_argv` kills the docker
+        # CLIENT and re-raises, which skipped the timeout branch below entirely
+        # -- and killing the client does not stop the container. It would keep
+        # running with write access to the worktree after the controller had
+        # already exited. `_remove` cannot raise, so the original interrupt is
+        # what reaches the caller.
+        _remove(name, worktree)
+        raise
     if result.timed_out:
-        # Killing the docker CLIENT does not stop the container. It keeps
-        # running against the mount, so without this the sentinel races writes
-        # that arrive after the stage was declared timed out.
-        run_argv([_DOCKER, "rm", "-f", name], worktree, _STOP_TIMEOUT)
+        # Same reason on the ordinary timeout path: the client is dead and the
+        # container is not, so without this the sentinel races writes arriving
+        # after the stage was declared timed out.
+        _remove(name, worktree)
     return result
