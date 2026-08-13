@@ -17,16 +17,20 @@ running a real command; where it does not, the test is about a refusal.
 
 from __future__ import annotations
 
-import os
 import re
-import shutil
 import subprocess
-import sys
+import uuid
 from pathlib import Path
 
 import pytest
 
+from conftest import (
+    build_is_expected as _build_is_expected,
+)
+from conftest import docker_expected, docker_works, needs_docker
+from whetstone._subprocess import ShellResult
 from whetstone.lenses.base import RunContext
+from whetstone.lenses.code_defects import reproduce as reproduce_module
 from whetstone.lenses.code_defects.prompts import load_prompt
 from whetstone.lenses.code_defects.reproduce import (
     REPRO_MARKER,
@@ -144,7 +148,16 @@ _JUNIT = (
 
 def _report(tmp_path: Path, *cases: str | None) -> Path:
     """A junit report in pytest's own shape: the assertion message in the
-    `message` attribute, the traceback in the element text."""
+    `message` attribute, the traceback in the element text.
+
+    THE TRACEBACK CONTAINS THE MARKER, and that is the whole point of the
+    fixture. pytest's traceback quotes the failing test's own source, and the
+    artifact is model-written -- so a real run where the artifact merely PRINTS
+    or comments `WHETSTONE-REPRO` produces exactly this shape. A fixture whose
+    text never held the marker made the leak-proof test assert the absence of a
+    string nothing had written, and an implementation that concatenated the
+    text back in would have passed it unchanged.
+    """
     body = ""
     for index, message in enumerate(cases):
         if message is None:
@@ -152,8 +165,10 @@ def _report(tmp_path: Path, *cases: str | None) -> Path:
         else:
             body += (
                 f'<testcase name="t{index}"><failure message="{message}">'
-                f"a traceback quoting the artifact's own source, which is why "
-                f"the text is never searched</failure></testcase>"
+                f"def test_reproduces():\n"
+                f"    print('{REPRO_MARKER}: nothing to see here')\n"
+                f">   assert 1 == 2\n"
+                f"</failure></testcase>"
             )
     path = tmp_path / "r.xml"
     path.write_text(_JUNIT.format(n=len(cases), cases=body), encoding="utf-8")
@@ -181,10 +196,20 @@ def test_exit_one_without_the_marker_is_a_broken_test(tmp_path):
 
 
 def test_the_marker_in_the_TRACEBACK_does_not_buy_absence(tmp_path):
-    """THE ATTACK the output scan allowed. The traceback quotes the artifact's
-    own source, so it could print or comment the marker and fail an unrelated
-    assertion."""
-    bound = _bound_failure(_report(tmp_path, "AssertionError: unrelated"))
+    """THE ATTACK the output scan allowed, with a fixture that actually carries it.
+
+    The report's element text holds the marker -- see `_report` -- because that
+    is the shape a real run produces when the artifact prints it and then fails
+    an unrelated assertion. Only the `message` attribute is read, so the leak
+    has somewhere to come from and does not arrive.
+    """
+    report = _report(tmp_path, "AssertionError: unrelated")
+    assert REPRO_MARKER in report.read_text(encoding="utf-8"), (
+        "the fixture must contain the marker somewhere, or this test asserts "
+        "the absence of a string nothing ever wrote"
+    )
+
+    bound = _bound_failure(report)
     assert REPRO_MARKER not in (bound[1] or ""), "the traceback leaked in"
     assert _verdict_from(1, bound)[0] == "inconclusive"
 
@@ -327,21 +352,7 @@ def test_the_prompt_teaches_the_form_that_can_reach_absence():
 # --- the whole chain, which needs a container ------------------------------------
 
 
-def _docker_works() -> bool:
-    if shutil.which("docker") is None:
-        return False
-    try:
-        return (
-            subprocess.run(
-                ["docker", "info"], capture_output=True, timeout=30
-            ).returncode
-            == 0
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
-@pytest.mark.skipif(not _docker_works(), reason="docker is unavailable")
+@needs_docker
 def test_the_controller_runs_the_artifact_inside_a_container(ctx, tmp_path):
     """THE ONE THAT PROVES THE CHAIN: artifact written, container run, report
     parsed, verdict taken from the exit code, worktree left clean.
@@ -356,14 +367,23 @@ def test_the_controller_runs_the_artifact_inside_a_container(ctx, tmp_path):
         "FROM python:3.11-slim\nRUN pip install --no-cache-dir pytest\n",
         encoding="utf-8",
     )
-    tag = "whetstone-test-sandbox:latest"
+    # A unique tag: a shared runner can have two of these in flight, and a
+    # fixed one makes them clobber each other's image.
+    tag = f"whetstone-test-sandbox:{uuid.uuid4().hex[:12]}"
     built = subprocess.run(
         ["docker", "build", "-q", "-t", tag, str(context)],
         capture_output=True,
         timeout=900,
     )
     if built.returncode != 0:
-        pytest.skip(f"could not build the test image: {built.stderr[:200]!r}")
+        detail = built.stderr.decode("utf-8", "replace")[-300:]
+        # A FAILED BUILD IS NOT A SKIP where the build is expected to work.
+        # `docker_works()` only says the daemon answered, so a registry outage,
+        # a proxy or a rate limit would otherwise skip the only test that
+        # proves the chain -- and the Linux leg would still report success.
+        if _build_is_expected():
+            pytest.fail(f"the sandbox image failed to build on a Linux CI leg: {detail}")
+        pytest.skip(f"could not build the test image: {detail!r}")
 
     provider = _FakeProvider(
         _ok(_payload(artifact={"kind": "pytest", "content": _PASSES}))
@@ -376,16 +396,40 @@ def test_the_controller_runs_the_artifact_inside_a_container(ctx, tmp_path):
     assert list(ctx.project_root.rglob("*.xml")) == []
 
 
-@pytest.mark.skipif(
-    not (sys.platform.startswith("linux") and os.environ.get("CI")),
-    reason="Docker is only *expected* on the Linux CI legs",
-)
+@docker_expected
 def test_docker_is_available_where_it_is_expected():
     """Without Docker the chain test above disappears and the run still reports
     success. Gated on Linux CI rather than asserted everywhere, because Docker
     is genuinely optional on a laptop and the Windows runners default to
     Windows containers."""
-    assert _docker_works(), (
+    assert docker_works(), (
         "docker is unavailable on a Linux CI leg, so the reproduce chain is "
         "unverified"
     )
+
+
+def test_the_bytecode_setting_reaches_the_container_as_an_env_var(ctx, monkeypatch):
+    """Not as a `VAR=value` command prefix. A prefix binds to one simple
+    command, so a compound `test_command` -- `cd sub && python -m pytest` --
+    would apply it to `cd` alone and pytest would leave `__pycache__` in the
+    mounted worktree: a file Whetstone put in the user's repository and did not
+    remove, which the sentinel then reports as a mutation Whetstone caused."""
+    captured: dict = {}
+
+    def fake_run(command, worktree, image, timeout, env=None):
+        captured["command"] = command
+        captured["env"] = env
+        return ShellResult(
+            returncode=0, stdout="", stderr="", timed_out=False
+        )
+
+    monkeypatch.setattr(reproduce_module, "availability", lambda _image: None)
+    monkeypatch.setattr(reproduce_module, "run_sandboxed", fake_run)
+
+    provider = _FakeProvider(
+        _ok(_payload(artifact={"kind": "pytest", "content": _PASSES}))
+    )
+    reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND, "an-image")
+
+    assert captured["env"] == {"PYTHONDONTWRITEBYTECODE": "1"}
+    assert "PYTHONDONTWRITEBYTECODE" not in captured["command"]

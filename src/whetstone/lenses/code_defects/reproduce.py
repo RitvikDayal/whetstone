@@ -284,18 +284,22 @@ def reproduce(
     before = sentinel.fingerprint(ctx.project_root)
     try:
         path.write_text(content, encoding="utf-8")
-        # The report goes to the worktree under a name we control, because the
-        # container can only write there -- and is read and deleted from the
-        # host immediately afterwards. PYTHONDONTWRITEBYTECODE keeps the
-        # artifact from leaving a `.pyc` behind: a file Whetstone put in the
-        # user's repository and did not remove, which the sentinel then
-        # reports, correctly.
-        inner = (
-            f"PYTHONDONTWRITEBYTECODE=1 {test_command} "
-            f'"{path.name}" --junit-xml="{report.name}"'
-        )
+        # The report goes to the worktree because that is the container's only
+        # writable location, and is read and removed from the host immediately
+        # afterwards. No defensive quoting: the argv reaches docker without a
+        # host shell, so the container's own `sh -lc` is the only thing that
+        # parses this string.
+        inner = f"{test_command} {path.name} --junit-xml={report.name}"
         shell = run_sandboxed(
-            inner, ctx.project_root, sandbox_image or "", _TEST_TIMEOUT_SECONDS
+            inner,
+            ctx.project_root,
+            sandbox_image or "",
+            _TEST_TIMEOUT_SECONDS,
+            # Through docker's own `-e` rather than a command prefix: a prefix
+            # binds to one simple command, so a compound `test_command` would
+            # apply it to the first part only and pytest would leave bytecode
+            # in the mounted worktree.
+            env={"PYTHONDONTWRITEBYTECODE": "1"},
         )
     finally:
         # `missing_ok` rather than a guard: a reproduction that deleted its own

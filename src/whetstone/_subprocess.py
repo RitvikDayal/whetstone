@@ -33,6 +33,7 @@ import contextlib
 import os
 import signal
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -186,6 +187,46 @@ class ShellResult:
         """Both streams, for searching. Order is stdout then stderr because a
         test runner writes its report to stdout and its crashes to stderr."""
         return f"{self.stdout}\n{self.stderr}"
+
+
+def run_argv(
+    argv: Sequence[str], cwd: Path, timeout: int, env: dict[str, str] | None = None
+) -> ShellResult:
+    """Run *argv* with NO SHELL, bounded. The same handling as `run_shell`.
+
+    This exists because `run_shell` takes a string, and rebuilding an argv into
+    one is not a formatting detail -- it is a second parse. The sandbox flattened
+    `docker run ... sh -lc "<command>"` by wrapping only the parts containing a
+    space in quotes and escaping nothing, and the host shell then re-parsed every
+    quote the caller had put inside the command. It broke differently on the two
+    CI legs because they have different shells, which is the shape of every
+    quoting defect: correct on the machine it was written on.
+    """
+    proc = subprocess.Popen(
+        list(argv),
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        **new_group(),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_and_reap(proc)
+        return ShellResult(returncode=-1, stdout="", stderr="", timed_out=True)
+    except BaseException:
+        kill_and_reap(proc)
+        raise
+    close_pipes(proc)
+    return ShellResult(
+        returncode=proc.returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
+        timed_out=False,
+    )
 
 
 def run_shell(
