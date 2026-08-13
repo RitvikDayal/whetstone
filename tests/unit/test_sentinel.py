@@ -8,6 +8,7 @@ exactly what let the permission defect ship green.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -547,7 +548,7 @@ def test_a_head_that_could_not_be_READ_is_not_reported_as_unborn(repo, monkeypat
         "a HEAD that could not be read was recorded as a repository with no "
         "commits, which is a different fact about the world"
     )
-    assert "head unreadable" in printed
+    assert "head unresolved (" in printed
     assert "did not answer" in printed
 
 
@@ -574,7 +575,14 @@ def test_an_unborn_head_is_a_state_not_a_failure(tmp_path):
     printed = fingerprint(tmp_path)
     assert printed.startswith("mode git")
     assert "mode git-unavailable" not in printed
-    assert "head unborn" in printed
+    # NOT the bare word `unborn`. `rev-parse HEAD` exits non-zero for an unborn
+    # branch, a dangling HEAD, a corrupt .git/HEAD and a permission error alike
+    # -- measured, `--verify --quiet` returns 1 for both unborn and dangling --
+    # so the exit code proves none of them. The reason travels in the line, and
+    # two different failures carry different git stderr and so differ here.
+    head_line = next(line for line in printed.splitlines() if line.startswith("head "))
+    assert head_line.startswith("head unresolved ("), head_line
+    assert "git exited" in head_line, head_line
 
 
 # --- what CodeRabbit's review added -------------------------------------------
@@ -711,7 +719,7 @@ def test_the_hashed_set_is_capped_and_the_cap_is_recorded(repo, monkeypatch):
         (repo / f"f{index}.txt").write_text("x\n", encoding="utf-8")
 
     before = fingerprint(repo)
-    assert "first 3 hashed" in before, before.splitlines()[:3]
+    assert "content-checked" in before, before.splitlines()[:3]
     # Counted over the STATUS lines only. The `.git` execution surface is hashed
     # separately and is small and fixed, so a bare `sha256:` count across the
     # whole fingerprint measures the hooks directory rather than the cap.
@@ -720,9 +728,86 @@ def test_the_hashed_set_is_capped_and_the_cap_is_recorded(repo, monkeypatch):
         for line in before.splitlines()
         if line.startswith(("??", " M", "M ", "A ", "!!")) and "sha256:" in line
     ]
-    assert len(hashed_status) <= 3, hashed_status
+    assert len(hashed_status) == 3, hashed_status
 
     (repo / "f5.txt").write_text("changed past the cap\n", encoding="utf-8")
     assert assert_unchanged(repo, before) is not None, (
         "the cap must bound the reading, never the detection"
     )
+
+
+@needs_git
+def test_an_ignored_tree_cannot_starve_tracked_files_of_the_hash_budget(
+    repo, monkeypatch
+):
+    """THE EVASION the positional cap allowed.
+
+    Ignored paths are never hashed, but they used to consume BUDGET POSITIONS.
+    A repository with a large ignored tree -- `.venv`, `node_modules`, which is
+    every real project -- pushed the tracked files past the cap, so they carried
+    stat marks only and a content-preserving mutation of a tracked file evaded
+    detection completely. That is the opposite of what the cap is for.
+
+    `<= cap` alone would not catch it either: hashing NOTHING satisfies that.
+    """
+    monkeypatch.setattr(sentinel_module, "_HASH_CAP_ENTRIES", 2)
+
+    # The ignored paths must sort BEFORE the tracked file, or they never reach
+    # the budget ahead of it and the case proves nothing. An earlier version of
+    # this test used `junk/` against `README.md`; uppercase sorts first, so the
+    # tracked file was hashed at position 1 and the defect was invisible.
+    (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    for index in range(10):
+        (repo / f"aaa{index}.log").write_text("ignored\n", encoding="utf-8")
+    tracked = repo / "zzz.txt"
+    tracked.write_bytes(b"original\n")
+    _git(repo, "add", "zzz.txt")
+    _git(repo, "commit", "--quiet", "-m", "add zzz", "--no-gpg-sign")
+    tracked.write_bytes(b"modified\n")
+
+    before = fingerprint(repo)
+    tracked_line = next(
+        line for line in before.splitlines() if line.endswith(("zzz.txt", "zzz.txt "))
+        or " zzz.txt " in line
+    )
+    assert "sha256:" in tracked_line, (
+        f"the tracked file was starved of the hash budget by ignored paths, so "
+        f"a content-preserving mutation of it would evade detection entirely: "
+        f"{tracked_line}"
+    )
+
+    # And the content check actually bites: a SAME-SIZE rewrite is caught, which
+    # a stat mark could not do.
+    tracked.write_bytes(b"MODIFIED\n")
+    assert assert_unchanged(repo, before) is not None
+
+
+@needs_git
+def test_the_status_lines_are_ordered_by_path(repo):
+    """Membership of the hash budget must depend only on paths.
+
+    With the status LETTERS leading the sort, a file going from `??` to ` M`
+    moves in the ordering and can push a completely different file across the
+    cap -- so which files are content-checked would shift for a reason that has
+    nothing to do with them.
+    """
+    (repo / "b.txt").write_text("b\n", encoding="utf-8")
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    (repo / "c.txt").write_text("c\n", encoding="utf-8")
+
+    # A status line is `XY path mark`. The letters are two characters, either
+    # of which may be a space, and both the path and a `stat N:N` mark can
+    # contain spaces -- so a positional split gets it wrong. The mark
+    # vocabulary is fixed and small, which makes it the reliable anchor.
+    pattern = re.compile(
+        r"^(?P<letters>..) (?P<path>.+?) "
+        r"(?:sha256:\S+|stat \S+|absent|nonfile:\S+|unreadable)$"
+    )
+    paths = [
+        match.group("path")
+        for match in (pattern.match(line) for line in fingerprint(repo).splitlines())
+        if match
+    ]
+    assert paths, "no status lines were parsed, so this test checks nothing"
+    assert paths == sorted(paths), paths

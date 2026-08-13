@@ -29,21 +29,18 @@ one; the first version disclosed two items and missed the five that mattered.
   `config`, `hooks/`, and every ref -- because those are what turn a repository
   into a program. A loose object nothing references is inert, and hashing every
   object would cost more than the stage.
-- **Ignored files, by content.** They are listed and stat-ed, so an appearance
-  or a size change is caught; a same-size same-mtime rewrite inside ignored
-  space is not. Hashing `node_modules` per stage is not worth it.
-- **Reads.** A stage that exfiltrates is not a mutation and this says nothing
-  about it. `read_denied` is the nominal control and reaches no CLI flag, so
-  there is currently NO control -- see `policy/profiles.py`.
-- **Anything outside *root*.**
-
-- **Ignored files and anything past `_HASH_CAP_ENTRIES`, by content.** Both are
+- **Ignored files, and anything past `_HASH_CAP_ENTRIES`, by content.** Both are
   listed and stat-ed, so an appearance or a size change is caught; a same-size
   same-mtime rewrite is not. The cap exists because `--untracked-files=all`
   lists every untracked file individually and Whetstone runs against
   repositories whose state it does not choose -- a large uncovered build tree
   would otherwise be read in full, twice, per stage. Measured on Whetstone's
-  own checkout: 3,508 entries.
+  own checkout: 3,508 entries. The budget counts HASHES rather than positions,
+  so an ignored tree cannot starve the tracked files of it.
+- **Reads.** A stage that exfiltrates is not a mutation and this says nothing
+  about it. `read_denied` is the nominal control and reaches no CLI flag, so
+  there is currently NO control -- see `policy/profiles.py`.
+- **Anything outside *root*.**
 
 AND IT RUNS GIT AGAINST A REPOSITORY IT DOES NOT TRUST. `core.fsmonitor`,
 `core.pager`, `core.hooksPath` and `core.sshCommand` all name programs git
@@ -390,24 +387,41 @@ def fingerprint(root: Path) -> str:
     # the same defect `scope/resolver.py` records under `--full-name`.
     base = Path(toplevel) if toplevel else root
 
+    # NOT `unborn` when this fails. A non-zero exit covers an unborn branch, a
+    # HEAD pointing at a ref that does not exist, a corrupt `.git/HEAD` and a
+    # permission error alike -- measured: `rev-parse --verify --quiet HEAD`
+    # returns 1 for BOTH a genuine unborn branch and a dangling one, so the exit
+    # code is proof of neither. Writing `unborn` from it states a fact about the
+    # repository that git never reported, which is the failure this module
+    # rejects for timeouts one line down.
+    #
+    # The reason goes in the line instead. Two different failures carry
+    # different git stderr, so they are different fingerprints -- a stage that
+    # corrupts HEAD is a change, not a tie.
     head, head_why = _git(root, ["rev-parse", "HEAD"])
-    if head is not None:
-        head_line = f"head {head.strip()}"
-    elif head_why.startswith("git exited"):
-        # A non-zero exit from `rev-parse HEAD`, inside a repository git has
-        # just answered about, means there is no commit yet. A legitimate state,
-        # recorded as itself so a first commit during a stage shows as a change.
-        head_line = "head unborn"
-    else:
-        # A timeout or a spawn failure is NOT unborn. Writing it as `unborn`
-        # would be a claim about the world taken from a failure to look.
-        head_line = f"head unreadable ({head_why})"
+    head_line = (
+        f"head {head.strip()}" if head is not None else f"head unresolved ({head_why})"
+    )
 
-    records = sorted(_status_records(status))
+    # Sorted BY PATH, not by status letters. Membership of the hash budget below
+    # has to depend only on paths: with the letters leading the sort, a file
+    # going from `??` to ` M` moves in the ordering and can push a completely
+    # different file across the cap, so which files are content-checked would
+    # shift for a reason unrelated to them.
+    records = sorted(_status_records(status), key=lambda item: (item[1], item[0]))
+
     lines = []
-    for position, (letters, relative) in enumerate(records):
+    hashed = 0
+    hashable = sum(1 for letters, _ in records if letters != "!!")
+    for letters, relative in records:
         target = base / relative
-        if letters == "!!" or position >= _HASH_CAP_ENTRIES:
+        # THE BUDGET COUNTS HASHES, NOT POSITIONS. Counting positions let
+        # ignored paths consume the budget without ever being read, so a large
+        # ignored tree -- `.venv`, `node_modules` -- pushed the tracked files
+        # past the cap and left them with stat marks only. A content-preserving
+        # mutation of a tracked file would then evade detection entirely, which
+        # is the opposite of what the cap is for.
+        if letters == "!!" or hashed >= _HASH_CAP_ENTRIES:
             # Ignored paths are never hashed: `node_modules` on every stage is
             # not worth what it buys. Past the cap the same applies for the same
             # reason -- and both still carry a stat mark, so an appearance or a
@@ -415,16 +429,24 @@ def fingerprint(root: Path) -> str:
             mark = f"stat {_stat_mark(target)}"
         else:
             mark = _digest(target)
+            hashed += 1
         lines.append(f"{letters} {relative} {mark}")
 
     header = ["mode git"]
-    if len(records) > _HASH_CAP_ENTRIES:
-        header.append(f"... {len(records)} entries, first {_HASH_CAP_ENTRIES} hashed")
+    if hashed < hashable:
+        # The ACTUAL count, not the configured cap. Reporting the cap would
+        # claim entries were hashed when the number read may be smaller.
+        header.append(
+            f"... {len(records)} entries, {hashed} of {hashable} hashable content-checked"
+        )
     if dirs is None:
         header.append(f"git-dirs unreadable ({dirs_why})")
     header.append(head_line)
 
-    return "\n".join([*header, *sorted(lines), *_git_surface(root, common_dir)])
+    # `lines` is NOT re-sorted here. It is already in path order, and sorting
+    # the formatted strings would order them by their leading status letters
+    # instead -- silently undoing the path ordering the hash budget depends on.
+    return "\n".join([*header, *lines, *_git_surface(root, common_dir)])
 
 
 def assert_unchanged(root: Path, before: str) -> str | None:
