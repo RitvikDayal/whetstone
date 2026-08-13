@@ -24,7 +24,7 @@ import pytest
 from whetstone.lenses.base import RunContext
 from whetstone.lenses.code_defects import reproduce as reproduce_module
 from whetstone.lenses.code_defects.prompts import load_prompt
-from whetstone.lenses.code_defects.reproduce import _sanitise, reproduce
+from whetstone.lenses.code_defects.reproduce import REPRO_MARKER, _sanitise, reproduce
 from whetstone.provider.base import StageRequest, StageResult, Usage
 
 _CANDIDATE = {
@@ -39,17 +39,33 @@ _CANDIDATE = {
     "provenance": {"angle": "error handling", "turns": 5, "read_nothing": False},
 }
 
+# The canonical form the prompt teaches: try/except, with a `pytest.fail` the
+# controller can attribute on the no-defect path.
+#
+# `with pytest.raises(...)` is deliberately NOT used. Against a fixed
+# implementation it fails with pytest's own "DID NOT RAISE" message, which
+# carries no marker -- so absence was unreachable through the very example the
+# prompt gave, and every fixed defect would have read as a broken test.
 _PASSES = (
     "import pytest\n"
     "from app import add\n\n"
     "def test_reproduces():\n"
-    "    with pytest.raises(IndexError):\n"
+    "    try:\n"
     "        add([])\n"
+    "    except IndexError:\n"
+    "        return\n"
+    "    pytest.fail('WHETSTONE-REPRO: add([]) returned instead of raising')\n"
 )
+# Fails with the marker in its ASSERTION MESSAGE, which is what earns absence.
+#
+# Deliberately independent of `app`: the first version called `add([])`, which
+# on the buggy fixture raises IndexError before the assertion runs -- so the
+# failure message was "IndexError: list index out of range", carried no marker,
+# and the verdict was correctly `inconclusive`. The fixture was wrong, not the
+# code. This one isolates the property under test from the app's semantics.
 _FAILS_WITH_MARKER = (
-    "from app import add\n\n"
     "def test_reproduces():\n"
-    "    assert add([]) == 0, 'WHETSTONE-REPRO: expected the empty case to work'\n"
+    "    assert False, 'WHETSTONE-REPRO: the defect did not occur'\n"
 )
 _FAILS_WITHOUT_MARKER = (
     "def test_reproduces():\n"
@@ -334,3 +350,106 @@ def test_the_prompt_TEMPLATE_cannot_ask_for_anything_sanitisation_withholds():
     assert "root_cause_hypothesis" not in placeholders
     assert "confidence" not in placeholders
     assert "severity" not in placeholders
+
+
+def test_the_canonical_artifact_reaches_ABSENT_against_a_fixed_implementation(
+    ctx,
+):
+    """The form the prompt teaches has to work in BOTH directions.
+
+    `with pytest.raises(...)` fails with pytest's own DID NOT RAISE message
+    when the defect is fixed. That carries no marker, so absence was
+    unreachable through the very example the prompt gave -- every fixed defect
+    would have read as a broken test.
+    """
+    (ctx.project_root / "app.py").write_text(
+        "def add(values):\n    return values[0] if values else 0\n", encoding="utf-8"
+    )
+    provider = _FakeProvider(
+        _ok(_payload(artifact={"kind": "pytest", "content": _PASSES}))
+    )
+    result, skips = reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND)
+
+    assert result["verdict"] == "absent", skips
+    assert result["reproduced"] is False
+
+
+def test_printing_the_marker_does_not_buy_absence(ctx):
+    """THE ATTACK the output scan allowed.
+
+    The artifact prints `WHETSTONE-REPRO` and then fails an unrelated
+    assertion. Exit 1 plus the string somewhere in stdout used to read as
+    absence, although the predicate meant to check the defect was never
+    checked. The marker is bound to the FAILING TEST now, via pytest's own
+    report rather than the model's output.
+    """
+    smuggles = (
+        "def test_reproduces():\n"
+        "    print('WHETSTONE-REPRO: nothing to see here')\n"
+        "    assert 1 == 2, 'an unrelated assertion'\n"
+    )
+    provider = _FakeProvider(
+        _ok(_payload(artifact={"kind": "pytest", "content": smuggles}))
+    )
+    result, skips = reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND)
+
+    assert result["verdict"] == "inconclusive", skips
+    assert any("marker" in skip for skip in skips)
+
+
+def test_more_than_one_test_cannot_attribute_a_failure(ctx):
+    """Two tests, one failing with the marker. Which defect did that settle?
+    Nothing here can say, so it settles nothing."""
+    two = (
+        "def test_one():\n"
+        "    assert True\n\n"
+        "def test_two():\n"
+        "    assert False, 'WHETSTONE-REPRO: the wrong one'\n"
+    )
+    provider = _FakeProvider(_ok(_payload(artifact={"kind": "pytest", "content": two})))
+    result, skips = reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND)
+
+    assert result["verdict"] == "inconclusive"
+    assert any("rather than one" in skip for skip in skips)
+
+
+def test_the_junit_report_is_not_left_in_the_project(ctx):
+    """It is Whetstone's bookkeeping, so it goes under state_root -- writing it
+    into the worktree would be a file we put in the user's repository."""
+    provider = _FakeProvider(
+        _ok(_payload(artifact={"kind": "pytest", "content": _PASSES}))
+    )
+    reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND)
+
+    assert list(ctx.project_root.rglob("*.xml")) == []
+    assert list(ctx.state_root.rglob("*.xml")) == []
+
+
+def test_a_test_command_that_writes_no_report_cannot_produce_absence(ctx):
+    """The binding degrades honestly. A declared test command that is not
+    pytest -- or one that rejects `--junit-xml` -- leaves nothing for the
+    controller to attribute a failure to, and an unattributable failure is not
+    evidence that the defect is gone."""
+    provider = _FakeProvider(
+        _ok(_payload(artifact={"kind": "pytest", "content": _FAILS_WITH_MARKER}))
+    )
+    exits_one_writes_nothing = f'"{sys.executable}" -c "import sys; sys.exit(1)"'
+    result, skips = reproduce(_CANDIDATE, ctx, provider, exits_one_writes_nothing)
+
+    assert result["verdict"] == "inconclusive"
+    assert any("no report" in skip for skip in skips)
+
+
+def test_the_prompt_teaches_the_form_that_can_reach_absence():
+    """The example is load-bearing, not decoration.
+
+    `with pytest.raises(...)` fails with pytest's own DID NOT RAISE message
+    against a fixed implementation. That carries no marker, so absence becomes
+    unreachable through the very form the prompt recommends -- and a prompt
+    that quietly regressed to it would make every fixed defect read as a broken
+    test, with nothing failing to say so.
+    """
+    template = load_prompt("reproduce")
+    assert "pytest.fail(" in template, "the example must show a message we control"
+    assert REPRO_MARKER in template
+    assert "Do not use `with pytest.raises(...)` for this." in template

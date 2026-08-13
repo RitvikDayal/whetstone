@@ -23,10 +23,22 @@ are not writing the test that guards the fix; you are writing the one that
 demonstrates the defect is real. So assert the broken behaviour:
 
 ```python
+import pytest
+from app import add
+
 def test_reproduces():
-    with pytest.raises(IndexError):
+    try:
         add([])
+    except IndexError:
+        return  # the defect is present
+    pytest.fail("WHETSTONE-REPRO: add([]) returned instead of raising")
 ```
+
+**Do not use `with pytest.raises(...)` for this.** When the defect is fixed it
+fails with pytest's own `DID NOT RAISE` message, which carries no marker — so
+the run reads as a broken test rather than as evidence the defect is gone, and
+absence becomes unreachable. Write the `try`/`except` form above, where the
+no-defect path is a `pytest.fail` you control the message of.
 
 Whetstone runs this itself, through the project's own test command, and the
 exit code — not your opinion — decides whether the defect is real.

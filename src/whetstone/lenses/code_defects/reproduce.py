@@ -19,16 +19,31 @@ PASSES while the defect is present, because it asserts the broken behaviour. So
 exit 0 is the evidence. A failure is then ambiguous -- the defect may be absent,
 or the test may be broken -- and those are completely different answers:
 
-    0                       reproduced
-    1 with the marker       absent; the assertion that was checking the defect
-                            is the thing that failed
-    1 without the marker    inconclusive; something else broke, and a broken
-                            harness must never read as "the defect is gone"
-    5                       inconclusive; pytest collected no tests at all
-    anything else           inconclusive
+    0                        reproduced
+    1, one test, and the      absent; the assertion that was checking the defect
+      marker in ITS failure   is the thing that failed
+    1, anything else          inconclusive; a broken harness must never read as
+                              "the defect is gone"
+    5                         inconclusive; pytest collected no tests at all
+    anything else             inconclusive
 
 Absence has to be EARNED. Reading any failure as absence is how a tool closes a
 real defect on the strength of its own typo.
+
+AND THE MARKER IS BOUND TO THE FAILING TEST, not searched for in the output.
+Scanning stdout let the artifact PRINT the marker and then fail an unrelated
+assertion: exit 1 plus the string anywhere read as absence, while the predicate
+that was supposed to check the defect went unchecked. `--junit-xml` is written
+by pytest rather than by the model, so the failure it attributes is one the
+controller owns.
+
+WHAT THIS MODULE STILL DOES NOT BOUND, and it is the important gap: the
+artifact is arbitrary Python. `kind: "pytest"` restricts what INVOKES it, not
+what it can do -- a pytest file can write outside the worktree, touch `.git`,
+or spawn `git push`. The permission profile bounds the provider stage and not
+this, and the sentinel reports mutations only after the fact and only inside
+`project_root`. Closing it needs an OS-enforced boundary, which is not M1a's.
+See the M1a plan's execution decision.
 """
 
 from __future__ import annotations
@@ -36,8 +51,10 @@ from __future__ import annotations
 import contextlib
 import os
 import uuid
+from pathlib import Path
 from string import Template
 from typing import Any
+from xml.etree import ElementTree
 
 from ..._subprocess import run_shell
 from ...policy.profiles import profile_for
@@ -87,7 +104,47 @@ def _prompt_for(candidate: dict[str, Any]) -> str:
     )
 
 
-def _verdict_from(returncode: int, output: str) -> tuple[str, str | None]:
+def _bound_failure(report: Path) -> tuple[int, str | None] | None:
+    """`(test count, the failure message of the single test)` from pytest's own
+    JUnit report, or None if there is no usable report.
+
+    CONTROLLER-OWNED, which is the whole point. Searching stdout for the marker
+    let the artifact PRINT `WHETSTONE-REPRO` and then fail an unrelated
+    assertion: return code 1 plus the string anywhere in the output read as
+    `absent`, although the predicate that was supposed to check the defect had
+    not been checked at all. The marker has to be bound to the failure of the
+    test, and pytest writes this file rather than the model.
+    """
+    try:
+        root = ElementTree.parse(report).getroot()
+    except (OSError, ElementTree.ParseError):
+        return None
+    cases = root.iter("testcase")
+    messages: list[str | None] = []
+    for case in cases:
+        failure = case.find("failure")
+        if failure is None:
+            messages.append(None)
+            continue
+        # THE `message` ATTRIBUTE ONLY, never the element text. pytest puts the
+        # assertion message in the attribute and the TRACEBACK in the text --
+        # and the traceback quotes the test's own source, which the model
+        # wrote. Including it let an artifact that merely PRINTS the marker,
+        # or contains it in a comment, buy absence on an unrelated failure.
+        messages.append(failure.get("message") or "")
+    if not messages:
+        return None
+    failures = [m for m in messages if m is not None]
+    if len(failures) != 1:
+        # Zero failures is not this branch's business; more than one means the
+        # marker cannot be attributed to the reproduction assertion.
+        return len(messages), None
+    return len(messages), failures[0]
+
+
+def _verdict_from(
+    returncode: int, bound: tuple[int, str | None] | None
+) -> tuple[str, str | None]:
     """`(verdict, reason)` for what the controller's own run produced."""
     if returncode == 0:
         return "reproduced", None
@@ -96,14 +153,28 @@ def _verdict_from(returncode: int, output: str) -> tuple[str, str | None]:
             "inconclusive",
             "the reproduction collected no tests at all, so nothing was checked",
         )
-    if returncode == 1 and REPRO_MARKER in output:
-        return "absent", None
     if returncode == 1:
-        return (
-            "inconclusive",
-            f"the reproduction failed without the {REPRO_MARKER} marker, so it "
-            f"is a broken test rather than evidence the defect is gone",
-        )
+        if bound is None:
+            return (
+                "inconclusive",
+                "the reproduction failed and pytest produced no report to attribute "
+                "the failure to, so absence cannot be established",
+            )
+        count, failure = bound
+        if count != 1:
+            return (
+                "inconclusive",
+                f"the reproduction contained {count} tests rather than one, so a "
+                f"failure cannot be attributed to the defect predicate",
+            )
+        if failure is None or REPRO_MARKER not in failure:
+            return (
+                "inconclusive",
+                f"the reproduction failed without the {REPRO_MARKER} marker in the "
+                f"failing assertion, so it is a broken test rather than evidence "
+                f"the defect is gone",
+            )
+        return "absent", None
     return (
         "inconclusive",
         f"the reproduction exited {returncode}, which settles nothing",
@@ -186,12 +257,18 @@ def reproduce(
     # A name nothing else will collide with, at the project root so the
     # project's own test command finds it and its imports resolve the way the
     # project's do.
-    path = ctx.project_root / f"test_whetstone_repro_{uuid.uuid4().hex[:12]}.py"
+    stem = f"whetstone_repro_{uuid.uuid4().hex[:12]}"
+    path = ctx.project_root / f"test_{stem}.py"
+    # The report goes OUTSIDE the worktree: it is Whetstone's bookkeeping, not
+    # the project's, and writing it inside would be a file we put in the user's
+    # repository for the sentinel to find.
+    report = ctx.state_root / f"{stem}.xml"
+    report.parent.mkdir(parents=True, exist_ok=True)
     before = sentinel.fingerprint(ctx.project_root)
     try:
         path.write_text(content, encoding="utf-8")
         shell = run_shell(
-            f'{test_command} "{path.name}"',
+            f'{test_command} "{path.name}" --junit-xml="{report}"',
             ctx.project_root,
             _TEST_TIMEOUT_SECONDS,
             # No bytecode. Without this, running the artifact leaves a `.pyc`
@@ -207,6 +284,9 @@ def reproduce(
         # here would leave the repository dirtier than we found it.
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
+        bound = _bound_failure(report)
+        with contextlib.suppress(OSError):
+            report.unlink(missing_ok=True)
 
     if shell.timed_out:
         outcome["verdict"] = "inconclusive"
@@ -215,7 +295,7 @@ def reproduce(
             f"was killed, so it settles nothing"
         )
     else:
-        verdict, reason = _verdict_from(shell.returncode, shell.output)
+        verdict, reason = _verdict_from(shell.returncode, bound)
         outcome["verdict"] = verdict
         outcome["reproduced"] = verdict == "reproduced"
         if reason:
