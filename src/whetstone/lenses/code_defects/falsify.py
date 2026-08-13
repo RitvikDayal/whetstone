@@ -71,9 +71,25 @@ _VERDICT_MEANING: dict[str, str] = {
         "a reproduction was written but the controller could not run it, so "
         "nothing was executed"
     ),
+    "unstated": (
+        "no verdict was recorded, so nothing is known about whether the "
+        "reproduction ran at all; treat it as settling nothing"
+    ),
 }
 
 _UNKNOWN_VERDICT = "an outcome this build does not recognise; treat it as settling nothing"
+
+# Which verdicts mean the controller actually ran the reproduction. The lead
+# sentence in `_reproduction_text` must agree with this set rather than assert
+# execution unconditionally -- fixing the verdict word alone and leaving an
+# unconditional "the controller ran this itself" in the same breath is the
+# half-fix CodeRabbit caught: the noun changed, the claim did not.
+_EXECUTED_VERDICTS = frozenset({"reproduced", "absent", "inconclusive"})
+# Verdicts where it is KNOWN nothing was executed, as distinct from verdicts
+# where that is simply not recorded (`unstated`, or anything this build does
+# not recognise) -- "did not run" and "unknown whether it ran" are different
+# claims and the lead sentence must not collapse them into each other either.
+_NOT_EXECUTED_VERDICTS = frozenset({"not attempted", "not executed"})
 
 
 def _sanitise(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -112,12 +128,36 @@ def _reproduction_text(reproduction: dict[str, Any]) -> str:
     code" is one of the ways a finding like this turns out to be nothing, and a
     falsifier that cannot see the test cannot make that argument at all.
     """
-    verdict = str(reproduction.get("verdict") or "inconclusive")
-    lines = [
-        f"The controller ran this itself; the model that wrote the reproduction "
-        f"had no shell and executed nothing. Verdict: {verdict} -- "
-        f"{_VERDICT_MEANING.get(verdict, _UNKNOWN_VERDICT)}."
-    ]
+    # A missing or empty verdict is not a genuine "inconclusive" -- that word
+    # means the controller ran the evidence and it settled nothing, which is a
+    # claim about an execution that in this case never happened. A default
+    # that tells the falsifier a reproduction ran when none did is exactly the
+    # failure class this stage exists to prevent.
+    verdict = str(reproduction.get("verdict") or "unstated")
+    # The "no shell" half is true unconditionally -- the reproducer is a model
+    # with no execution capability of its own, whatever the controller did or
+    # did not do with what it wrote. The "controller ran this itself" half is
+    # NOT unconditional, and asserting it regardless of `verdict` is exactly
+    # what CodeRabbit's finding was about: it renders true prose for the
+    # verdicts in `_EXECUTED_VERDICTS` and a false claim of execution for
+    # every other one, including the ones `_VERDICT_MEANING` itself already
+    # says nothing was executed for.
+    if verdict in _EXECUTED_VERDICTS:
+        lead = (
+            "The controller ran this itself; the model that wrote the "
+            "reproduction had no shell and executed nothing."
+        )
+    elif verdict in _NOT_EXECUTED_VERDICTS:
+        lead = (
+            "Nothing here was executed, by the controller or by the model "
+            "that wrote the reproduction, which also had no shell."
+        )
+    else:
+        lead = (
+            "Whether the controller executed anything here was not recorded; "
+            "the model that wrote the reproduction had no shell regardless."
+        )
+    lines = [f"{lead} Verdict: {verdict} -- {_VERDICT_MEANING.get(verdict, _UNKNOWN_VERDICT)}."]
 
     payload = reproduction.get("payload") or {}
     steps = [str(step) for step in (payload.get("steps") or [])]

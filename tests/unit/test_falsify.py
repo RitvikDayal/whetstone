@@ -31,6 +31,13 @@ from whetstone.lenses.code_defects.prompts import load_prompt
 from whetstone.provider.base import StageRequest, StageResult, Usage
 from whetstone.schemas import load_schema
 
+# Withheld fields get unique sentinels rather than realistic-looking values
+# like "high" or "0.8" -- those could coincidentally appear in unrelated
+# prompt prose and pass the leakage assertion by accident rather than by
+# actually proving nothing leaked.
+_WITHHELD_SEVERITY = "ZZ-SEVERITY-SHOULD-NOT-TRAVEL"
+_WITHHELD_CONFIDENCE = "ZZ-CONFIDENCE-SHOULD-NOT-TRAVEL"
+
 _CANDIDATE = {
     "subject": "app.py:2",
     "title": "add() raises on empty input",
@@ -38,8 +45,8 @@ _CANDIDATE = {
     "root_cause_hypothesis": "The caller does not guard against an empty list.",
     "alternative_explanations": ["Callers may guarantee a non-empty list."],
     "failure_scenario": "add([]) raises IndexError.",
-    "severity": "high",
-    "confidence": 0.8,
+    "severity": _WITHHELD_SEVERITY,
+    "confidence": _WITHHELD_CONFIDENCE,
     "provenance": {"angle": "error handling", "turns": 5, "read_nothing": False},
 }
 
@@ -194,8 +201,8 @@ def test_the_prompt_carries_only_the_sanitised_fields(ctx):
     assert _CANDIDATE["root_cause_hypothesis"] not in sent
     assert _CANDIDATE["title"] not in sent
     assert _CANDIDATE["alternative_explanations"][0] not in sent
-    assert "0.8" not in sent
-    assert "high" not in sent
+    assert _WITHHELD_CONFIDENCE not in sent
+    assert _WITHHELD_SEVERITY not in sent
 
 
 # --- what the falsifier is told about the reproduction --------------------------
@@ -231,6 +238,58 @@ def test_a_reproduction_with_no_payload_at_all_still_renders():
     stage out entirely on the exact findings that most need challenging."""
     text = _reproduction_text({"verdict": "not attempted", "payload": None})
     assert "not attempted" in text
+
+
+def test_a_missing_verdict_is_not_read_as_a_genuine_inconclusive():
+    """`reproduce()` always sets `verdict`, so an absent key only reaches this
+    stage through a hand-built dict -- but a default that claims execution
+    happened when it did not is the exact failure class this stage exists to
+    prevent. Falling back to a real verdict word ("inconclusive") would tell
+    the falsifier the controller ran the evidence and it settled nothing,
+    when in fact nothing ran at all."""
+    text = _reproduction_text({"payload": None})
+    assert "the controller executed the evidence and it settled nothing" not in text
+    assert "no verdict was recorded" in text
+
+
+@pytest.mark.parametrize("verdict", ["reproduced", "absent", "inconclusive"])
+def test_a_verdict_that_means_execution_happened_says_the_controller_ran_it(verdict):
+    """The other half of the fix: fixing the noun (the verdict word) and
+    leaving the lead sentence unconditional was the miss CodeRabbit caught on
+    the round before this one. These three verdicts are the ones where the
+    controller genuinely ran the evidence, so the claim belongs here."""
+    text = _reproduction_text({"verdict": verdict, "payload": None})
+    assert "the controller ran this itself" in text.lower()
+
+
+@pytest.mark.parametrize("verdict", ["not attempted", "not executed"])
+def test_a_verdict_that_means_nothing_ran_never_claims_the_controller_ran_it(verdict):
+    """Checked per verdict, not only for the missing-key case: a fix that
+    special-cased `unstated` alone would leave this one -- a reproduction
+    that WAS written but that the controller declined to run -- still lying
+    about who ran what."""
+    text = _reproduction_text({"verdict": verdict, "payload": None})
+    lowered = text.lower()
+    assert "the controller ran this itself" not in lowered
+    assert "nothing here was executed" in lowered
+
+
+@pytest.mark.parametrize("verdict", ["unstated", "banana"])
+def test_a_verdict_that_is_unknown_or_unrecorded_makes_no_execution_claim_either_way(
+    verdict,
+):
+    """`unstated` and an unrecognised verdict are both cases where whether
+    anything ran is genuinely not known -- neither "the controller ran it"
+    nor "nothing ran" is a claim this code can back, so the lead sentence
+    must assert neither."""
+    reproduction = {"payload": None} if verdict == "unstated" else {
+        "verdict": verdict,
+        "payload": None,
+    }
+    text = _reproduction_text(reproduction).lower()
+    assert "the controller ran this itself" not in text
+    assert "nothing here was executed" not in text
+    assert "not recorded" in text
 
 
 # --- the stage's own decisions --------------------------------------------------
