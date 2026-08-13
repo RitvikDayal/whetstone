@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "hunt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["findings"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "subject",
+          "title",
+          "observation",
+          "root_cause_hypothesis",
+          "alternative_explanations",
+          "severity",
+          "confidence"
+        ],
+        "properties": {
+          "subject": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "The file path, or path:line, the finding is about."
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "One line naming the defect."
+          },
+          "observation": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "description": "WHAT IS IN THE CODE, stated so a reader can check it against the file without trusting anything else here. No cause, no blame, no fix."
+          },
+          "root_cause_hypothesis": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "description": "WHY the observation is thought to be a defect. This is a claim, not a fact, and is held separately from the observation for exactly that reason."
+          },
+          "alternative_explanations": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "description": "At least one other reading of the same observation. Required because a hunter that can only see its own explanation has not looked; empty here means the stage did not do the work.",
+            "items": {"type": "string", "minLength": 1, "maxLength": 500}
+          },
+          "failure_scenario": {
+            "type": ["string", "null"],
+            "maxLength": 1000,
+            "description": "Concrete inputs or state that would produce the wrong behaviour, if any can be named yet."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low", "info"]
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "The model's opinion of its own output. RECORDED FOR CALIBRATION AND NEVER USED IN GRADING -- see lenses/code_defects/grade.py."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "maxLength": 2000,
+      "description": "Anything about the hunt itself: what was not looked at, what could not be read."
+    }
+  }
+}

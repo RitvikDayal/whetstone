@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "reproduce",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reproduced", "steps", "expected", "actual"],
+  "properties": {
+    "reproduced": {
+      "type": "boolean",
+      "description": "The model's claim about whether it reproduced the defect. THE CONTROLLER RE-RUNS THE ARTIFACT AND OVERRIDES THIS -- invariant 2 says a model's self-assessment is discarded and recomputed from the world."
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "description": "How to produce the behaviour. minItems is correct here: a reproduce stage with no steps did no work.",
+      "items": {"type": "string", "minLength": 1, "maxLength": 500}
+    },
+    "expected": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000,
+      "description": "What correct behaviour would look like."
+    },
+    "actual": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000,
+      "description": "What happens instead."
+    },
+    "artifact": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "content"],
+      "description": "A RUNNABLE reproduction. Null is honest when none could be written; invariant 3 caps such a finding at grade B and it can never auto-anything.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["pytest", "script", "command"]
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000,
+          "description": "The test or script itself. The CONTROLLER executes this; the stage does not, and holds no shell with which to."
+        },
+        "path_hint": {
+          "type": ["string", "null"],
+          "maxLength": 500
+        }
+      }
+    },
+    "environment": {
+      "type": ["string", "null"],
+      "maxLength": 1000,
+      "description": "Versions, platform, and anything else the reproduction depends on."
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "maxLength": 2000
+    }
+  }
+}
