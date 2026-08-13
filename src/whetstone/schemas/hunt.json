@@ -4,6 +4,21 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["findings"],
+  "if": {
+    "properties": {"findings": {"maxItems": 0}},
+    "required": ["findings"]
+  },
+  "then": {
+    "required": ["findings", "notes"],
+    "properties": {
+      "notes": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000,
+        "description": "REQUIRED WHEN THERE ARE NO FINDINGS. An empty findings list with a null note is indistinguishable from a hunt that declined, ran out of budget, or could not read the files -- all of which read as a clean repository. Any path that declines to do work records a reason that reaches the user."
+      }
+    }
+  },
   "properties": {
     "findings": {
       "type": "array",

@@ -130,6 +130,14 @@ def test_grading_is_pure():
     assert first == second
 
 
-def test_grade_is_ordered_worst_last():
-    """A, B, C, D read as better-to-worse, and callers will sort on it."""
-    assert [g.value for g in Grade] == ["A", "B", "C", "D"]
+def test_grade_sorts_best_first():
+    """SORTING, not declaration order. Callers will sort on this to put the
+    worst findings last, and the declaration-order form would pass for a plain
+    `Enum` with the same values -- which is not sortable at all."""
+    assert sorted(Grade) == [Grade.A, Grade.B, Grade.C, Grade.D]
+    assert sorted([Grade.D, Grade.A, Grade.C, Grade.B]) == [
+        Grade.A,
+        Grade.B,
+        Grade.C,
+        Grade.D,
+    ]

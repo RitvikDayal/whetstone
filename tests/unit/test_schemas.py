@@ -19,9 +19,34 @@ def test_each_schema_is_valid_json_schema(stage):
     Draft202012Validator.check_schema(load_schema(stage))
 
 
+def _object_subschemas(node: object, path: str = "") -> list[tuple[str, dict]]:
+    """Every subschema that describes an object with named properties."""
+    found: list[tuple[str, dict]] = []
+    if isinstance(node, dict):
+        types = node.get("type")
+        types = types if isinstance(types, list) else [types]
+        if "object" in types and "properties" in node:
+            found.append((path or "<root>", node))
+        for key, value in node.items():
+            found.extend(_object_subschemas(value, f"{path}.{key}"))
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            found.extend(_object_subschemas(item, f"{path}[{index}]"))
+    return found
+
+
 @pytest.mark.parametrize("stage", ["hunt", "reproduce", "falsify"])
-def test_each_schema_forbids_extra_properties(stage):
-    assert load_schema(stage)["additionalProperties"] is False
+def test_every_object_forbids_extra_properties_not_only_the_root(stage):
+    """NESTED objects too. Checking only the root left `hunt.findings.items`
+    and `reproduce.artifact` open, so removing either one's
+    `additionalProperties: false` would have kept this green while letting a
+    model invent fields inside every finding."""
+    open_objects = [
+        path
+        for path, node in _object_subschemas(load_schema(stage), stage)
+        if node.get("additionalProperties") is not False
+    ]
+    assert not open_objects, open_objects
 
 
 def test_hunt_separates_facts_from_hypotheses():
@@ -109,17 +134,54 @@ def test_every_string_field_is_capped(stage):
 @pytest.mark.parametrize("stage", ["hunt", "reproduce", "falsify"])
 def test_optional_non_array_fields_accept_null(stage):
     """Models fill optionals with `null` rather than omitting them, so an
-    optional string typed `"string"` is refused for the ordinary case."""
+    optional string typed `"string"` is refused for the ordinary case.
+
+    Asserts `null` is IN the type list rather than merely that a list was used.
+    The looser form accepted `["object", "string"]` -- two types, no null --
+    which is exactly the shape `artifact` would take if somebody widened it
+    without thinking about the declining case.
+    """
     schema = load_schema(stage)
     required = set(schema.get("required", ()))
-    wrong = [
-        name
-        for name, spec in schema["properties"].items()
-        if name not in required
-        and isinstance(spec.get("type"), str)
-        and spec["type"] != "array"
-    ]
+    wrong = []
+    for name, spec in schema["properties"].items():
+        if name in required:
+            continue
+        types = spec.get("type")
+        types = types if isinstance(types, list) else [types]
+        if "array" in types:
+            continue
+        if "null" not in types:
+            wrong.append((name, spec.get("type")))
     assert not wrong, wrong
+
+
+def test_an_empty_hunt_must_say_why():
+    """`findings: []` with `notes: null` validated, so a hunt that declined,
+    ran out of budget or could not read the files was indistinguishable from a
+    clean repository -- the exact shape this project bans everywhere else."""
+    schema = load_schema("hunt")
+    validator = Draft202012Validator(schema)
+
+    assert not validator.is_valid({"findings": []})
+    assert not validator.is_valid({"findings": [], "notes": None})
+    assert not validator.is_valid({"findings": [], "notes": ""})
+    assert validator.is_valid({"findings": [], "notes": "read 12 files, nothing found"})
+
+
+def test_a_hunt_WITH_findings_still_does_not_require_notes():
+    """The requirement is conditional on purpose. Findings speak for
+    themselves; it is the empty answer that needs an account."""
+    finding = {
+        "subject": "a.py:1",
+        "title": "t",
+        "observation": "o",
+        "root_cause_hypothesis": "h",
+        "alternative_explanations": ["other"],
+        "severity": "low",
+        "confidence": 0.5,
+    }
+    assert Draft202012Validator(load_schema("hunt")).is_valid({"findings": [finding]})
 
 
 def test_load_schema_refuses_an_unknown_stage():
