@@ -250,7 +250,7 @@ def _surface_of(git_dir: Path) -> list[str]:
     return entries
 
 
-def _git_surface(root: Path, common_dir: str | None) -> list[str]:
+def _git_surface(root: Path, common_dir: str) -> list[str]:
     """The parts of the git directory that decide whether the repository is
     also a program.
 
@@ -265,13 +265,10 @@ def _git_surface(root: Path, common_dir: str | None) -> list[str]:
     the layout Whetstone will use once it starts working in worktrees.
     """
     entries: list[str] = []
-    if common_dir is None:
-        entries.append("git-surface unreadable (could not resolve --git-common-dir)")
-    else:
-        resolved = Path(common_dir)
-        if not resolved.is_absolute():
-            resolved = root / resolved
-        entries.extend(_surface_of(resolved))
+    resolved = Path(common_dir)
+    if not resolved.is_absolute():
+        resolved = root / resolved
+    entries.extend(_surface_of(resolved))
     refs, why = _git(root, ["for-each-ref", "--format=%(refname) %(objectname)"])
     if refs is None:
         entries.append(f"refs unreadable ({why})")
@@ -376,16 +373,25 @@ def fingerprint(root: Path) -> str:
     # HEAD. This runs twice per stage, so every spawn is paid ten times over a
     # four-stage lens.
     dirs, dirs_why = _git(root, ["rev-parse", "--show-toplevel", "--git-common-dir"])
-    toplevel = common_dir = None
-    if dirs is not None:
-        parts = [line.strip() for line in dirs.splitlines() if line.strip()]
-        if len(parts) == 2:
-            toplevel, common_dir = parts
-    # Status paths are relative to the REPOSITORY ROOT, never to cwd. Joining
-    # them onto `root` worked only when the two were the same directory and
-    # silently produced `absent` for every path when watching a subdirectory --
-    # the same defect `scope/resolver.py` records under `--full-name`.
-    base = Path(toplevel) if toplevel else root
+    parts = [line.strip() for line in dirs.splitlines() if line.strip()] if dirs else []
+    if len(parts) != 2:
+        # FAIL CLOSED. Status paths are relative to the REPOSITORY ROOT, never
+        # to cwd, so without the toplevel there is no way to resolve them --
+        # and falling back to `base = root` was silently catastrophic when
+        # *root* is a subdirectory: every path resolved to somewhere that does
+        # not exist, every mark became `absent`, and `absent` is STABLE. Both
+        # fingerprints then agreed, `assert_unchanged` returned None, and the
+        # sentinel reported a clean worktree while seeing nothing at all.
+        #
+        # That is a fail-open inside the one check whose entire job is to not
+        # fail open. Degrading to the walk still watches the directory, and the
+        # mode line carries the reason.
+        reason = dirs_why or f"rev-parse returned {len(parts)} of 2 paths"
+        return "\n".join(
+            [f"mode git-unavailable (git directories unresolved: {reason})", *_walk(root)]
+        )
+    toplevel, common_dir = parts
+    base = Path(toplevel)
 
     # NOT `unborn` when this fails. A non-zero exit covers an unborn branch, a
     # HEAD pointing at a ref that does not exist, a corrupt `.git/HEAD` and a
@@ -412,35 +418,40 @@ def fingerprint(root: Path) -> str:
 
     lines = []
     hashed = 0
-    hashable = sum(1 for letters, _ in records if letters != "!!")
+    capped = False
     for letters, relative in records:
         target = base / relative
-        # THE BUDGET COUNTS HASHES, NOT POSITIONS. Counting positions let
-        # ignored paths consume the budget without ever being read, so a large
-        # ignored tree -- `.venv`, `node_modules` -- pushed the tracked files
-        # past the cap and left them with stat marks only. A content-preserving
-        # mutation of a tracked file would then evade detection entirely, which
-        # is the opposite of what the cap is for.
+        # THE BUDGET COUNTS COMPLETED HASHES, NOT POSITIONS AND NOT ATTEMPTS.
+        #
+        # Counting positions let ignored paths consume the budget without ever
+        # being read, so a large ignored tree -- `.venv`, `node_modules`, which
+        # is every real project -- pushed the tracked files past the cap and
+        # left them with stat marks only.
+        #
+        # Counting attempts had the same effect one step in: `_digest` returns
+        # `absent` for a deleted path and `unreadable` for one it cannot open,
+        # neither of which reads any content. A commit that deleted many files
+        # would exhaust the budget on paths that cost nothing, and a later
+        # tracked file would fall back to a stat mark -- which a same-size
+        # rewrite with a restored mtime then walks straight past.
         if letters == "!!" or hashed >= _HASH_CAP_ENTRIES:
             # Ignored paths are never hashed: `node_modules` on every stage is
             # not worth what it buys. Past the cap the same applies for the same
             # reason -- and both still carry a stat mark, so an appearance or a
             # size change is caught either way.
+            capped = capped or letters != "!!"
             mark = f"stat {_stat_mark(target)}"
         else:
             mark = _digest(target)
-            hashed += 1
+            if mark.startswith("sha256:"):
+                hashed += 1
         lines.append(f"{letters} {relative} {mark}")
 
     header = ["mode git"]
-    if hashed < hashable:
+    if capped:
         # The ACTUAL count, not the configured cap. Reporting the cap would
-        # claim entries were hashed when the number read may be smaller.
-        header.append(
-            f"... {len(records)} entries, {hashed} of {hashable} hashable content-checked"
-        )
-    if dirs is None:
-        header.append(f"git-dirs unreadable ({dirs_why})")
+        # claim entries were content-checked when the number read may be lower.
+        header.append(f"... {len(records)} entries, {hashed} content-checked")
     header.append(head_line)
 
     # `lines` is NOT re-sorted here. It is already in path order, and sorting

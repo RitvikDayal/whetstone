@@ -811,3 +811,92 @@ def test_the_status_lines_are_ordered_by_path(repo):
     ]
     assert paths, "no status lines were parsed, so this test checks nothing"
     assert paths == sorted(paths), paths
+
+
+@needs_git
+def test_deleted_paths_do_not_consume_the_hash_budget(repo, monkeypatch):
+    """`_digest` returns `absent` for a deleted path, having read no content.
+
+    Counting positions was fixed first; counting ATTEMPTS had the same effect
+    one step in. A commit that deleted many files would exhaust the budget on
+    paths that cost nothing to look at, and a later tracked file would fall back
+    to a stat mark -- which a same-size rewrite with a restored mtime walks
+    straight past.
+
+    The deleted paths sort BEFORE the target, or they never reach the budget
+    ahead of it and the case proves nothing.
+    """
+    monkeypatch.setattr(sentinel_module, "_HASH_CAP_ENTRIES", 2)
+    for index in range(8):
+        (repo / f"aaa{index}.txt").write_bytes(b"doomed\n")
+    target = repo / "zzz.txt"
+    target.write_bytes(b"original\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "--quiet", "-m", "seed", "--no-gpg-sign")
+
+    for index in range(8):
+        (repo / f"aaa{index}.txt").unlink()
+    # Dirty, so it appears in the status at all. A committed, unmodified file
+    # is not listed and would carry no mark either way.
+    target.write_bytes(b"modified\n")
+
+    before = fingerprint(repo)
+    target_line = next(
+        line for line in before.splitlines() if line.rstrip().endswith(("zzz.txt",))
+        or " zzz.txt " in line
+    )
+    assert "sha256:" in target_line, (
+        f"deletions consumed the hash budget without reading anything, so the "
+        f"tracked file fell back to a stat mark: {target_line}"
+    )
+
+    stamp = target.stat().st_mtime_ns
+    target.write_bytes(b"MODIFIED\n")
+    os.utime(target, ns=(stamp, stamp))
+    assert assert_unchanged(repo, before) is not None, (
+        "a same-size rewrite with a restored mtime is exactly what a stat mark "
+        "cannot see"
+    )
+
+
+@needs_git
+def test_unresolvable_git_directories_fail_closed_rather_than_reading_nowhere(
+    tmp_path, monkeypatch
+):
+    """THE CRITICAL ONE, and it is a fail-open inside the check whose whole job
+    is not failing open.
+
+    Porcelain paths are relative to the REPOSITORY ROOT. With `rev-parse
+    --show-toplevel` failing after `git status` succeeded, the old code kept
+    `base = root` -- and when *root* is a subdirectory every path then resolved
+    to somewhere that does not exist, every mark became `absent`, and `absent`
+    is STABLE. Both fingerprints agreed, `assert_unchanged` returned None, and
+    the sentinel reported a clean worktree while seeing nothing at all.
+    """
+    _git(tmp_path, "init", "--quiet")
+    _git(tmp_path, "config", "user.email", "t@example.invalid")
+    _git(tmp_path, "config", "user.name", "T")
+    watched = tmp_path / "sub"
+    watched.mkdir()
+    (watched / "inside.txt").write_bytes(b"original\n")
+
+    real_run = sentinel_module.subprocess.run
+
+    def fail_only_dir_resolution(args, **kwargs):
+        if "rev-parse" in args and "--show-toplevel" in args:
+            raise subprocess.TimeoutExpired(cmd="git", timeout=1)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(sentinel_module.subprocess, "run", fail_only_dir_resolution)
+
+    before = fingerprint(watched)
+    assert before.startswith("mode git-unavailable (git directories unresolved:"), (
+        before.splitlines()[0]
+    )
+    assert "inside.txt" in before, "failing closed must still watch the directory"
+
+    (watched / "inside.txt").write_bytes(b"MUTATED\n")
+    assert assert_unchanged(watched, before) is not None, (
+        "the mutation must reach the user rather than being lost to a "
+        "fingerprint that resolved every path to nowhere"
+    )
