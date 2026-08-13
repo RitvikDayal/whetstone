@@ -39,11 +39,12 @@ controller owns.
 
 WHAT THIS MODULE STILL DOES NOT BOUND, and it is the important gap: the
 artifact is arbitrary Python. `kind: "pytest"` restricts what INVOKES it, not
-what it can do -- a pytest file can write outside the worktree, touch `.git`,
-or spawn `git push`. The permission profile bounds the provider stage and not
-this, and the sentinel reports mutations only after the fact and only inside
-`project_root`. Closing it needs an OS-enforced boundary, which is not M1a's.
-See the M1a plan's execution decision.
+what it can do -- a pytest file can write outside the worktree, reach into
+`.git`, or spawn any process at all, including the version-control operations
+this repository forbids itself from ever performing. The permission profile
+bounds the provider stage and not this, and the sentinel reports mutations only
+after the fact and only inside `project_root`. Closing it needs an OS-enforced
+boundary, which is not M1a's. See the M1a plan's execution decision.
 """
 
 from __future__ import annotations
