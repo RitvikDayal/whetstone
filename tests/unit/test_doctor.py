@@ -4,7 +4,6 @@ import sys
 import time
 
 from whetstone import _subprocess
-from whetstone import doctor as doctor_module
 from whetstone.config.model import (
     CommandsConfig,
     EnvironmentConfig,
@@ -112,7 +111,7 @@ def test_the_bound_still_holds_when_the_kill_does_not_take(tmp_path, monkeypatch
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.communicate(timeout=2)
 
-    monkeypatch.setattr(doctor_module, "kill_and_reap", _reap_without_killing)
+    monkeypatch.setattr(_subprocess, "kill_and_reap", _reap_without_killing)
 
     started = time.monotonic()
     try:
@@ -168,13 +167,21 @@ def _recording_reap(monkeypatch) -> list[bool]:
     than faking: the real kill, drain and `close_pipes` all still run.
     """
     drained: list[bool] = []
+    # Bound BEFORE the patch, or the wrapper calls itself.
+    real_kill_and_reap = _subprocess.kill_and_reap
 
     def _wrapper(proc):
-        result = _subprocess.kill_and_reap(proc)
+        result = real_kill_and_reap(proc)
         drained.append(result)
         return result
 
-    monkeypatch.setattr(doctor_module, "kill_and_reap", _wrapper)
+    # Patched on `_subprocess`, not on `doctor`. The execution moved into
+    # `_subprocess.run_shell` so the reproduce stage could read the exit code
+    # and the output that `CheckResult` cannot carry; `doctor.run_command` is
+    # now a view over it. Patching the old name silently stopped wrapping
+    # anything, which is why these three tests failed loudly rather than
+    # passing over a `kill_and_reap` nobody was watching.
+    monkeypatch.setattr(_subprocess, "kill_and_reap", _wrapper)
     return drained
 
 
