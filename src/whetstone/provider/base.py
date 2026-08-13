@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from ..errors import WhetstoneError
+from ..policy.gate import PermissionSet
 
 
 class ProviderError(WhetstoneError):
@@ -38,6 +39,11 @@ class Usage:
     cache_read_input_tokens: int = 0
     cost_usd: float | None = None
     wall_seconds: float = 0.0
+    # Which key in the envelope these numbers came from. A budget-exhausted
+    # envelope carried an all-zero top-level `usage` alongside a `modelUsage`
+    # reporting 47,661 cache-creation tokens, so "where did this come from" is
+    # a question a cost report has to be able to answer.
+    source: str = "none"
 
     @property
     def total_tokens(self) -> int:
@@ -67,12 +73,17 @@ class StageRequest:
     None means unbounded, and that is a real choice rather than a missing value:
     Task 9's budget holds the run-level ceiling, so a stage that declines to set
     its own is deferring to it, not escaping it.
+
+    `permissions` is typed rather than `Any`. It was `Any`, and a stage built
+    with `permissions=None` produced a command line with no permission flags on
+    it at all -- the absence of a policy and the most restrictive policy
+    expressible both yielding the least restrictive invocation.
     """
 
     stage: str
     prompt: str
     schema: dict[str, Any]
-    permissions: Any
+    permissions: PermissionSet
     effort: str
     max_budget_usd: float | None
     cwd: Path
@@ -80,13 +91,46 @@ class StageRequest:
 
 @dataclass(frozen=True)
 class StageResult:
+    """What one stage produced, and what it cost to find out.
+
+    `denials` and `mutation` are both observations about the run rather than
+    about the payload, and both exist because the provider's first version
+    reported neither. A stage whose tool call was refused returned
+    `ok=True, error=None`; a stage that modified the worktree returned the same.
+    """
+
     ok: bool
     data: dict[str, Any] | None
     raw: str
     usage: Usage
     error: str | None
+    # What the CLI refused. Necessary and NOT sufficient: measured against the
+    # real binary, a tool left out of `--tools` produces an empty
+    # `permission_denials`, because there was nothing to refuse. Absence is
+    # invisible here; only `mutation` sees through it.
+    denials: tuple[str, ...] = ()
+    # What changed in the worktree while the stage ran, or None. Every M1a
+    # stage is read-only, so anything at all here is a defect.
+    mutation: str | None = None
+    # How many turns the CLI took. One turn means the model answered without
+    # calling a single tool -- which is what a FABRICATED answer looks like, and
+    # what a blanket refusal looks like. Proven: a stage asked for the installed
+    # git version "measured by running it" returned an invented version number,
+    # schema-valid, no denials, no mutation. The sentinel structurally cannot
+    # see that; a fabricated READ changes nothing on disk.
+    #
+    # Recorded here and judged NOWHERE in this module. Invariant 2 says the
+    # provider decides nothing, so what counts as a substantive stage is the
+    # lens's call, not the adapter's.
+    turns: int = 0
 
     def __post_init__(self) -> None:
+        if not self.ok and self.error is None:
+            raise ValueError(
+                "a failed StageResult must carry an error -- a failure with no "
+                "reason is a path that declines to do work and says nothing, "
+                "which is the shape this repo bans everywhere else"
+            )
         if not self.ok and self.data is not None:
             raise ValueError(
                 "a failed StageResult must not carry data -- the spine reads "

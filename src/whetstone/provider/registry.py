@@ -16,14 +16,33 @@ from .base import Provider, ProviderError
 ENTRY_POINT_GROUP = "whetstone.providers"
 
 _REGISTRY: dict[str, Provider] = {}
+_BUILTINS: set[str] = set()
 _LOADED_PLUGINS = False
 _LOAD_ERROR: ProviderError | None = None
 
 
 def register(provider: Provider) -> None:
+    """Add *provider* under its own name, refusing to shadow a built-in.
+
+    `_register_builtins()` runs at import and `_load_plugins()` runs later, so
+    a plugin declaring the name `claude-cli` would simply replace the real
+    provider and every stage would silently run through it. `isinstance`
+    against a runtime-checkable Protocol only checks that the attribute names
+    exist, so it is not the guard people assume; the name collision is the one
+    that has to be closed here.
+    """
     if not isinstance(provider, Provider):
         raise ProviderError(f"{provider!r} does not satisfy the Provider protocol")
-    _REGISTRY[provider.name] = provider
+    name = provider.name
+    if not isinstance(name, str) or not name.strip():
+        raise ProviderError(f"{provider!r} has no usable name")
+    if name in _BUILTINS and _REGISTRY.get(name) is not provider:
+        raise ProviderError(
+            f"a plugin tried to register as {name!r}, which is a built-in "
+            f"provider. Shadowing it would route every stage through the "
+            f"plugin with nothing saying so; pick another name."
+        )
+    _REGISTRY[name] = provider
 
 
 def _load_plugins() -> None:
@@ -68,7 +87,9 @@ def available_providers() -> list[str]:
 def _register_builtins() -> None:
     from .claude_cli import ClaudeCliProvider
 
-    register(ClaudeCliProvider())
+    provider = ClaudeCliProvider()
+    register(provider)
+    _BUILTINS.add(provider.name)
 
 
 _register_builtins()
