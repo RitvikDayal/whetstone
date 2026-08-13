@@ -36,11 +36,17 @@ def register(provider: Provider) -> None:
     name = provider.name
     if not isinstance(name, str) or not name.strip():
         raise ProviderError(f"{provider!r} has no usable name")
-    if name in _BUILTINS and _REGISTRY.get(name) is not provider:
+    if name in _REGISTRY and _REGISTRY[name] is not provider:
+        # Two cases, one shape. A plugin taking a BUILT-IN name would route
+        # every stage through itself; two plugins sharing a name resolve by
+        # entry-point iteration order, which is not a stable contract, so which
+        # provider runs becomes install-order dependent and nothing says so.
+        # Both are the silent override this registry exists to refuse.
+        kind = "a built-in provider" if name in _BUILTINS else "another plugin"
         raise ProviderError(
-            f"a plugin tried to register as {name!r}, which is a built-in "
-            f"provider. Shadowing it would route every stage through the "
-            f"plugin with nothing saying so; pick another name."
+            f"{name!r} is already registered by {kind}. Overwriting it would "
+            f"route every stage through the replacement with nothing saying "
+            f"so; pick another name."
         )
     _REGISTRY[name] = provider
 

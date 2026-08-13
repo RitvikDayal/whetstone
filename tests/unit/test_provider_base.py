@@ -58,6 +58,18 @@ def test_an_ok_result_must_carry_a_reason_free_payload():
         StageResult(ok=True, data={"x": 1}, raw="", usage=Usage(), error="boom")
 
 
+def test_a_success_with_no_payload_is_refused():
+    """The fourth contradictory combination, and the one that constructed.
+
+    `ClaudeCliProvider` cannot produce it -- `_interpret` rejects a non-dict
+    `structured_output` first -- but this dataclass is the surface every future
+    provider and every registry plugin implements, and the spine dereferences
+    `data` whenever `ok` is true.
+    """
+    with pytest.raises(ValueError, match="must carry data"):
+        StageResult(ok=True, data=None, raw="", usage=Usage(), error=None)
+
+
 def test_a_failure_with_no_reason_is_refused():
     """The shape this repo bans everywhere else: a path that declines to do
     work and says nothing about why. It constructed."""

@@ -575,18 +575,22 @@ def test_the_subprocess_really_runs_under_the_scrubbed_environment(
     assert "PATH" in child, "the CLI still has to be able to find its own runtime"
 
 
-def test_the_allow_list_admits_nothing_it_was_not_asked_to(monkeypatch):
+def test_a_variable_nobody_thought_of_does_not_reach_the_stage(
+    workdir, fake_claude, monkeypatch
+):
     """An allow-list, not a deny-list: a deny-list of a vendor's environment
-    variables is out of date the day they add one."""
-    for name in _LEAKY_VARS:
-        monkeypatch.setenv(name, "x")
+    variables is out of date the day they add one. THE UNKNOWN VARIABLE is what
+    this test exists for, and it is the case a deny-list cannot cover.
+
+    The previous version rebuilt `_child_env`'s own predicate and applied it to
+    `_child_env`'s own output, so `unexpected` was empty by construction and the
+    assertion held for any content of `_ENV_ALLOWED` -- including
+    `ANTHROPIC_API_KEY`. It would have passed with the allow-list deleted.
+    """
     monkeypatch.setenv("SOME_VENDOR_VARIABLE_INVENTED_TOMORROW", "x")
-    unexpected = [
-        name
-        for name in claude_cli_module._child_env()
-        if name.upper() not in claude_cli_module._ENV_ALLOWED
-    ]
-    assert not unexpected, unexpected
+    recorder = fake_claude()
+    ClaudeCliProvider().run_stage(_request(workdir))
+    assert "SOME_VENDOR_VARIABLE_INVENTED_TOMORROW" not in recorder.env()
 
 
 def test_the_stage_runs_headless_and_asks_for_an_envelope(
@@ -1068,6 +1072,30 @@ def test_a_plugin_cannot_shadow_the_builtin_provider():
         registry_module.register(_Impostor())
     assert get_provider("claude-cli").name == "claude-cli"
     assert isinstance(get_provider("claude-cli"), ClaudeCliProvider)
+
+
+def test_two_plugins_cannot_share_a_name():
+    """The built-in half was closed and this half was not. Two plugins
+    declaring the same non-built-in name resolved silently -- the later
+    `register` replaced the earlier provider -- and entry-point iteration order
+    is not a stable contract, so WHICH provider ran every stage became
+    install-order dependent with nothing saying so."""
+
+    class _First:
+        name = "duplicate-name"
+
+        def run_stage(self, request):  # pragma: no cover - never reached
+            raise AssertionError("never called")
+
+    class _Second(_First):
+        pass
+
+    registry_module.register(_First())
+    try:
+        with pytest.raises(ProviderError, match="already registered"):
+            registry_module.register(_Second())
+    finally:
+        registry_module._REGISTRY.pop("duplicate-name", None)
 
 
 def test_a_plugin_load_failure_is_remembered_rather_than_degrading(monkeypatch):

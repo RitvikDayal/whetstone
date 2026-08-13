@@ -211,6 +211,37 @@ def test_a_scoped_deny_of_an_available_tool_is_still_an_overlap():
         )
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["available_tools", "auto_approve", "denied_tools"],
+)
+@pytest.mark.parametrize(
+    "spec", ["--dangerously-skip-permissions", "-p", "  --add-dir", ""]
+)
+def test_a_flag_shaped_tool_name_is_refused(field, spec):
+    """A tool name that looks like a flag IS a flag by the time it reaches the
+    argv. Proven before this guard existed:
+
+        PermissionSet(available_tools={"--dangerously-skip-permissions"})
+        _argv(...)  ->  ['--tools', '--dangerously-skip-permissions']
+
+    So the object whose entire job is constraining the invocation could inject
+    arbitrary options into it. Not reachable from today's profiles, which are
+    fixed literals -- and that is exactly the reasoning that made the original
+    `--allowedTools` mapping look fine, so it is closed at the boundary instead.
+    """
+    base = dict(
+        available_tools=frozenset({"Read"}),
+        auto_approve=frozenset({"Read"}),
+        denied_tools=frozenset({"Write"}),
+    )
+    base[field] = frozenset({spec}) | (
+        frozenset({"Read"}) if field != "denied_tools" else frozenset()
+    )
+    with pytest.raises(PolicyError):
+        _perms(**base)
+
+
 def test_a_tool_cannot_be_both_available_and_denied():
     """`auto_approve` is deliberately EMPTY here.
 

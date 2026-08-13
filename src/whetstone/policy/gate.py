@@ -71,6 +71,30 @@ class PermissionSet:
     write_root: Path | None
 
     def __post_init__(self) -> None:
+        # A tool name that looks like a flag IS a flag by the time it reaches
+        # the argv. `available_tools={"--dangerously-skip-permissions"}` is
+        # accepted by every other check here and lands immediately after
+        # `--tools` on the command line -- so the object whose entire job is
+        # constraining the invocation can inject arbitrary options into it.
+        #
+        # Not reachable from today's profiles, which are fixed literals. That is
+        # the same reasoning that made the original `--allowedTools` mapping
+        # look fine, so it is closed at the boundary rather than trusted to the
+        # constants.
+        for field_name in ("available_tools", "auto_approve", "denied_tools"):
+            for spec in getattr(self, field_name):
+                if not isinstance(spec, str) or not spec.strip():
+                    raise PolicyError(
+                        f"{field_name} contains {spec!r}, which is not a usable "
+                        f"tool name."
+                    )
+                if spec.lstrip().startswith("-"):
+                    raise PolicyError(
+                        f"{field_name} contains {spec!r}, which the CLI would "
+                        f"read as an option rather than a tool name. A "
+                        f"permission set may not inject flags into the command "
+                        f"line it exists to bound."
+                    )
         widened = {
             spec
             for spec in self.auto_approve

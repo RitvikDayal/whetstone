@@ -142,6 +142,12 @@ class StageResult:
                 "a successful StageResult must not carry an error -- a caller "
                 "checking ok would never see it"
             )
+        if self.ok and self.data is None:
+            raise ValueError(
+                "a successful StageResult must carry data -- a success with no "
+                "payload is a path that declined to do work and said nothing, "
+                "and the spine dereferences data whenever ok is true"
+            )
 
 
 @runtime_checkable
