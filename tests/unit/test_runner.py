@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 import whetstone.lenses.registry as registry_module
 from whetstone.config.model import LensConfig, ProjectConfig, WhetstoneConfig
@@ -10,6 +11,7 @@ from whetstone.lenses.base import (
     Candidate,
     Evidence,
     EvidenceKind,
+    LensRuntime,
     RunContext,
     Severity,
 )
@@ -985,8 +987,8 @@ class _NeedsConfig:
     def __init__(self, test_command: str | None = None):
         self.test_command = test_command
 
-    def configure(self, cfg) -> "_NeedsConfig":
-        return type(self)(cfg.environment.commands.test)
+    def configure(self, runtime) -> "_NeedsConfig":
+        return type(self)(runtime.test_command)
 
     def supports_tier(self, tier: str) -> bool:
         return True
@@ -1035,6 +1037,47 @@ def test_a_pack_declaring_configure_is_given_the_runs_config(tmp_path, monkeypat
     assert any("'pytest -q'" in skip for skip in result.skips), result.skips
 
 
+class _RecordsWhatItWasGiven:
+    name = "recordsconfig"
+    max_autonomy = 3
+    given: object = None
+
+    def configure(self, runtime):
+        type(self).given = runtime
+        return self
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        return
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
+def test_the_hook_is_handed_a_narrowed_record_and_not_the_config(tmp_path, monkeypatch):
+    """`WhetstoneConfig.state_dir` is a `SecretStr` the loader has ALREADY
+    resolved from `${env:...}`, so a pack handed the config object is one
+    `get_secret_value()` from a project's credential -- and a lens pack arrives
+    through an entry point. Asserted on the object the hook actually received,
+    because `_lens_runtime` being correct proves nothing if the runner still
+    passes `cfg`."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_RecordsWhatItWasGiven())
+    cfg = _cfg_with_test_command("pytest -q")
+    cfg = cfg.model_copy(update={"state_dir": SecretStr("s3cret-token-path")})
+    cfg.lenses["recordsconfig"] = LensConfig()
+    conn = connect(tmp_path)
+    execute_run(conn, cfg, tmp_path, tmp_path, tier="deep", changed_only=False)
+
+    given = _RecordsWhatItWasGiven.given
+    assert isinstance(given, LensRuntime)
+    assert not isinstance(given, WhetstoneConfig)
+    assert not hasattr(given, "state_dir")
+    assert "s3cret" not in repr(given)
+    # Narrowed, not emptied: the thing the hook exists for still arrives.
+    assert given.test_command == "pytest -q"
+
+
 def test_configuring_does_not_edit_the_registered_pack(tmp_path, monkeypatch):
     """The registry hands out one instance for the life of the process, so a
     hook that configured in place would leak one project's settings into the
@@ -1066,8 +1109,95 @@ def test_a_pack_that_cannot_be_configured_is_skipped_not_run(tmp_path, monkeypat
         tier="deep",
         changed_only=False,
     )
-    assert any("not installed" in skip for skip in result.skips), result.skips
+    # `could not be configured` is the configure branch's OWN wording. The
+    # raised message ends in "not installed", which is also how the runner
+    # reports a lens with no registered pack -- so matching that substring
+    # alone passes with the whole configure block deleted, and with
+    # `register()` never having taken effect. It named a behaviour it did not
+    # pin.
+    assert any(
+        "could not be configured" in skip and "not installed" in skip
+        for skip in result.skips
+    ), result.skips
     assert result.lens_count == 0
+
+
+class _ConfigureReturnsNone:
+    """The in-place spelling `configure` invites: it sets an attribute and
+    returns None, which is what every function without a `return` does."""
+
+    name = "configurenone"
+    max_autonomy = 3
+    test_command: str | None = None
+
+    def configure(self, runtime) -> None:
+        self.test_command = runtime.test_command
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure returned None must not run")
+        yield
+
+
+class _ConfigureReturnsRubbish:
+    name = "configurerubbish"
+    max_autonomy = 3
+
+    def configure(self, runtime) -> object:
+        return "a lens pack, honest"
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure returned a str must not run")
+        yield
+
+
+@pytest.mark.parametrize(
+    ("pack", "lens", "returned"),
+    [
+        (_ConfigureReturnsNone(), "configurenone", "NoneType"),
+        (_ConfigureReturnsRubbish(), "configurerubbish", "str"),
+    ],
+    ids=["none", "not-a-pack"],
+)
+def test_a_configure_hook_returning_a_non_pack_skips_that_lens_alone(
+    pack, lens, returned, tmp_path, monkeypatch
+):
+    """One third-party pack must not take the run with it.
+
+    The return value was assigned unchecked, so `configure` returning None put
+    None into `lens_scope_declaration` and raised `AttributeError` -- not a
+    `WhetstoneError`, so it escaped `execute_run` BEFORE the `runs` INSERT. No
+    run row, every other lens abandoned, and nothing anywhere saying why. The
+    honest pack registered alongside it is what proves the blast radius is one
+    lens rather than the run.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(pack)
+    register(_Stub())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(**{lens: {}, "stub": {}}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+    assert result.status == "complete"
+    assert any(
+        lens in skip and returned in skip and "NOT run" in skip
+        for skip in result.skips
+    ), result.skips
+    # The other lens ran to completion, which is the whole point of the skip.
+    assert result.new == 1
+    assert result.lens_count == 1
 
 
 def test_a_pack_without_configure_still_runs(tmp_path, monkeypatch):

@@ -396,6 +396,34 @@ class Candidate:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True)
+class LensRuntime:
+    """Everything a lens is allowed to know about the run's CONFIG.
+
+    Handed to `configure()`, which is the one hook a pack has for settings
+    `RunContext` deliberately does not carry. NOT `WhetstoneConfig` itself:
+    that object holds `state_dir` as a `SecretStr` the loader has already
+    resolved from `${env:...}`, so passing it gives any in-process entry-point
+    pack a `get_secret_value()` away from a project's credential -- for the sake
+    of a test command.
+
+    NOT A CONFINEMENT, and it would be dishonest to call it one. A lens pack is
+    arbitrary Python in this process and can read `os.environ` or reopen
+    `whetstone.yaml` for itself. What this is: the runner not HANDING over a
+    resolved secret, and a contract narrow enough to keep stable -- a pack
+    written against these four fields does not break when the config schema
+    moves underneath it.
+
+    Grows by adding a field here when a pack needs one, which is a deliberate
+    decision each time rather than the whole config arriving by default.
+    """
+
+    provider_name: str | None
+    test_command: str | None
+    ceiling_usd: float | None
+    calls_per_day: int | None
+
+
 @dataclass
 class RunContext:
     """Everything a lens is allowed to know about the run."""

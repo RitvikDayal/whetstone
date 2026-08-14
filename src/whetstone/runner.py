@@ -11,7 +11,13 @@ from pathlib import Path
 
 from .config.model import BoundariesConfig, LensConfig, WhetstoneConfig
 from .errors import WhetstoneError
-from .lenses.base import LensPack, LensScope, RunContext, lens_scope_declaration
+from .lenses.base import (
+    LensPack,
+    LensRuntime,
+    LensScope,
+    RunContext,
+    lens_scope_declaration,
+)
 from .lenses.registry import get_lens
 from .scope.resolver import resolve_files
 from .severity import severity_at_least
@@ -136,6 +142,21 @@ def _boundaries_are_narrowed(boundaries: BoundariesConfig) -> bool:
     return bool(boundaries.exclude) or boundaries.include != _DEFAULT_INCLUDE
 
 
+def _lens_runtime(cfg: WhetstoneConfig) -> LensRuntime:
+    """The narrowed record `configure()` receives instead of the whole config.
+
+    Built here rather than in `lenses/` because the runner is the only layer
+    that holds a `WhetstoneConfig`, and this is exactly the seam that keeps it
+    that way: `state_dir` never crosses it.
+    """
+    return LensRuntime(
+        provider_name=cfg.model.provider,
+        test_command=cfg.environment.commands.test,
+        ceiling_usd=cfg.budget.ceiling.usd_per_run,
+        calls_per_day=cfg.budget.ceiling.calls_per_day,
+    )
+
+
 def _nothing_ran_reason(cfg: WhetstoneConfig) -> str:
     """Why an empty plan happened, worded so it cannot be read as a clean bill.
 
@@ -226,6 +247,13 @@ def execute_run(
         # around the boundary that keeps a third-party pack out of a project's
         # resolved secrets.
         #
+        # A `LensRuntime` rather than `cfg`, which is that same sentence being
+        # true rather than merely written down: `WhetstoneConfig.state_dir` is
+        # a `SecretStr` the loader has already resolved, and handing the whole
+        # object over put `get_secret_value()` one attribute away from every
+        # in-process entry-point pack. See `LensRuntime` for what this does and
+        # does not claim to be.
+        #
         # Optional, and read with getattr for the reason `lens_scope` is not a
         # protocol member either: `runtime_checkable` isinstance() checks every
         # attribute, so requiring `configure` would make `register()` reject
@@ -239,13 +267,31 @@ def execute_run(
         configure = getattr(pack, "configure", None)
         if callable(configure):
             try:
-                pack = configure(cfg)
+                configured = configure(_lens_runtime(cfg))
             except WhetstoneError as exc:
                 skips.append(
                     f"{name}: could not be configured for this run ({exc}); "
                     "not run."
                 )
                 continue
+            # CHECKED, NOT TRUSTED. `configure` is an optional hook on code
+            # that arrives through an entry point, and the in-place spelling
+            # its name invites -- `self.test_command = ...` with no return --
+            # yields None. That would reach `lens_scope_declaration` as None
+            # and raise `AttributeError`, which is not a `WhetstoneError`, so
+            # it escapes `execute_run` BEFORE the `runs` row is inserted: no
+            # run to report against, every other lens abandoned, one
+            # third-party pack taking the whole run with it. A per-lens skip
+            # is the blast radius the rest of this loop already uses.
+            if not isinstance(configured, LensPack):
+                skips.append(
+                    f"{name}: its `configure` hook returned "
+                    f"{type(configured).__name__} rather than a lens pack, so "
+                    "this lens was NOT run. `configure` must return the "
+                    "configured copy of the pack."
+                )
+                continue
+            pack = configured
 
         scope, scope_reason = lens_scope_declaration(pack)
         if scope_reason is not None:

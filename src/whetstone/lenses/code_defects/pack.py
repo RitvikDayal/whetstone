@@ -42,14 +42,20 @@ from typing import TYPE_CHECKING, Any
 from ...budget import Budget, BudgetedProvider
 from ...errors import LensError, WhetstoneError
 from ...severity import Severity
-from ..base import Candidate, Evidence, EvidenceKind, LensScope, RunContext
+from ..base import (
+    Candidate,
+    Evidence,
+    EvidenceKind,
+    LensRuntime,
+    LensScope,
+    RunContext,
+)
 from .falsify import falsify
 from .grade import Grade, grade_finding
 from .hunt import hunt
 from .reproduce import reproduce
 
 if TYPE_CHECKING:  # pragma: no cover - import shape only
-    from ...config.model import WhetstoneConfig
     from ...provider.base import Provider
 
 # The tier that does not run this lens. Every other tier does, and the
@@ -112,21 +118,23 @@ class CodeDefectsPack:
         self.ceiling_usd = ceiling_usd
         self.calls_per_day = calls_per_day
 
-    def configure(self, cfg: WhetstoneConfig) -> CodeDefectsPack:
+    def configure(self, runtime: LensRuntime) -> CodeDefectsPack:
         """A copy of this pack carrying what the run's config decided.
 
         Called by the runner, which is the only layer holding the config.
         `RunContext` deliberately does not carry it -- a lens reading
         `whetstone.yaml` for itself would duplicate the loader and walk around
         the boundary that keeps a third-party pack from reading a project's
-        secrets.
+        secrets. `LensRuntime` rather than `WhetstoneConfig` for the same
+        reason: this pack needs four values, and the config object it used to
+        receive carries a resolved `state_dir` secret.
         """
         return type(self)(
             provider=self._provider,
-            provider_name=cfg.model.provider,
-            test_command=cfg.environment.commands.test,
-            ceiling_usd=cfg.budget.ceiling.usd_per_run,
-            calls_per_day=cfg.budget.ceiling.calls_per_day,
+            provider_name=runtime.provider_name,
+            test_command=runtime.test_command,
+            ceiling_usd=runtime.ceiling_usd,
+            calls_per_day=runtime.calls_per_day,
         )
 
     def supports_tier(self, tier: str) -> bool:
@@ -261,6 +269,7 @@ class CodeDefectsPack:
                 {
                     "reproduced": False,
                     "verdict": "not attempted",
+                    "executed": False,
                     "has_runnable_artifact": False,
                     "mutation": None,
                     "payload": None,
@@ -349,7 +358,13 @@ class CodeDefectsPack:
         if adjusted is not None:
             severity = adjusted
 
-        executed = reproduction["verdict"] in ("reproduced", "absent", "inconclusive")
+        # THE FACT `reproduce()` RECORDED, not a verdict word this file
+        # recognises. `inconclusive` means a container ran and settled nothing;
+        # deriving execution from it also caught every path that returned
+        # before one started, so a mutated, non-executable or empty artifact
+        # was filed as `EvidenceKind.repro` -- evidence of a run that never
+        # happened. That is the conflation Task 8 removed one layer out.
+        executed = bool(reproduction["executed"])
         data = {
             "grade": str(grade),
             "grade_reason": why,
@@ -366,6 +381,7 @@ class CodeDefectsPack:
             "hunt_provenance": candidate.get("provenance"),
             "reproduction": {
                 "verdict": reproduction["verdict"],
+                "executed": executed,
                 "reproduced": reproduction["reproduced"],
                 "has_runnable_artifact": reproduction["has_runnable_artifact"],
                 "provenance": reproduction.get("provenance"),

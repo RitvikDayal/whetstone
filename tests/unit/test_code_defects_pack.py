@@ -32,12 +32,20 @@ from whetstone.config.model import (
     ProjectConfig,
     WhetstoneConfig,
 )
-from whetstone.lenses.base import Candidate, LensPack, RunContext, Severity
+from whetstone.lenses.base import (
+    Candidate,
+    EvidenceKind,
+    LensPack,
+    LensRuntime,
+    RunContext,
+    Severity,
+)
 from whetstone.lenses.code_defects import pack as pack_module
 from whetstone.lenses.code_defects.grade import Grade
 from whetstone.lenses.code_defects.pack import CodeDefectsPack
 from whetstone.lenses.registry import get_lens
 from whetstone.provider.base import StageRequest, StageResult, Usage
+from whetstone.runner import _lens_runtime
 
 _MEASURED = Usage(
     input_tokens=4,
@@ -295,6 +303,20 @@ def test_no_runnable_artifact_caps_the_grade(ctx, monkeypatch):
     assert data["grade"] == Grade.B
 
 
+def test_a_falsifier_lowering_the_severity_moves_the_recorded_one(ctx, monkeypatch):
+    """The candidate is declared `high`. A falsifier that argued it down to
+    `low` and was ignored would file it at the discoverer's own severity, which
+    is the one number every filter and floor reads."""
+    _stub_reproduction(monkeypatch, verdict="reproduced", reproduced=True)
+    provider = _provider(falsified=[_falsify_payload(severity_adjustment="low")])
+    found = _run(_pack(provider), ctx)
+
+    assert found[0].severity is Severity.low
+    data = json.loads(found[0].evidence.to_json())["data"]
+    assert data["declared_severity"] == "high"
+    assert data["falsify"]["severity_adjustment"] == "low"
+
+
 def test_the_falsifier_killing_it_grades_d(ctx, monkeypatch):
     _stub_reproduction(monkeypatch, verdict="reproduced", reproduced=True)
     provider = _provider(falsified=[_falsify_payload(confirmed=False)])
@@ -459,6 +481,21 @@ def test_the_cost_record_survives_a_run_that_found_nothing(ctx):
     assert json.loads(record.read_text(encoding="utf-8"))["spent_usd"] > 0
 
 
+def test_a_stage_that_reported_no_cost_is_named_as_an_unmeasured_call(ctx):
+    """`cost_usd=None` is unknown, not free. A ceiling enforced against a total
+    known to be short and not said out loud is a bound the user believes in and
+    does not have."""
+    unmeasured = Usage(
+        input_tokens=4, cache_creation_input_tokens=41036, source="none"
+    )
+    provider = _FakeProvider(
+        hunt=[_ok({"findings": [], "notes": None}, usage=unmeasured)]
+    )
+    _run(_pack(provider), ctx)
+
+    assert any("reported no cost" in skip for skip in ctx.skips), ctx.skips
+
+
 def test_an_empty_hunt_reports_its_own_reason(ctx):
     provider = _FakeProvider(
         hunt=[_ok({"findings": [], "notes": "read app.py, nothing here"})]
@@ -484,6 +521,68 @@ def test_with_no_sandbox_the_evidence_is_never_executed_and_the_grade_shows_it(c
     assert any("sandbox" in skip.lower() for skip in ctx.skips), ctx.skips
 
 
+@pytest.mark.parametrize(
+    ("artifact", "why"),
+    [
+        ({"kind": "script", "content": "rm -rf /"}, "a kind Whetstone will not run"),
+        ({"kind": "pytest", "content": "   \n"}, "an empty artifact"),
+    ],
+    ids=["non-executable", "empty"],
+)
+def test_evidence_that_never_ran_is_not_filed_as_a_reproduction(artifact, why, ctx):
+    """`EvidenceKind.repro` is a claim that something WAS EXECUTED.
+
+    Both of these return from `reproduce()` before any container starts. Both
+    used to leave the verdict at its `inconclusive` default, and the pack read
+    execution out of that word -- so a finding whose evidence was refused, or
+    was blank, was recorded as reproduction evidence. `inconclusive` means a
+    container ran and settled nothing, which is a different state from one that
+    never ran, and only the recorded fact separates them.
+    """
+    provider = _provider(repro=_repro_payload(artifact=artifact))
+    found = _run(_pack(provider), ctx)
+
+    assert len(found) == 1, why
+    assert found[0].evidence.kind is EvidenceKind.critique
+    data = json.loads(found[0].evidence.to_json())["data"]
+    assert data["reproduction"]["executed"] is False
+    assert data["reproduction"]["verdict"] == "not executed"
+
+
+def test_the_pack_reads_the_execution_fact_over_a_verdict_that_disagrees(
+    ctx, monkeypatch
+):
+    """The contract, pinned where a word and a fact can be made to disagree.
+
+    `reproduce()` no longer emits `inconclusive` without a container, so the
+    two agree on every path it produces -- which means the paired test above
+    passes whether the pack reads the fact or re-derives it from the word, and
+    would go on passing if the derivation came back. Only a disagreeing pair
+    can tell them apart, and the fact has to win.
+    """
+    _stub_reproduction(
+        monkeypatch, verdict="inconclusive", reproduced=False, executed=False
+    )
+    found = _run(_pack(_provider()), ctx)
+
+    assert found[0].evidence.kind is EvidenceKind.critique
+    assert json.loads(found[0].evidence.to_json())["data"]["reproduction"][
+        "executed"
+    ] is False
+
+
+def test_a_reproduction_that_did_run_is_filed_as_one(ctx, monkeypatch):
+    """The population guard for the two above. Without it, a pack that filed
+    EVERYTHING as a critique would satisfy both of them."""
+    _stub_reproduction(
+        monkeypatch, verdict="reproduced", reproduced=True, executed=True
+    )
+    found = _run(_pack(_provider()), ctx)
+
+    assert found[0].evidence.kind is EvidenceKind.repro
+    assert json.loads(found[0].evidence.to_json())["data"]["reproduction"]["executed"]
+
+
 def test_without_a_declared_test_command_nothing_is_reproduced(ctx):
     """No `environment.commands.test` means there is nothing to execute the
     artifact with, so the reproduce stage is not paid for at all."""
@@ -499,6 +598,10 @@ def test_without_a_declared_test_command_nothing_is_reproduced(ctx):
     # claiming a runnable artifact nobody could run would grade identically.
     assert data["reproduction"]["has_runnable_artifact"] is False
     assert data["reproduction"]["verdict"] == "not attempted"
+    # And it is not filed as reproduction evidence: nothing was executed, so
+    # `EvidenceKind.repro` would be a claim about a run that never happened.
+    assert data["reproduction"]["executed"] is False
+    assert found[0].evidence.kind is EvidenceKind.critique
     assert any("commands.test" in skip for skip in ctx.skips), ctx.skips
 
 
@@ -528,14 +631,19 @@ def test_a_refused_hunt_stage_reports_its_reason_to_the_user(ctx):
 # --- configuration --------------------------------------------------------------
 
 
-def test_configure_takes_what_it_needs_from_the_config():
-    cfg = WhetstoneConfig(
-        project=ProjectConfig(name="p"),
-        environment=EnvironmentConfig(commands=CommandsConfig(test="pytest -q")),
-        model=ModelConfig(provider="claude-cli"),
-        budget=BudgetConfig(ceiling=CeilingConfig(usd_per_run=2.5, calls_per_day=7)),
+def _runtime(**overrides) -> LensRuntime:
+    base = dict(
+        provider_name="claude-cli",
+        test_command="pytest -q",
+        ceiling_usd=2.5,
+        calls_per_day=7,
     )
-    configured = CodeDefectsPack().configure(cfg)
+    base.update(overrides)
+    return LensRuntime(**base)
+
+
+def test_configure_takes_what_it_needs_from_the_runtime_record():
+    configured = CodeDefectsPack().configure(_runtime())
 
     assert configured is not None
     assert configured.test_command == "pytest -q"
@@ -544,15 +652,43 @@ def test_configure_takes_what_it_needs_from_the_config():
     assert configured.provider_name == "claude-cli"
 
 
+def test_the_runtime_record_the_runner_builds_carries_no_state_dir():
+    """The narrowing, asserted where it is decided rather than described.
+
+    `WhetstoneConfig.state_dir` is a `SecretStr` the loader has already
+    resolved from `${env:...}`, so a pack handed the config object is one
+    `get_secret_value()` from a project's credential -- for the sake of a test
+    command. `_lens_runtime` is the seam that stops it crossing.
+    """
+    cfg = WhetstoneConfig(
+        project=ProjectConfig(name="p"),
+        environment=EnvironmentConfig(commands=CommandsConfig(test="pytest -q")),
+        model=ModelConfig(provider="claude-cli"),
+        budget=BudgetConfig(ceiling=CeilingConfig(usd_per_run=2.5, calls_per_day=7)),
+        state_dir="s3cret-token-path",
+    )
+    runtime = _lens_runtime(cfg)
+
+    assert not hasattr(runtime, "state_dir")
+    assert "s3cret" not in repr(runtime)
+    assert vars(runtime) == {
+        "provider_name": "claude-cli",
+        "test_command": "pytest -q",
+        "ceiling_usd": 2.5,
+        "calls_per_day": 7,
+    }
+    # The pack still gets everything it needs from the narrowed record, so this
+    # is a narrowing rather than a removal.
+    configured = CodeDefectsPack().configure(runtime)
+    assert configured.test_command == "pytest -q"
+    assert configured.ceiling_usd == 2.5
+
+
 def test_configure_returns_a_new_pack_rather_than_editing_the_registered_one():
     """The registry hands out one instance for the life of the process, so
     configuring in place would leak one project's test command into the next."""
     registered = CodeDefectsPack()
-    cfg = WhetstoneConfig(
-        project=ProjectConfig(name="p"),
-        environment=EnvironmentConfig(commands=CommandsConfig(test="pytest -q")),
-    )
-    configured = registered.configure(cfg)
+    configured = registered.configure(_runtime())
 
     assert configured is not registered
     assert registered.test_command is None
@@ -574,6 +710,7 @@ def _stub_reproduction(
     verdict: str,
     reproduced: bool,
     runnable: bool = True,
+    executed: bool = True,
     payload: dict | None = None,
 ):
     """Replace the reproduce stage with a fixed outcome.
@@ -589,6 +726,7 @@ def _stub_reproduction(
             {
                 "reproduced": reproduced,
                 "verdict": verdict,
+                "executed": executed,
                 "has_runnable_artifact": runnable,
                 "mutation": None,
                 "payload": payload or _repro_payload(),
@@ -611,7 +749,16 @@ def test_the_budget_is_not_shared_between_runs(ctx, monkeypatch):
     assert len(_run(pack, ctx)) == 1, "the second run started with a fresh budget"
 
 
-def test_a_budget_object_is_not_kept_on_the_pack():
-    assert not any(
-        isinstance(value, Budget) for value in vars(CodeDefectsPack()).values()
-    )
+def test_a_budget_object_is_not_kept_on_the_pack(ctx, monkeypatch):
+    """INSPECTED AFTER A RUN, which is the only version of this that can fail.
+
+    A freshly constructed pack holds no `Budget` whatever `_collect` does with
+    one, so checking an unrun instance passes against the leak this names: an
+    added `self._budget = budget` inside `_collect` would keep it green and the
+    per-run isolation would be gone.
+    """
+    _stub_reproduction(monkeypatch, verdict="reproduced", reproduced=True)
+    pack = _pack(_provider())
+    _run(pack, ctx)
+
+    assert not any(isinstance(value, Budget) for value in vars(pack).values())
