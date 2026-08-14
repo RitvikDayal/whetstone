@@ -142,6 +142,36 @@ def _boundaries_are_narrowed(boundaries: BoundariesConfig) -> bool:
     return bool(boundaries.exclude) or boundaries.include != _DEFAULT_INCLUDE
 
 
+def _rendered(exc: BaseException) -> str:
+    """*exc*'s message, or why it has none. Never raises.
+
+    `str(exc)` RUNS A THIRD-PARTY `__str__` -- an ordinary override, and the
+    one thing a pack is invited to define about its own exception. It can
+    raise, and a `__str__` returning a non-str makes `str()` itself raise
+    `TypeError`. Either lands inside the `except` block that exists to stop a
+    pack ending the run, where there is no handler left above it and no `runs`
+    row yet: the renderer of the safety message becomes the unsafe thing.
+
+    HOW FAR THIS GOES, AND WHERE IT STOPS. There is no second attempt at the
+    message: `repr()` is not a safer fallback, because `__repr__` is equally a
+    pack's to override, so a failure yields a fixed sentence instead. The TYPE
+    NAME is read by the callers rather than here, as `type(exc).__name__` --
+    `type()` returns the real type object, so a `__class__` property cannot lie
+    about it, and `__name__` on a class runs no pack code. Making THAT raise
+    needs a custom metaclass on an exception class, and a pack prepared to go
+    that far could equally just hang in `configure`, which no amount of
+    rendering care would survive. The line is what a pack is invited to
+    define, not what it can subvert with a metaclass.
+    """
+    try:
+        text = str(exc)
+    except Exception:  # noqa: BLE001 - rendering a reason must not end the run
+        return "its message could not be rendered"
+    # Stripped, so a whitespace-only message is the same empty parenthetical
+    # that `str(exc) or ...` was fixed to prevent, by a slower route.
+    return text.strip() or "no message"
+
+
 def _lens_runtime(cfg: WhetstoneConfig) -> LensRuntime:
     """The narrowed record `configure()` receives instead of the whole config.
 
@@ -273,9 +303,12 @@ def execute_run(
             try:
                 configured = configure(runtime)
             except WhetstoneError as exc:
+                # `_rendered` here too. `LensError` is importable, so a pack
+                # may subclass it and override `__str__`; being Whetstone's own
+                # base class does not make the INSTANCE ours.
                 skips.append(
-                    f"{name}: could not be configured for this run ({exc}); "
-                    "not run."
+                    f"{name}: could not be configured for this run "
+                    f"({_rendered(exc)}); not run."
                 )
                 continue
             except Exception as exc:  # noqa: BLE001 - a pack must not end the run
@@ -298,15 +331,15 @@ def execute_run(
                 # `Exception`, not `BaseException`: a Ctrl-C or a SystemExit
                 # during configuration is the user or the process ending the
                 # run, and turning either into a skip would swallow it.
-                # `str(exc)`, NOT `exc`. An exception instance is always truthy
-                # -- `BaseException` defines neither `__bool__` nor `__len__` --
-                # so `exc or ...` never reaches the fallback, and a bare
-                # `raise ValueError` rendered as `raised ValueError ()`. An
-                # empty parenthetical in the one message whose whole job is
-                # saying why a lens did not run.
+                # `_rendered(exc)`, NOT `exc` and not `str(exc)`. An exception
+                # instance is always truthy -- `BaseException` defines neither
+                # `__bool__` nor `__len__` -- so `exc or ...` never reached its
+                # fallback and a bare `raise ValueError` rendered as `raised
+                # ValueError ()`. And `str(exc)` runs the pack's own `__str__`,
+                # which can raise from inside this handler. See `_rendered`.
                 skips.append(
                     f"{name}: its `configure` hook raised "
-                    f"{type(exc).__name__} ({str(exc) or 'no message'}), which "
+                    f"{type(exc).__name__} ({_rendered(exc)}), which "
                     "is not a Whetstone error. This lens was NOT run; the rest "
                     "of the run continued."
                 )

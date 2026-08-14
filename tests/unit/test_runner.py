@@ -1205,6 +1205,147 @@ class _ConfigureRaisesWithAMessage:
         yield
 
 
+class _ConfigureRaisesWhitespace:
+    name = "configureboom8"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise ValueError("   \n ")
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    run = _NeedsConfig.run
+
+
+class _UnrenderableError(Exception):
+    """`__str__` is an ordinary override, so a pack may define one that raises.
+
+    Not a hypothetical shape: an exception whose message is built lazily from
+    state the failure destroyed does this by accident.
+    """
+
+    def __str__(self):
+        raise RuntimeError("and rendering the message fails too")
+
+
+class _NonStringError(Exception):
+    """`__str__` returning a non-str. `str()` itself raises `TypeError` for
+    this -- `__str__ returned non-string` -- so it reaches the caller as a
+    second exception rather than as a bad value."""
+
+    def __str__(self):
+        return 42  # type: ignore[return-value]
+
+
+class _ConfigureRaisesUnrenderable:
+    name = "configureboom5"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise _UnrenderableError
+
+
+class _ConfigureRaisesNonString:
+    name = "configureboom6"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise _NonStringError
+
+
+for _unrenderable in (_ConfigureRaisesUnrenderable, _ConfigureRaisesNonString):
+    _unrenderable.supports_tier = lambda self, tier: True  # type: ignore[method-assign]
+    _unrenderable.run = _NeedsConfig.run  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize(
+    ("pack", "lens"),
+    [
+        (_ConfigureRaisesUnrenderable(), "configureboom5"),
+        (_ConfigureRaisesNonString(), "configureboom6"),
+    ],
+    ids=["str-raises", "str-returns-non-string"],
+)
+def test_an_exception_that_cannot_be_rendered_still_skips_only_its_own_lens(
+    pack, lens, tmp_path, monkeypatch
+):
+    """The handler's own renderer must not become the unsafe thing.
+
+    `str(exc)` executes a third-party `__str__`. If that raises -- or returns a
+    non-str, which makes `str()` itself raise `TypeError` -- the secondary
+    exception escapes from inside the very `except` block added to stop a pack
+    ending the run, and it escapes before the `runs` INSERT. Same failure, one
+    level in, and with no handler left above it.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(pack)
+    register(_Stub())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(**{lens: {}, "stub": {}}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+    assert result.status == "complete"
+    skip = next(s for s in result.skips if s.startswith(f"{lens}:"))
+    # The type name still travels: `type(exc)` is the real type object, so a
+    # `__class__` property cannot lie about it, and reading `__name__` off a
+    # class does not run pack code.
+    assert "its message could not be rendered" in skip, skip
+    assert "()" not in skip, skip
+    assert "NOT run" in skip, skip
+    assert result.new == 1
+    assert result.lens_count == 1
+
+
+def test_an_unrenderable_whetstone_error_is_survivable_too(tmp_path, monkeypatch):
+    """The named branch renders an exception too, and `LensError` is importable
+    -- so a pack may subclass it and override `__str__`. Being Whetstone's own
+    base class does not make the instance ours."""
+
+    class _UnrenderableLensError(LensError):
+        def __str__(self):
+            raise RuntimeError("nor this one")
+
+    class _Pack:
+        name = "configureboom7"
+        max_autonomy = 3
+
+        def configure(self, runtime):
+            raise _UnrenderableLensError
+
+        def supports_tier(self, tier: str) -> bool:
+            return True
+
+        run = _NeedsConfig.run
+
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Pack())
+    register(_Stub())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(configureboom7={}, stub={}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+    assert result.status == "complete"
+    skip = next(s for s in result.skips if s.startswith("configureboom7:"))
+    assert "could not be configured" in skip, skip
+    assert "its message could not be rendered" in skip, skip
+    assert result.new == 1
+
+
 @pytest.mark.parametrize(
     ("pack", "lens", "expected"),
     [
@@ -1223,8 +1364,22 @@ class _ConfigureRaisesWithAMessage:
             "list is empty), which is not a Whetstone error. This lens was NOT "
             "run; the rest of the run continued.",
         ),
+        (
+            # A whitespace-only message is the same empty parenthetical by a
+            # slower route, so `_rendered` strips before deciding.
+            _ConfigureRaisesWhitespace(),
+            "configureboom8",
+            "configureboom8: its `configure` hook raised ValueError (no "
+            "message), which is not a Whetstone error. This lens was NOT run; "
+            "the rest of the run continued.",
+        ),
     ],
-    ids=["attribute-error", "bare-value-error", "value-error-with-message"],
+    ids=[
+        "attribute-error",
+        "bare-value-error",
+        "value-error-with-message",
+        "whitespace-only-message",
+    ],
 )
 def test_a_configure_hook_raising_a_non_whetstone_error_skips_that_lens_alone(
     pack, lens, expected, tmp_path, monkeypatch
