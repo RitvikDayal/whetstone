@@ -1260,15 +1260,15 @@ for _unrenderable in (_ConfigureRaisesUnrenderable, _ConfigureRaisesNonString):
 
 
 @pytest.mark.parametrize(
-    ("pack", "lens"),
+    ("pack", "lens", "exc_name"),
     [
-        (_ConfigureRaisesUnrenderable(), "configureboom5"),
-        (_ConfigureRaisesNonString(), "configureboom6"),
+        (_ConfigureRaisesUnrenderable(), "configureboom5", "_UnrenderableError"),
+        (_ConfigureRaisesNonString(), "configureboom6", "_NonStringError"),
     ],
     ids=["str-raises", "str-returns-non-string"],
 )
 def test_an_exception_that_cannot_be_rendered_still_skips_only_its_own_lens(
-    pack, lens, tmp_path, monkeypatch
+    pack, lens, exc_name, tmp_path, monkeypatch
 ):
     """The handler's own renderer must not become the unsafe thing.
 
@@ -1294,10 +1294,15 @@ def test_an_exception_that_cannot_be_rendered_still_skips_only_its_own_lens(
 
     assert result.status == "complete"
     skip = next(s for s in result.skips if s.startswith(f"{lens}:"))
-    # The type name still travels: `type(exc)` is the real type object, so a
-    # `__class__` property cannot lie about it, and reading `__name__` off a
-    # class does not run pack code.
     assert "its message could not be rendered" in skip, skip
+    # THE TYPE NAME, ASSERTED RATHER THAN DESCRIBED. `_rendered` keeps
+    # `type(exc).__name__` outside its guard on the grounds that `type()`
+    # returns the real type object -- a `__class__` property cannot lie about
+    # it -- and that reading `__name__` off a class runs no pack code. That is
+    # the whole reason an unrenderable exception still tells the user WHAT
+    # failed, and a rendering that dropped the name for the fixed sentence
+    # alone would satisfy every other assertion here.
+    assert exc_name in skip, skip
     assert "()" not in skip, skip
     assert "NOT run" in skip, skip
     assert result.new == 1
