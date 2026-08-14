@@ -966,3 +966,117 @@ def test_a_clean_model_shaped_candidate_still_runs(tmp_path, monkeypatch):
     assert result.status == "complete"
     assert result.new == 1
     assert [f.subject for f in list_findings(connect(tmp_path))] == ["src/ok.py"]
+
+
+# --- the configure hook ---------------------------------------------------------
+#
+# A lens needing the run's config -- the declared test command, the cost ceiling
+# -- gets it from the runner and nowhere else. RunContext deliberately does not
+# carry the config, so without this hook a model-driven pack would have to
+# re-load whetstone.yaml for itself.
+
+
+class _NeedsConfig:
+    """Returns a CONFIGURED COPY, the way the code-defects pack does."""
+
+    name = "needsconfig"
+    max_autonomy = 3
+
+    def __init__(self, test_command: str | None = None):
+        self.test_command = test_command
+
+    def configure(self, cfg) -> "_NeedsConfig":
+        return type(self)(cfg.environment.commands.test)
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        ctx.skip(f"needsconfig: test command is {self.test_command!r}")
+        return
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
+class _ConfigureRaises:
+    name = "configureboom"
+    max_autonomy = 3
+
+    def configure(self, cfg):
+        raise LensError("the provider it needs is not installed")
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack that could not be configured must not run")
+        yield
+
+
+def _cfg_with_test_command(command: str) -> WhetstoneConfig:
+    return WhetstoneConfig(
+        project=ProjectConfig(name="demo"),
+        environment={"commands": {"test": command}},
+        lenses={"needsconfig": LensConfig()},
+    )
+
+
+def test_a_pack_declaring_configure_is_given_the_runs_config(tmp_path, monkeypatch):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_NeedsConfig())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn,
+        _cfg_with_test_command("pytest -q"),
+        tmp_path,
+        tmp_path,
+        tier="deep",
+        changed_only=False,
+    )
+    assert any("'pytest -q'" in skip for skip in result.skips), result.skips
+
+
+def test_configuring_does_not_edit_the_registered_pack(tmp_path, monkeypatch):
+    """The registry hands out one instance for the life of the process, so a
+    hook that configured in place would leak one project's settings into the
+    next run."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    registered = _NeedsConfig()
+    register(registered)
+    conn = connect(tmp_path)
+    execute_run(
+        conn,
+        _cfg_with_test_command("pytest -q"),
+        tmp_path,
+        tmp_path,
+        tier="deep",
+        changed_only=False,
+    )
+    assert registered.test_command is None
+
+
+def test_a_pack_that_cannot_be_configured_is_skipped_not_run(tmp_path, monkeypatch):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_ConfigureRaises())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn,
+        _cfg(configureboom={}),
+        tmp_path,
+        tmp_path,
+        tier="deep",
+        changed_only=False,
+    )
+    assert any("not installed" in skip for skip in result.skips), result.skips
+    assert result.lens_count == 0
+
+
+def test_a_pack_without_configure_still_runs(tmp_path, monkeypatch):
+    """The population guard: the hook is optional, and a pack written before it
+    existed -- including every installed third-party one -- must be untouched."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert result.new == 1

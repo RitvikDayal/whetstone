@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .config.model import BoundariesConfig, LensConfig, WhetstoneConfig
+from .errors import WhetstoneError
 from .lenses.base import LensPack, LensScope, RunContext, lens_scope_declaration
 from .lenses.registry import get_lens
 from .scope.resolver import resolve_files
@@ -216,6 +217,35 @@ def execute_run(
                 "Use a higher tier to include it."
             )
             continue
+
+        # A pack that needs the run's config gets it here and NOWHERE else.
+        # `RunContext` is deliberately "everything a lens is allowed to know"
+        # and does not carry the config, so a lens needing the declared test
+        # command or the cost ceiling would otherwise have to re-load
+        # whetstone.yaml for itself -- duplicating the loader and walking
+        # around the boundary that keeps a third-party pack out of a project's
+        # resolved secrets.
+        #
+        # Optional, and read with getattr for the reason `lens_scope` is not a
+        # protocol member either: `runtime_checkable` isinstance() checks every
+        # attribute, so requiring `configure` would make `register()` reject
+        # every pack written before this existed, including installed
+        # third-party ones.
+        #
+        # The RETURN VALUE is used rather than mutating in place, because the
+        # registry hands out one instance for the life of the process and
+        # configuring that object would leak one project's settings into the
+        # next run in the same process.
+        configure = getattr(pack, "configure", None)
+        if callable(configure):
+            try:
+                pack = configure(cfg)
+            except WhetstoneError as exc:
+                skips.append(
+                    f"{name}: could not be configured for this run ({exc}); "
+                    "not run."
+                )
+                continue
 
         scope, scope_reason = lens_scope_declaration(pack)
         if scope_reason is not None:
