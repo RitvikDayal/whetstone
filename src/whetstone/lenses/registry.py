@@ -52,9 +52,16 @@ def available_lenses() -> list[str]:
 
 
 def _register_builtins() -> None:
+    from .code_defects.pack import CodeDefectsPack
     from .hygiene.pack import HygienePack
 
     register(HygienePack())
+    # Registered UNCONFIGURED. It resolves its provider and its test command
+    # from the run's config through `configure()`, which the runner calls; a
+    # pack constructed here can hold nothing project-specific because the
+    # registry is process-wide and one project's settings must not reach
+    # another's run.
+    register(CodeDefectsPack())
 
 
 _register_builtins()
