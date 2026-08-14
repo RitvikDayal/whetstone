@@ -1190,24 +1190,58 @@ class _ConfigureRaisesBareValueError:
         yield
 
 
+class _ConfigureRaisesWithAMessage:
+    name = "configureboom4"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise ValueError("the angle list is empty")
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure raised must not run")
+        yield
+
+
 @pytest.mark.parametrize(
-    ("pack", "lens", "raised"),
+    ("pack", "lens", "expected"),
     [
-        (_ConfigureExplodes(), "configureboom2", "AttributeError"),
-        (_ConfigureRaisesBareValueError(), "configureboom3", "ValueError"),
+        (_ConfigureExplodes(), "configureboom2", None),
+        (
+            _ConfigureRaisesBareValueError(),
+            "configureboom3",
+            "configureboom3: its `configure` hook raised ValueError (no message), "
+            "which is not a Whetstone error. This lens was NOT run; the rest of "
+            "the run continued.",
+        ),
+        (
+            _ConfigureRaisesWithAMessage(),
+            "configureboom4",
+            "configureboom4: its `configure` hook raised ValueError (the angle "
+            "list is empty), which is not a Whetstone error. This lens was NOT "
+            "run; the rest of the run continued.",
+        ),
     ],
-    ids=["attribute-error", "bare-value-error"],
+    ids=["attribute-error", "bare-value-error", "value-error-with-message"],
 )
 def test_a_configure_hook_raising_a_non_whetstone_error_skips_that_lens_alone(
-    pack, lens, raised, tmp_path, monkeypatch
+    pack, lens, expected, tmp_path, monkeypatch
 ):
     """The adjacent half of the return-value check, and the same blast radius.
 
     Only `WhetstoneError` was caught, so anything else a third-party hook
     raised escaped `execute_run` BEFORE the `runs` INSERT: no run row, every
-    other lens abandoned, nothing naming the pack. The bare `ValueError` case
-    is not padding -- `f"({exc})"` renders empty for it, so a message that
-    names only the exception text would say nothing at all.
+    other lens abandoned, nothing naming the pack.
+
+    THE RENDERED MESSAGE IS ASSERTED, not the exception type it contains. An
+    exception instance is ALWAYS truthy -- `BaseException` defines neither
+    `__bool__` nor `__len__` -- so `exc or 'no message'` could never fire and a
+    bare `ValueError` rendered as `raised ValueError ()`. A test naming only
+    the type is green against that, which is how it shipped. An empty
+    parenthetical is exactly the moment a user most needs the text, in the one
+    message whose whole job is saying why a lens did not run.
     """
     monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
     register(pack)
@@ -1224,10 +1258,16 @@ def test_a_configure_hook_raising_a_non_whetstone_error_skips_that_lens_alone(
     )
 
     assert result.status == "complete"
-    assert any(
-        lens in skip and raised in skip and "NOT run" in skip
-        for skip in result.skips
-    ), result.skips
+    skip = next(s for s in result.skips if s.startswith(f"{lens}:"))
+    assert "()" not in skip, skip
+    if expected is None:
+        # CPython owns this wording, so the type and a non-empty body are what
+        # can be asserted -- and the `()` check above is what makes the body
+        # non-empty rather than merely present.
+        assert "raised AttributeError (" in skip, skip
+        assert "NOT run" in skip, skip
+    else:
+        assert skip == expected
     assert result.new == 1
     assert result.lens_count == 1
 

@@ -298,11 +298,17 @@ def execute_run(
                 # `Exception`, not `BaseException`: a Ctrl-C or a SystemExit
                 # during configuration is the user or the process ending the
                 # run, and turning either into a skip would swallow it.
+                # `str(exc)`, NOT `exc`. An exception instance is always truthy
+                # -- `BaseException` defines neither `__bool__` nor `__len__` --
+                # so `exc or ...` never reaches the fallback, and a bare
+                # `raise ValueError` rendered as `raised ValueError ()`. An
+                # empty parenthetical in the one message whose whole job is
+                # saying why a lens did not run.
                 skips.append(
                     f"{name}: its `configure` hook raised "
-                    f"{type(exc).__name__} ({exc or 'no message'}), which is not "
-                    "a Whetstone error. This lens was NOT run; the rest of the "
-                    "run continued."
+                    f"{type(exc).__name__} ({str(exc) or 'no message'}), which "
+                    "is not a Whetstone error. This lens was NOT run; the rest "
+                    "of the run continued."
                 )
                 continue
             # CHECKED, NOT TRUSTED. `configure` is an optional hook on code
