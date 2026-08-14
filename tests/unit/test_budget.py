@@ -151,6 +151,17 @@ def test_the_call_ceiling_stops_it_too():
     assert "call" in budget.reason()
 
 
+def test_a_zero_call_ceiling_is_a_ceiling_not_an_absent_one():
+    """The same trap as `usd_per_run: 0`, one field over and untested until
+    now: `if self.ceiling_calls` reads a declared limit of nothing as no limit
+    at all, which is the exact opposite of what it says."""
+    budget = Budget(ceiling_calls=0)
+
+    assert budget.exhausted() is True
+    assert budget.remaining_calls() == 0
+    assert "call" in budget.reason()
+
+
 def test_the_reason_names_the_spend_and_the_ceiling():
     budget = Budget(ceiling_usd=0.15)
     budget.spend(_MEASURED)
@@ -218,6 +229,39 @@ def test_the_wrapper_passes_the_request_through_and_records_what_it_cost():
     assert result.ok is True
     assert inner.calls == 1
     assert budget.spent_usd == pytest.approx(0.0921)
+    assert budget.ledger[0].stage == "hunt"
+
+
+def test_a_failed_stage_is_still_charged():
+    """The tokens were billed before the stage decided it had failed.
+
+    `run_stage` spends on every result the inner provider returns, and no test
+    asserted that. A regression guarding the `spend` call with `if result.ok`
+    would keep every other test in this file green, and a run of failures --
+    each burning the 41,036 cache-creation tokens the fixture carries -- would
+    spend without limit and record itself as free. That under-count is what
+    this module exists to prevent.
+    """
+
+    class _FailingProvider:
+        name = "fake"
+
+        def run_stage(self, request: StageRequest) -> StageResult:
+            return StageResult(
+                ok=False,
+                data=None,
+                raw="",
+                usage=_MEASURED,
+                error="the model gave up",
+            )
+
+    budget = Budget(ceiling_usd=1.0)
+    result = BudgetedProvider(_FailingProvider(), budget).run_stage(_request())
+
+    assert result.ok is False
+    assert budget.calls == 1
+    assert budget.spent_usd == pytest.approx(0.0921)
+    assert budget.tokens == 42060
     assert budget.ledger[0].stage == "hunt"
 
 
