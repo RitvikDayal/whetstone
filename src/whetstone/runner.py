@@ -219,6 +219,10 @@ def execute_run(
     # about it. Keyed by lens name, which config guarantees is unique.
     scopes: dict[str, LensScope] = {}
     skips: list[str] = []
+    # Built ONCE, and outside the try below. It is loop-invariant, and keeping
+    # it out of the `except` means a defect in Whetstone's own narrowing cannot
+    # be absorbed into a per-lens skip and reported as a misbehaving pack.
+    runtime = _lens_runtime(cfg)
     for name, lens_cfg in cfg.lenses.items():
         if not lens_cfg.enabled:
             skips.append(f"{name}: disabled in config; not run.")
@@ -267,11 +271,38 @@ def execute_run(
         configure = getattr(pack, "configure", None)
         if callable(configure):
             try:
-                configured = configure(_lens_runtime(cfg))
+                configured = configure(runtime)
             except WhetstoneError as exc:
                 skips.append(
                     f"{name}: could not be configured for this run ({exc}); "
                     "not run."
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 - a pack must not end the run
+                # THE SAME BLAST RADIUS AS THE RETURN-VALUE CHECK BELOW, and
+                # for the same reason. `configure` is third-party code reached
+                # through an entry point, and anything it raises that is not a
+                # `WhetstoneError` -- an `AttributeError` on a `LensRuntime`
+                # field it expected to be a config, a `KeyError`, a `TypeError`
+                # -- escapes `execute_run` before the `runs` INSERT: no run row,
+                # every other lens abandoned, and nothing anywhere saying which
+                # pack did it.
+                #
+                # DELIBERATELY NOT THE SHAPE `registry._load_plugins` USES,
+                # which re-raises. That failure is a plugin that could not LOAD,
+                # which silently shrinks the registry for every lens and every
+                # future call; this one is scoped to a lens that exists, is
+                # named in the skip, and whose absence is visible in
+                # `lens_count`. Loud and fatal there, loud and contained here.
+                #
+                # `Exception`, not `BaseException`: a Ctrl-C or a SystemExit
+                # during configuration is the user or the process ending the
+                # run, and turning either into a skip would swallow it.
+                skips.append(
+                    f"{name}: its `configure` hook raised "
+                    f"{type(exc).__name__} ({exc or 'no message'}), which is not "
+                    "a Whetstone error. This lens was NOT run; the rest of the "
+                    "run continued."
                 )
                 continue
             # CHECKED, NOT TRUSTED. `configure` is an optional hook on code

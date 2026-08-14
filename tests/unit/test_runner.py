@@ -1156,6 +1156,133 @@ class _ConfigureReturnsRubbish:
         yield
 
 
+class _ConfigureExplodes:
+    """A pack written against the old `configure(cfg)` contract, which is the
+    ordinary way this happens: it reaches for a config attribute that a
+    `LensRuntime` does not have and raises `AttributeError`."""
+
+    name = "configureboom2"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        return type(self)(runtime.environment.commands.test)
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure raised must not run")
+        yield
+
+
+class _ConfigureRaisesBareValueError:
+    name = "configureboom3"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise ValueError
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure raised must not run")
+        yield
+
+
+@pytest.mark.parametrize(
+    ("pack", "lens", "raised"),
+    [
+        (_ConfigureExplodes(), "configureboom2", "AttributeError"),
+        (_ConfigureRaisesBareValueError(), "configureboom3", "ValueError"),
+    ],
+    ids=["attribute-error", "bare-value-error"],
+)
+def test_a_configure_hook_raising_a_non_whetstone_error_skips_that_lens_alone(
+    pack, lens, raised, tmp_path, monkeypatch
+):
+    """The adjacent half of the return-value check, and the same blast radius.
+
+    Only `WhetstoneError` was caught, so anything else a third-party hook
+    raised escaped `execute_run` BEFORE the `runs` INSERT: no run row, every
+    other lens abandoned, nothing naming the pack. The bare `ValueError` case
+    is not padding -- `f"({exc})"` renders empty for it, so a message that
+    names only the exception text would say nothing at all.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(pack)
+    register(_Stub())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(**{lens: {}, "stub": {}}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+    assert result.status == "complete"
+    assert any(
+        lens in skip and raised in skip and "NOT run" in skip
+        for skip in result.skips
+    ), result.skips
+    assert result.new == 1
+    assert result.lens_count == 1
+
+
+def test_a_failure_building_the_runtime_record_is_not_blamed_on_a_pack(
+    tmp_path, monkeypatch
+):
+    """Why `_lens_runtime` is called OUTSIDE the try that swallows.
+
+    It is Whetstone's own code. Called inside, a defect of ours would be
+    absorbed into a per-lens skip reading "its `configure` hook raised
+    RuntimeError" -- a message that sends somebody to the wrong codebase, about
+    a hook that was never reached. Ours propagates.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+
+    def _boom(cfg):
+        raise RuntimeError("the narrowing is broken")
+
+    monkeypatch.setattr("whetstone.runner._lens_runtime", _boom)
+    register(_NeedsConfig())
+    conn = connect(tmp_path)
+
+    with pytest.raises(RuntimeError, match="the narrowing is broken"):
+        execute_run(
+            conn,
+            _cfg_with_test_command("pytest -q"),
+            tmp_path,
+            tmp_path,
+            tier="deep",
+            changed_only=False,
+        )
+
+
+def test_a_whetstone_error_from_configure_keeps_its_own_wording(tmp_path, monkeypatch):
+    """The population guard for the handler above: a `WhetstoneError` must
+    still take the named branch rather than fall through to the catch-all,
+    which would report a designed refusal as an unexpected crash."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_ConfigureRaises())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(configureboom={}),
+        tmp_path,
+        tmp_path,
+        tier="deep",
+        changed_only=False,
+    )
+
+    assert any("could not be configured" in skip for skip in result.skips), result.skips
+    assert not any("LensError" in skip for skip in result.skips), result.skips
+
+
 @pytest.mark.parametrize(
     ("pack", "lens", "returned"),
     [
