@@ -39,6 +39,15 @@ or the test may be broken -- and those are completely different answers:
 Absence has to be EARNED. Reading any failure as absence is how a tool closes a
 real defect on the strength of its own typo.
 
+AND `inconclusive` IS A POST-EXECUTION WORD. It means a container ran and the
+run settled nothing, which is a claim about an execution. Every path that
+returns before a container starts therefore says `not attempted` or `not
+executed` instead of leaving the default in place, and `executed` carries the
+fact itself so no consumer has to recognise a vocabulary to know whether
+anything ran. Task 8 removed exactly this conflation one layer out, where a
+missing verdict defaulted to `inconclusive`; the default value here was the
+other half of it.
+
 AND THE MARKER IS BOUND TO THE FAILING TEST, not searched for in the output.
 Scanning stdout let the artifact PRINT the marker and then fail an unrelated
 assertion: exit 1 plus the string anywhere read as absence, while the predicate
@@ -79,6 +88,12 @@ REPRO_MARKER = "WHETSTONE-REPRO"
 _EXECUTABLE_KIND = "pytest"
 
 _TEST_TIMEOUT_SECONDS = 300
+
+# `docker run`'s own "the container never started" -- an image that cannot be
+# pulled, a flag it will not take. pytest's own exit codes are 0 to 5, so this
+# code can only have come from docker itself and nothing was executed. Every
+# other code reaching the caller came out of the container.
+_DOCKER_DID_NOT_START = 125
 
 
 def _sanitise(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -217,7 +232,14 @@ def reproduce(
 
     outcome: dict[str, Any] = {
         "reproduced": False,
-        "verdict": "inconclusive",
+        # NOT `inconclusive`. That word means a container ran and settled
+        # nothing, and every early return below happens before one starts --
+        # see the module docstring. The default is the weakest true statement:
+        # no reproduction was attempted yet.
+        "verdict": "not attempted",
+        # The FACT, carried rather than inferred from the verdict. Set once,
+        # after the container has actually run.
+        "executed": False,
         "has_runnable_artifact": False,
         "mutation": result.mutation,
         "payload": result.data,
@@ -229,6 +251,7 @@ def reproduce(
     }
 
     if result.mutation:
+        outcome["verdict"] = "not executed"
         skips.append(f"reproduce modified the worktree: {result.mutation}")
         return outcome, skips
     if not result.ok or result.data is None:
@@ -247,6 +270,7 @@ def reproduce(
 
     kind = artifact.get("kind")
     if kind != _EXECUTABLE_KIND:
+        outcome["verdict"] = "not executed"
         skips.append(
             f"reproduce returned a {kind!r} artifact, which Whetstone will not "
             f"execute -- only {_EXECUTABLE_KIND} runs, through the project's own "
@@ -256,6 +280,7 @@ def reproduce(
 
     content = artifact.get("content") or ""
     if not content.strip():
+        outcome["verdict"] = "not executed"
         skips.append("reproduce returned an empty artifact, so there was nothing to run")
         return outcome, skips
 
@@ -311,13 +336,28 @@ def reproduce(
         with contextlib.suppress(OSError):
             report.unlink(missing_ok=True)
 
+    # THE ONLY PLACE `executed` IS SET TRUE, and only from what the run itself
+    # did. A timeout ran: it was killed part way through, which is a container
+    # that started. Exit 125 is docker refusing to start one at all, which is
+    # the one code arriving here that the container did not produce -- and it
+    # keeps `inconclusive` meaning what it says, because a verdict about what a
+    # run settled needs a run.
     if shell.timed_out:
+        outcome["executed"] = True
         outcome["verdict"] = "inconclusive"
         skips.append(
             f"the reproduction did not finish within {_TEST_TIMEOUT_SECONDS}s and "
             f"was killed, so it settles nothing"
         )
+    elif shell.returncode == _DOCKER_DID_NOT_START:
+        outcome["verdict"] = "not executed"
+        skips.append(
+            f"the reproduction was not run: docker exited "
+            f"{_DOCKER_DID_NOT_START} without starting a container, so the "
+            f"artifact was never executed"
+        )
     else:
+        outcome["executed"] = True
         verdict, reason = _verdict_from(shell.returncode, bound)
         outcome["verdict"] = verdict
         outcome["reproduced"] = verdict == "reproduced"

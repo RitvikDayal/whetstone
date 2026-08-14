@@ -300,8 +300,74 @@ def test_a_provider_failure_is_a_skip(ctx):
     )
     result, skips = reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND, "an-image")
 
-    assert result["verdict"] == "inconclusive"
+    # NOT `inconclusive`. That word means a container ran and settled nothing,
+    # and the provider never returned an artifact for one to run.
+    assert result["verdict"] == "not attempted"
+    assert result["executed"] is False
     assert any("CLI missing" in skip for skip in skips)
+
+
+@pytest.mark.parametrize(
+    ("result", "image", "verdict"),
+    [
+        (
+            _ok(
+                _payload(artifact={"kind": "pytest", "content": _PASSES}),
+                mutation="app.py changed",
+            ),
+            "an-image",
+            "not executed",
+        ),
+        (
+            StageResult(
+                ok=False, data=None, raw="", usage=Usage(), error="CLI missing"
+            ),
+            "an-image",
+            "not attempted",
+        ),
+        (_ok(_payload(artifact=None)), "an-image", "not attempted"),
+        (
+            _ok(_payload(artifact={"kind": "script", "content": "rm -rf /"})),
+            "an-image",
+            "not executed",
+        ),
+        (
+            _ok(_payload(artifact={"kind": "pytest", "content": "   \n"})),
+            "an-image",
+            "not executed",
+        ),
+        (
+            _ok(_payload(artifact={"kind": "pytest", "content": _PASSES})),
+            None,
+            "not executed",
+        ),
+    ],
+    ids=[
+        "mutation",
+        "provider-failed",
+        "no-artifact",
+        "wrong-kind",
+        "empty",
+        "no-sandbox",
+    ],
+)
+def test_every_path_that_starts_no_container_records_that_nothing_ran(
+    result, image, verdict, ctx
+):
+    """`executed` is a FACT, and `inconclusive` is a post-execution word.
+
+    Each of these returns before a container starts. Each of them used to leave
+    the verdict at its `inconclusive` default -- which legitimately means "it
+    ran and settled nothing" -- so every consumer reading execution out of that
+    word was told a run had happened. Both halves are asserted, and the verdict
+    exactly rather than as a set: a branch that stopped distinguishing "nothing
+    was written" from "it was written and refused" would otherwise pass.
+    """
+    outcome, _ = reproduce(_CANDIDATE, ctx, _FakeProvider(result), _TEST_COMMAND, image)
+
+    assert outcome["executed"] is False
+    assert outcome["verdict"] == verdict
+    assert outcome["reproduced"] is False
 
 
 # --- what gets sent -------------------------------------------------------------
