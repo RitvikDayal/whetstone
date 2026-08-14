@@ -300,8 +300,74 @@ def test_a_provider_failure_is_a_skip(ctx):
     )
     result, skips = reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND, "an-image")
 
-    assert result["verdict"] == "inconclusive"
+    # NOT `inconclusive`. That word means a container ran and settled nothing,
+    # and the provider never returned an artifact for one to run.
+    assert result["verdict"] == "not attempted"
+    assert result["executed"] is False
     assert any("CLI missing" in skip for skip in skips)
+
+
+@pytest.mark.parametrize(
+    ("result", "image", "verdict"),
+    [
+        (
+            _ok(
+                _payload(artifact={"kind": "pytest", "content": _PASSES}),
+                mutation="app.py changed",
+            ),
+            "an-image",
+            "not executed",
+        ),
+        (
+            StageResult(
+                ok=False, data=None, raw="", usage=Usage(), error="CLI missing"
+            ),
+            "an-image",
+            "not attempted",
+        ),
+        (_ok(_payload(artifact=None)), "an-image", "not attempted"),
+        (
+            _ok(_payload(artifact={"kind": "script", "content": "rm -rf /"})),
+            "an-image",
+            "not executed",
+        ),
+        (
+            _ok(_payload(artifact={"kind": "pytest", "content": "   \n"})),
+            "an-image",
+            "not executed",
+        ),
+        (
+            _ok(_payload(artifact={"kind": "pytest", "content": _PASSES})),
+            None,
+            "not executed",
+        ),
+    ],
+    ids=[
+        "mutation",
+        "provider-failed",
+        "no-artifact",
+        "wrong-kind",
+        "empty",
+        "no-sandbox",
+    ],
+)
+def test_every_path_that_starts_no_container_records_that_nothing_ran(
+    result, image, verdict, ctx
+):
+    """`executed` is a FACT, and `inconclusive` is a post-execution word.
+
+    Each of these returns before a container starts. Each of them used to leave
+    the verdict at its `inconclusive` default -- which legitimately means "it
+    ran and settled nothing" -- so every consumer reading execution out of that
+    word was told a run had happened. Both halves are asserted, and the verdict
+    exactly rather than as a set: a branch that stopped distinguishing "nothing
+    was written" from "it was written and refused" would otherwise pass.
+    """
+    outcome, _ = reproduce(_CANDIDATE, ctx, _FakeProvider(result), _TEST_COMMAND, image)
+
+    assert outcome["executed"] is False
+    assert outcome["verdict"] == verdict
+    assert outcome["reproduced"] is False
 
 
 # --- what gets sent -------------------------------------------------------------
@@ -406,6 +472,105 @@ def test_docker_is_available_where_it_is_expected():
         "docker is unavailable on a Linux CI leg, so the reproduce chain is "
         "unverified"
     )
+
+
+def _stub_container(monkeypatch, *, returncode: int = 0, timed_out: bool = False):
+    """A container that ran, without needing one.
+
+    The chain test above proves a real container; these prove what the
+    controller DOES with each outcome, and they have to run on every leg. Both
+    the availability probe and the run are replaced, because the probe would
+    otherwise refuse before any of this is reached on a machine with no Docker
+    -- which is exactly how these branches stayed unasserted.
+    """
+    monkeypatch.setattr(reproduce_module, "availability", lambda _image: None)
+    monkeypatch.setattr(
+        reproduce_module,
+        "run_sandboxed",
+        lambda *a, **k: ShellResult(
+            returncode=returncode, stdout="", stderr="", timed_out=timed_out
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "timed_out", "executed", "verdict", "reproduced"),
+    [
+        (0, False, True, "reproduced", True),
+        (-1, True, True, "inconclusive", False),
+        (125, False, False, "not executed", False),
+        (1, False, True, "inconclusive", False),
+        (5, False, True, "inconclusive", False),
+        (2, False, True, "inconclusive", False),
+    ],
+    ids=["exit-0", "timeout", "docker-125", "exit-1-no-report", "exit-5", "exit-2"],
+)
+def test_what_the_controller_records_for_each_container_outcome(
+    returncode, timed_out, executed, verdict, reproduced, ctx, monkeypatch
+):
+    """THE THREE POST-CONTAINER BRANCHES, none of which a Docker-gated test
+    reaches on a leg without Docker.
+
+    They are also the only place `executed` and the verdict can legitimately
+    disagree, which is the only place a regression re-deriving execution from
+    the verdict word is catchable at all:
+
+    - a TIMEOUT ran. It was killed part way through, so `inconclusive` is
+      earned and `executed` is True.
+    - docker exit 125 is docker refusing to start a container. Nothing was
+      executed, and reading `inconclusive` off that exit code -- which is what
+      `_verdict_from` would return for it -- would file a finding as evidence
+      of a run that never happened.
+    - every other code came out of the container, so it ran whatever it
+      concluded.
+    """
+    _stub_container(monkeypatch, returncode=returncode, timed_out=timed_out)
+    provider = _FakeProvider(
+        _ok(_payload(artifact={"kind": "pytest", "content": _PASSES}))
+    )
+
+    outcome, _ = reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND, "an-image")
+
+    assert outcome["executed"] is executed
+    assert outcome["verdict"] == verdict
+    assert outcome["reproduced"] is reproduced
+    # It got far enough to write one, on every one of these paths.
+    assert outcome["has_runnable_artifact"] is True
+
+
+def test_a_container_docker_never_started_says_so_rather_than_settling_nothing(
+    ctx, monkeypatch
+):
+    """The skip, not just the verdict. `_verdict_from(125, ...)` says the run
+    'settles nothing', which reads as a container that ran and was
+    unhelpful; the user needs to know no container started -- a bad image name
+    is the ordinary cause and it is fixable."""
+    _stub_container(monkeypatch, returncode=125)
+    provider = _FakeProvider(
+        _ok(_payload(artifact={"kind": "pytest", "content": _PASSES}))
+    )
+
+    _, skips = reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND, "an-image")
+
+    assert any("without starting a container" in skip for skip in skips), skips
+    assert not any("settles nothing" in skip for skip in skips), skips
+
+
+def test_a_timed_out_container_is_recorded_as_having_run(ctx, monkeypatch):
+    """Named separately from the table because it is the one outcome where
+    `executed` is True and the verdict is `inconclusive` -- the pair that makes
+    the word legal. A fix that set `executed` from the exit code alone would
+    get this one wrong and the table would still be green on five of six."""
+    _stub_container(monkeypatch, returncode=-1, timed_out=True)
+    provider = _FakeProvider(
+        _ok(_payload(artifact={"kind": "pytest", "content": _PASSES}))
+    )
+
+    outcome, skips = reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND, "an-image")
+
+    assert outcome["executed"] is True
+    assert outcome["verdict"] == "inconclusive"
+    assert any("did not finish within" in skip for skip in skips), skips
 
 
 def test_the_bytecode_setting_reaches_the_container_as_an_env_var(ctx, monkeypatch):

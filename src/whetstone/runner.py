@@ -10,7 +10,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .config.model import BoundariesConfig, LensConfig, WhetstoneConfig
-from .lenses.base import LensPack, LensScope, RunContext, lens_scope_declaration
+from .errors import WhetstoneError
+from .lenses.base import (
+    LensPack,
+    LensRuntime,
+    LensScope,
+    RunContext,
+    lens_scope_declaration,
+)
 from .lenses.registry import get_lens
 from .scope.resolver import resolve_files
 from .severity import severity_at_least
@@ -135,6 +142,51 @@ def _boundaries_are_narrowed(boundaries: BoundariesConfig) -> bool:
     return bool(boundaries.exclude) or boundaries.include != _DEFAULT_INCLUDE
 
 
+def _rendered(exc: BaseException) -> str:
+    """*exc*'s message, or why it has none. Never raises.
+
+    `str(exc)` RUNS A THIRD-PARTY `__str__` -- an ordinary override, and the
+    one thing a pack is invited to define about its own exception. It can
+    raise, and a `__str__` returning a non-str makes `str()` itself raise
+    `TypeError`. Either lands inside the `except` block that exists to stop a
+    pack ending the run, where there is no handler left above it and no `runs`
+    row yet: the renderer of the safety message becomes the unsafe thing.
+
+    HOW FAR THIS GOES, AND WHERE IT STOPS. There is no second attempt at the
+    message: `repr()` is not a safer fallback, because `__repr__` is equally a
+    pack's to override, so a failure yields a fixed sentence instead. The TYPE
+    NAME is read by the callers rather than here, as `type(exc).__name__` --
+    `type()` returns the real type object, so a `__class__` property cannot lie
+    about it, and `__name__` on a class runs no pack code. Making THAT raise
+    needs a custom metaclass on an exception class, and a pack prepared to go
+    that far could equally just hang in `configure`, which no amount of
+    rendering care would survive. The line is what a pack is invited to
+    define, not what it can subvert with a metaclass.
+    """
+    try:
+        text = str(exc)
+    except Exception:  # noqa: BLE001 - rendering a reason must not end the run
+        return "its message could not be rendered"
+    # Stripped, so a whitespace-only message is the same empty parenthetical
+    # that `str(exc) or ...` was fixed to prevent, by a slower route.
+    return text.strip() or "no message"
+
+
+def _lens_runtime(cfg: WhetstoneConfig) -> LensRuntime:
+    """The narrowed record `configure()` receives instead of the whole config.
+
+    Built here rather than in `lenses/` because the runner is the only layer
+    that holds a `WhetstoneConfig`, and this is exactly the seam that keeps it
+    that way: `state_dir` never crosses it.
+    """
+    return LensRuntime(
+        provider_name=cfg.model.provider,
+        test_command=cfg.environment.commands.test,
+        ceiling_usd=cfg.budget.ceiling.usd_per_run,
+        calls_per_day=cfg.budget.ceiling.calls_per_day,
+    )
+
+
 def _nothing_ran_reason(cfg: WhetstoneConfig) -> str:
     """Why an empty plan happened, worded so it cannot be read as a clean bill.
 
@@ -197,6 +249,10 @@ def execute_run(
     # about it. Keyed by lens name, which config guarantees is unique.
     scopes: dict[str, LensScope] = {}
     skips: list[str] = []
+    # Built ONCE, and outside the try below. It is loop-invariant, and keeping
+    # it out of the `except` means a defect in Whetstone's own narrowing cannot
+    # be absorbed into a per-lens skip and reported as a misbehaving pack.
+    runtime = _lens_runtime(cfg)
     for name, lens_cfg in cfg.lenses.items():
         if not lens_cfg.enabled:
             skips.append(f"{name}: disabled in config; not run.")
@@ -216,6 +272,96 @@ def execute_run(
                 "Use a higher tier to include it."
             )
             continue
+
+        # A pack that needs the run's config gets it here and NOWHERE else.
+        # `RunContext` is deliberately "everything a lens is allowed to know"
+        # and does not carry the config, so a lens needing the declared test
+        # command or the cost ceiling would otherwise have to re-load
+        # whetstone.yaml for itself -- duplicating the loader and walking
+        # around the boundary that keeps a third-party pack out of a project's
+        # resolved secrets.
+        #
+        # A `LensRuntime` rather than `cfg`, which is that same sentence being
+        # true rather than merely written down: `WhetstoneConfig.state_dir` is
+        # a `SecretStr` the loader has already resolved, and handing the whole
+        # object over put `get_secret_value()` one attribute away from every
+        # in-process entry-point pack. See `LensRuntime` for what this does and
+        # does not claim to be.
+        #
+        # Optional, and read with getattr for the reason `lens_scope` is not a
+        # protocol member either: `runtime_checkable` isinstance() checks every
+        # attribute, so requiring `configure` would make `register()` reject
+        # every pack written before this existed, including installed
+        # third-party ones.
+        #
+        # The RETURN VALUE is used rather than mutating in place, because the
+        # registry hands out one instance for the life of the process and
+        # configuring that object would leak one project's settings into the
+        # next run in the same process.
+        configure = getattr(pack, "configure", None)
+        if callable(configure):
+            try:
+                configured = configure(runtime)
+            except WhetstoneError as exc:
+                # `_rendered` here too. `LensError` is importable, so a pack
+                # may subclass it and override `__str__`; being Whetstone's own
+                # base class does not make the INSTANCE ours.
+                skips.append(
+                    f"{name}: could not be configured for this run "
+                    f"({_rendered(exc)}); not run."
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 - a pack must not end the run
+                # THE SAME BLAST RADIUS AS THE RETURN-VALUE CHECK BELOW, and
+                # for the same reason. `configure` is third-party code reached
+                # through an entry point, and anything it raises that is not a
+                # `WhetstoneError` -- an `AttributeError` on a `LensRuntime`
+                # field it expected to be a config, a `KeyError`, a `TypeError`
+                # -- escapes `execute_run` before the `runs` INSERT: no run row,
+                # every other lens abandoned, and nothing anywhere saying which
+                # pack did it.
+                #
+                # DELIBERATELY NOT THE SHAPE `registry._load_plugins` USES,
+                # which re-raises. That failure is a plugin that could not LOAD,
+                # which silently shrinks the registry for every lens and every
+                # future call; this one is scoped to a lens that exists, is
+                # named in the skip, and whose absence is visible in
+                # `lens_count`. Loud and fatal there, loud and contained here.
+                #
+                # `Exception`, not `BaseException`: a Ctrl-C or a SystemExit
+                # during configuration is the user or the process ending the
+                # run, and turning either into a skip would swallow it.
+                # `_rendered(exc)`, NOT `exc` and not `str(exc)`. An exception
+                # instance is always truthy -- `BaseException` defines neither
+                # `__bool__` nor `__len__` -- so `exc or ...` never reached its
+                # fallback and a bare `raise ValueError` rendered as `raised
+                # ValueError ()`. And `str(exc)` runs the pack's own `__str__`,
+                # which can raise from inside this handler. See `_rendered`.
+                skips.append(
+                    f"{name}: its `configure` hook raised "
+                    f"{type(exc).__name__} ({_rendered(exc)}), which "
+                    "is not a Whetstone error. This lens was NOT run; the rest "
+                    "of the run continued."
+                )
+                continue
+            # CHECKED, NOT TRUSTED. `configure` is an optional hook on code
+            # that arrives through an entry point, and the in-place spelling
+            # its name invites -- `self.test_command = ...` with no return --
+            # yields None. That would reach `lens_scope_declaration` as None
+            # and raise `AttributeError`, which is not a `WhetstoneError`, so
+            # it escapes `execute_run` BEFORE the `runs` row is inserted: no
+            # run to report against, every other lens abandoned, one
+            # third-party pack taking the whole run with it. A per-lens skip
+            # is the blast radius the rest of this loop already uses.
+            if not isinstance(configured, LensPack):
+                skips.append(
+                    f"{name}: its `configure` hook returned "
+                    f"{type(configured).__name__} rather than a lens pack, so "
+                    "this lens was NOT run. `configure` must return the "
+                    "configured copy of the pack."
+                )
+                continue
+            pack = configured
 
         scope, scope_reason = lens_scope_declaration(pack)
         if scope_reason is not None:

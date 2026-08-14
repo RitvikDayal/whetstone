@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 import whetstone.lenses.registry as registry_module
 from whetstone.config.model import LensConfig, ProjectConfig, WhetstoneConfig
@@ -10,6 +11,7 @@ from whetstone.lenses.base import (
     Candidate,
     Evidence,
     EvidenceKind,
+    LensRuntime,
     RunContext,
     Severity,
 )
@@ -966,3 +968,572 @@ def test_a_clean_model_shaped_candidate_still_runs(tmp_path, monkeypatch):
     assert result.status == "complete"
     assert result.new == 1
     assert [f.subject for f in list_findings(connect(tmp_path))] == ["src/ok.py"]
+
+
+# --- the configure hook ---------------------------------------------------------
+#
+# A lens needing the run's config -- the declared test command, the cost ceiling
+# -- gets it from the runner and nowhere else. RunContext deliberately does not
+# carry the config, so without this hook a model-driven pack would have to
+# re-load whetstone.yaml for itself.
+
+
+class _NeedsConfig:
+    """Returns a CONFIGURED COPY, the way the code-defects pack does."""
+
+    name = "needsconfig"
+    max_autonomy = 3
+
+    def __init__(self, test_command: str | None = None):
+        self.test_command = test_command
+
+    def configure(self, runtime) -> "_NeedsConfig":
+        return type(self)(runtime.test_command)
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        ctx.skip(f"needsconfig: test command is {self.test_command!r}")
+        return
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
+class _ConfigureRaises:
+    name = "configureboom"
+    max_autonomy = 3
+
+    def configure(self, cfg):
+        raise LensError("the provider it needs is not installed")
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack that could not be configured must not run")
+        yield
+
+
+def _cfg_with_test_command(command: str) -> WhetstoneConfig:
+    return WhetstoneConfig(
+        project=ProjectConfig(name="demo"),
+        environment={"commands": {"test": command}},
+        lenses={"needsconfig": LensConfig()},
+    )
+
+
+def test_a_pack_declaring_configure_is_given_the_runs_config(tmp_path, monkeypatch):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_NeedsConfig())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn,
+        _cfg_with_test_command("pytest -q"),
+        tmp_path,
+        tmp_path,
+        tier="deep",
+        changed_only=False,
+    )
+    assert any("'pytest -q'" in skip for skip in result.skips), result.skips
+
+
+class _RecordsWhatItWasGiven:
+    name = "recordsconfig"
+    max_autonomy = 3
+    given: object = None
+
+    def configure(self, runtime):
+        type(self).given = runtime
+        return self
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):
+        return
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+
+def test_the_hook_is_handed_a_narrowed_record_and_not_the_config(tmp_path, monkeypatch):
+    """`WhetstoneConfig.state_dir` is a `SecretStr` the loader has ALREADY
+    resolved from `${env:...}`, so a pack handed the config object is one
+    `get_secret_value()` from a project's credential -- and a lens pack arrives
+    through an entry point. Asserted on the object the hook actually received,
+    because `_lens_runtime` being correct proves nothing if the runner still
+    passes `cfg`."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_RecordsWhatItWasGiven())
+    cfg = _cfg_with_test_command("pytest -q")
+    cfg = cfg.model_copy(update={"state_dir": SecretStr("s3cret-token-path")})
+    cfg.lenses["recordsconfig"] = LensConfig()
+    conn = connect(tmp_path)
+    execute_run(conn, cfg, tmp_path, tmp_path, tier="deep", changed_only=False)
+
+    given = _RecordsWhatItWasGiven.given
+    assert isinstance(given, LensRuntime)
+    assert not isinstance(given, WhetstoneConfig)
+    assert not hasattr(given, "state_dir")
+    assert "s3cret" not in repr(given)
+    # Narrowed, not emptied: the thing the hook exists for still arrives.
+    assert given.test_command == "pytest -q"
+
+
+def test_configuring_does_not_edit_the_registered_pack(tmp_path, monkeypatch):
+    """The registry hands out one instance for the life of the process, so a
+    hook that configured in place would leak one project's settings into the
+    next run."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    registered = _NeedsConfig()
+    register(registered)
+    conn = connect(tmp_path)
+    execute_run(
+        conn,
+        _cfg_with_test_command("pytest -q"),
+        tmp_path,
+        tmp_path,
+        tier="deep",
+        changed_only=False,
+    )
+    assert registered.test_command is None
+
+
+def test_a_pack_that_cannot_be_configured_is_skipped_not_run(tmp_path, monkeypatch):
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_ConfigureRaises())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn,
+        _cfg(configureboom={}),
+        tmp_path,
+        tmp_path,
+        tier="deep",
+        changed_only=False,
+    )
+    # `could not be configured` is the configure branch's OWN wording. The
+    # raised message ends in "not installed", which is also how the runner
+    # reports a lens with no registered pack -- so matching that substring
+    # alone passes with the whole configure block deleted, and with
+    # `register()` never having taken effect. It named a behaviour it did not
+    # pin.
+    assert any(
+        "could not be configured" in skip and "not installed" in skip
+        for skip in result.skips
+    ), result.skips
+    assert result.lens_count == 0
+
+
+class _ConfigureReturnsNone:
+    """The in-place spelling `configure` invites: it sets an attribute and
+    returns None, which is what every function without a `return` does."""
+
+    name = "configurenone"
+    max_autonomy = 3
+    test_command: str | None = None
+
+    def configure(self, runtime) -> None:
+        self.test_command = runtime.test_command
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure returned None must not run")
+        yield
+
+
+class _ConfigureReturnsRubbish:
+    name = "configurerubbish"
+    max_autonomy = 3
+
+    def configure(self, runtime) -> object:
+        return "a lens pack, honest"
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure returned a str must not run")
+        yield
+
+
+class _ConfigureExplodes:
+    """A pack written against the old `configure(cfg)` contract, which is the
+    ordinary way this happens: it reaches for a config attribute that a
+    `LensRuntime` does not have and raises `AttributeError`."""
+
+    name = "configureboom2"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        return type(self)(runtime.environment.commands.test)
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure raised must not run")
+        yield
+
+
+class _ConfigureRaisesBareValueError:
+    name = "configureboom3"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise ValueError
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure raised must not run")
+        yield
+
+
+class _ConfigureRaisesWithAMessage:
+    name = "configureboom4"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise ValueError("the angle list is empty")
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    def run(self, ctx: RunContext):  # pragma: no cover - must never be reached
+        raise AssertionError("a pack whose configure raised must not run")
+        yield
+
+
+class _ConfigureRaisesWhitespace:
+    name = "configureboom8"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise ValueError("   \n ")
+
+    def supports_tier(self, tier: str) -> bool:
+        return True
+
+    run = _NeedsConfig.run
+
+
+class _UnrenderableError(Exception):
+    """`__str__` is an ordinary override, so a pack may define one that raises.
+
+    Not a hypothetical shape: an exception whose message is built lazily from
+    state the failure destroyed does this by accident.
+    """
+
+    def __str__(self):
+        raise RuntimeError("and rendering the message fails too")
+
+
+class _NonStringError(Exception):
+    """`__str__` returning a non-str. `str()` itself raises `TypeError` for
+    this -- `__str__ returned non-string` -- so it reaches the caller as a
+    second exception rather than as a bad value."""
+
+    def __str__(self):
+        return 42  # type: ignore[return-value]
+
+
+class _ConfigureRaisesUnrenderable:
+    name = "configureboom5"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise _UnrenderableError
+
+
+class _ConfigureRaisesNonString:
+    name = "configureboom6"
+    max_autonomy = 3
+
+    def configure(self, runtime):
+        raise _NonStringError
+
+
+for _unrenderable in (_ConfigureRaisesUnrenderable, _ConfigureRaisesNonString):
+    _unrenderable.supports_tier = lambda self, tier: True  # type: ignore[method-assign]
+    _unrenderable.run = _NeedsConfig.run  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize(
+    ("pack", "lens", "exc_name"),
+    [
+        (_ConfigureRaisesUnrenderable(), "configureboom5", "_UnrenderableError"),
+        (_ConfigureRaisesNonString(), "configureboom6", "_NonStringError"),
+    ],
+    ids=["str-raises", "str-returns-non-string"],
+)
+def test_an_exception_that_cannot_be_rendered_still_skips_only_its_own_lens(
+    pack, lens, exc_name, tmp_path, monkeypatch
+):
+    """The handler's own renderer must not become the unsafe thing.
+
+    `str(exc)` executes a third-party `__str__`. If that raises -- or returns a
+    non-str, which makes `str()` itself raise `TypeError` -- the secondary
+    exception escapes from inside the very `except` block added to stop a pack
+    ending the run, and it escapes before the `runs` INSERT. Same failure, one
+    level in, and with no handler left above it.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(pack)
+    register(_Stub())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(**{lens: {}, "stub": {}}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+    assert result.status == "complete"
+    skip = next(s for s in result.skips if s.startswith(f"{lens}:"))
+    assert "its message could not be rendered" in skip, skip
+    # THE TYPE NAME, ASSERTED RATHER THAN DESCRIBED. `_rendered` keeps
+    # `type(exc).__name__` outside its guard on the grounds that `type()`
+    # returns the real type object -- a `__class__` property cannot lie about
+    # it -- and that reading `__name__` off a class runs no pack code. That is
+    # the whole reason an unrenderable exception still tells the user WHAT
+    # failed, and a rendering that dropped the name for the fixed sentence
+    # alone would satisfy every other assertion here.
+    assert exc_name in skip, skip
+    assert "()" not in skip, skip
+    assert "NOT run" in skip, skip
+    assert result.new == 1
+    assert result.lens_count == 1
+
+
+def test_an_unrenderable_whetstone_error_is_survivable_too(tmp_path, monkeypatch):
+    """The named branch renders an exception too, and `LensError` is importable
+    -- so a pack may subclass it and override `__str__`. Being Whetstone's own
+    base class does not make the instance ours."""
+
+    class _UnrenderableLensError(LensError):
+        def __str__(self):
+            raise RuntimeError("nor this one")
+
+    class _Pack:
+        name = "configureboom7"
+        max_autonomy = 3
+
+        def configure(self, runtime):
+            raise _UnrenderableLensError
+
+        def supports_tier(self, tier: str) -> bool:
+            return True
+
+        run = _NeedsConfig.run
+
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Pack())
+    register(_Stub())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(configureboom7={}, stub={}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+    assert result.status == "complete"
+    skip = next(s for s in result.skips if s.startswith("configureboom7:"))
+    assert "could not be configured" in skip, skip
+    assert "its message could not be rendered" in skip, skip
+    assert result.new == 1
+
+
+@pytest.mark.parametrize(
+    ("pack", "lens", "expected"),
+    [
+        (_ConfigureExplodes(), "configureboom2", None),
+        (
+            _ConfigureRaisesBareValueError(),
+            "configureboom3",
+            "configureboom3: its `configure` hook raised ValueError (no message), "
+            "which is not a Whetstone error. This lens was NOT run; the rest of "
+            "the run continued.",
+        ),
+        (
+            _ConfigureRaisesWithAMessage(),
+            "configureboom4",
+            "configureboom4: its `configure` hook raised ValueError (the angle "
+            "list is empty), which is not a Whetstone error. This lens was NOT "
+            "run; the rest of the run continued.",
+        ),
+        (
+            # A whitespace-only message is the same empty parenthetical by a
+            # slower route, so `_rendered` strips before deciding.
+            _ConfigureRaisesWhitespace(),
+            "configureboom8",
+            "configureboom8: its `configure` hook raised ValueError (no "
+            "message), which is not a Whetstone error. This lens was NOT run; "
+            "the rest of the run continued.",
+        ),
+    ],
+    ids=[
+        "attribute-error",
+        "bare-value-error",
+        "value-error-with-message",
+        "whitespace-only-message",
+    ],
+)
+def test_a_configure_hook_raising_a_non_whetstone_error_skips_that_lens_alone(
+    pack, lens, expected, tmp_path, monkeypatch
+):
+    """The adjacent half of the return-value check, and the same blast radius.
+
+    Only `WhetstoneError` was caught, so anything else a third-party hook
+    raised escaped `execute_run` BEFORE the `runs` INSERT: no run row, every
+    other lens abandoned, nothing naming the pack.
+
+    THE RENDERED MESSAGE IS ASSERTED, not the exception type it contains. An
+    exception instance is ALWAYS truthy -- `BaseException` defines neither
+    `__bool__` nor `__len__` -- so `exc or 'no message'` could never fire and a
+    bare `ValueError` rendered as `raised ValueError ()`. A test naming only
+    the type is green against that, which is how it shipped. An empty
+    parenthetical is exactly the moment a user most needs the text, in the one
+    message whose whole job is saying why a lens did not run.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(pack)
+    register(_Stub())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(**{lens: {}, "stub": {}}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+    assert result.status == "complete"
+    skip = next(s for s in result.skips if s.startswith(f"{lens}:"))
+    assert "()" not in skip, skip
+    if expected is None:
+        # CPython owns this wording, so the type and a non-empty body are what
+        # can be asserted -- and the `()` check above is what makes the body
+        # non-empty rather than merely present.
+        assert "raised AttributeError (" in skip, skip
+        assert "NOT run" in skip, skip
+    else:
+        assert skip == expected
+    assert result.new == 1
+    assert result.lens_count == 1
+
+
+def test_a_failure_building_the_runtime_record_is_not_blamed_on_a_pack(
+    tmp_path, monkeypatch
+):
+    """Why `_lens_runtime` is called OUTSIDE the try that swallows.
+
+    It is Whetstone's own code. Called inside, a defect of ours would be
+    absorbed into a per-lens skip reading "its `configure` hook raised
+    RuntimeError" -- a message that sends somebody to the wrong codebase, about
+    a hook that was never reached. Ours propagates.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+
+    def _boom(cfg):
+        raise RuntimeError("the narrowing is broken")
+
+    monkeypatch.setattr("whetstone.runner._lens_runtime", _boom)
+    register(_NeedsConfig())
+    conn = connect(tmp_path)
+
+    with pytest.raises(RuntimeError, match="the narrowing is broken"):
+        execute_run(
+            conn,
+            _cfg_with_test_command("pytest -q"),
+            tmp_path,
+            tmp_path,
+            tier="deep",
+            changed_only=False,
+        )
+
+
+def test_a_whetstone_error_from_configure_keeps_its_own_wording(tmp_path, monkeypatch):
+    """The population guard for the handler above: a `WhetstoneError` must
+    still take the named branch rather than fall through to the catch-all,
+    which would report a designed refusal as an unexpected crash."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_ConfigureRaises())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(configureboom={}),
+        tmp_path,
+        tmp_path,
+        tier="deep",
+        changed_only=False,
+    )
+
+    assert any("could not be configured" in skip for skip in result.skips), result.skips
+    assert not any("LensError" in skip for skip in result.skips), result.skips
+
+
+@pytest.mark.parametrize(
+    ("pack", "lens", "returned"),
+    [
+        (_ConfigureReturnsNone(), "configurenone", "NoneType"),
+        (_ConfigureReturnsRubbish(), "configurerubbish", "str"),
+    ],
+    ids=["none", "not-a-pack"],
+)
+def test_a_configure_hook_returning_a_non_pack_skips_that_lens_alone(
+    pack, lens, returned, tmp_path, monkeypatch
+):
+    """One third-party pack must not take the run with it.
+
+    The return value was assigned unchecked, so `configure` returning None put
+    None into `lens_scope_declaration` and raised `AttributeError` -- not a
+    `WhetstoneError`, so it escaped `execute_run` BEFORE the `runs` INSERT. No
+    run row, every other lens abandoned, and nothing anywhere saying why. The
+    honest pack registered alongside it is what proves the blast radius is one
+    lens rather than the run.
+    """
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(pack)
+    register(_Stub())
+    conn = connect(tmp_path)
+
+    result = execute_run(
+        conn,
+        _cfg(**{lens: {}, "stub": {}}),
+        tmp_path,
+        tmp_path,
+        tier="quick",
+        changed_only=False,
+    )
+
+    assert result.status == "complete"
+    assert any(
+        lens in skip and returned in skip and "NOT run" in skip
+        for skip in result.skips
+    ), result.skips
+    # The other lens ran to completion, which is the whole point of the skip.
+    assert result.new == 1
+    assert result.lens_count == 1
+
+
+def test_a_pack_without_configure_still_runs(tmp_path, monkeypatch):
+    """The population guard: the hook is optional, and a pack written before it
+    existed -- including every installed third-party one -- must be untouched."""
+    monkeypatch.setattr("whetstone.runner.resolve_files", lambda *a, **k: ())
+    register(_Stub())
+    conn = connect(tmp_path)
+    result = execute_run(
+        conn, _cfg(stub={}), tmp_path, tmp_path, tier="quick", changed_only=False
+    )
+    assert result.new == 1

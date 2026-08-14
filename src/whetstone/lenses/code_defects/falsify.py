@@ -79,16 +79,18 @@ _VERDICT_MEANING: dict[str, str] = {
 
 _UNKNOWN_VERDICT = "an outcome this build does not recognise; treat it as settling nothing"
 
-# Which verdicts mean the controller actually ran the reproduction. The lead
-# sentence in `_reproduction_text` must agree with this set rather than assert
-# execution unconditionally -- fixing the verdict word alone and leaving an
-# unconditional "the controller ran this itself" in the same breath is the
-# half-fix CodeRabbit caught: the noun changed, the claim did not.
-_EXECUTED_VERDICTS = frozenset({"reproduced", "absent", "inconclusive"})
 # Verdicts where it is KNOWN nothing was executed, as distinct from verdicts
 # where that is simply not recorded (`unstated`, or anything this build does
 # not recognise) -- "did not run" and "unknown whether it ran" are different
 # claims and the lead sentence must not collapse them into each other either.
+#
+# THERE IS NO MATCHING SET FOR THE OTHER DIRECTION, deliberately. `reproduce()`
+# now carries `executed` as a fact, and no verdict word may be read as PROOF
+# something ran: `inconclusive` is produced by a container that ran and settled
+# nothing, and was also -- before this -- the default a reproduction returned
+# without starting one. Deriving execution from the word is the conflation Task
+# 8 removed one layer out. A word may only be read in the direction it cannot
+# be wrong in, which is this one.
 _NOT_EXECUTED_VERDICTS = frozenset({"not attempted", "not executed"})
 
 
@@ -134,20 +136,24 @@ def _reproduction_text(reproduction: dict[str, Any]) -> str:
     # that tells the falsifier a reproduction ran when none did is exactly the
     # failure class this stage exists to prevent.
     verdict = str(reproduction.get("verdict") or "unstated")
+    # THE FACT FIRST, and only the fact may claim execution. `executed` is set
+    # by `reproduce()` from what its own container run did; absent, whether
+    # anything ran is genuinely not recorded and the lead says so rather than
+    # guessing from the verdict word.
+    #
     # The "no shell" half is true unconditionally -- the reproducer is a model
     # with no execution capability of its own, whatever the controller did or
     # did not do with what it wrote. The "controller ran this itself" half is
-    # NOT unconditional, and asserting it regardless of `verdict` is exactly
-    # what CodeRabbit's finding was about: it renders true prose for the
-    # verdicts in `_EXECUTED_VERDICTS` and a false claim of execution for
-    # every other one, including the ones `_VERDICT_MEANING` itself already
-    # says nothing was executed for.
-    if verdict in _EXECUTED_VERDICTS:
+    # NOT unconditional, and asserting it regardless is exactly what
+    # CodeRabbit's finding was about: it renders true prose for a run that
+    # happened and a false claim of execution for every other one.
+    executed = reproduction.get("executed")
+    if executed is True:
         lead = (
             "The controller ran this itself; the model that wrote the "
             "reproduction had no shell and executed nothing."
         )
-    elif verdict in _NOT_EXECUTED_VERDICTS:
+    elif executed is False or verdict in _NOT_EXECUTED_VERDICTS:
         lead = (
             "Nothing here was executed, by the controller or by the model "
             "that wrote the reproduction, which also had no shell."

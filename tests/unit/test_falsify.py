@@ -67,10 +67,13 @@ _ARTIFACT_CONTENT = (
 _REPRODUCER_NOTES = "ZZ-REPRODUCER-NOTES-SHOULD-NOT-TRAVEL"
 
 
-def _reproduction(verdict: str = "reproduced", *, model_claim: bool = True) -> dict:
+def _reproduction(
+    verdict: str = "reproduced", *, model_claim: bool = True, executed: bool = True
+) -> dict:
     return {
         "reproduced": verdict == "reproduced",
         "verdict": verdict,
+        "executed": executed,
         "has_runnable_artifact": True,
         "mutation": None,
         "payload": {
@@ -253,13 +256,39 @@ def test_a_missing_verdict_is_not_read_as_a_genuine_inconclusive():
 
 
 @pytest.mark.parametrize("verdict", ["reproduced", "absent", "inconclusive"])
-def test_a_verdict_that_means_execution_happened_says_the_controller_ran_it(verdict):
+def test_the_recorded_execution_fact_is_what_says_the_controller_ran_it(verdict):
     """The other half of the fix: fixing the noun (the verdict word) and
     leaving the lead sentence unconditional was the miss CodeRabbit caught on
-    the round before this one. These three verdicts are the ones where the
-    controller genuinely ran the evidence, so the claim belongs here."""
-    text = _reproduction_text({"verdict": verdict, "payload": None})
+    the round before this one. `executed` is what carries the claim."""
+    text = _reproduction_text(
+        {"verdict": verdict, "executed": True, "payload": None}
+    )
     assert "the controller ran this itself" in text.lower()
+
+
+@pytest.mark.parametrize("verdict", ["reproduced", "absent", "inconclusive"])
+def test_a_verdict_word_alone_never_buys_the_claim_that_something_ran(verdict):
+    """`inconclusive` used to be BOTH "a container ran and settled nothing" and
+    the value a reproduction returned having started none, so reading execution
+    out of the word claimed a run that never happened. No verdict may be read
+    in that direction now -- only the recorded fact, and these dicts do not
+    record one."""
+    text = _reproduction_text({"verdict": verdict, "payload": None}).lower()
+
+    assert "the controller ran this itself" not in text
+    assert "not recorded" in text
+
+
+def test_the_fact_overrides_a_verdict_word_that_disagrees_with_it():
+    """`executed: False` next to a verdict that sounds like a run is exactly
+    the disagreement the fact exists to settle, and it settles it against the
+    word."""
+    text = _reproduction_text(
+        {"verdict": "inconclusive", "executed": False, "payload": None}
+    ).lower()
+
+    assert "the controller ran this itself" not in text
+    assert "nothing here was executed" in text
 
 
 @pytest.mark.parametrize("verdict", ["not attempted", "not executed"])
