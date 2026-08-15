@@ -51,6 +51,15 @@ from ._subprocess import ShellResult, run_argv
 # run is one more thing that can differ between a passing and a failing stage.
 CONTAINER_WORKDIR = "/whetstone"
 
+# Somewhere inside the container that is NOT the mount. The worktree is the only
+# volume, so everything written here lives in the container's own writable layer
+# and dies with `--rm` -- which makes it the place to point a tool's state at
+# when that state has no business being in somebody else's repository. Used by
+# the reproduce stage for pytest's cache directory: the alternative, turning the
+# cache plugin off, isolates the files by deleting the feature and breaks any
+# target whose own test command uses `--lf`, `--ff` or the `cache` fixture.
+CONTAINER_SCRATCH = "/tmp/whetstone"
+
 # Bounds a runaway artifact rather than the machine.
 _PIDS_LIMIT = 512
 _MEMORY = "2g"

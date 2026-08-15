@@ -427,13 +427,29 @@ def test_the_prompt_teaches_the_form_that_can_reach_absence():
 
 
 @needs_docker
-def test_the_controller_runs_the_artifact_inside_a_container(ctx, tmp_path):
+@pytest.mark.parametrize(
+    "declared",
+    [_TEST_COMMAND, f"{_TEST_COMMAND} --lf"],
+    ids=["plain", "cache-dependent"],
+)
+def test_the_controller_runs_the_artifact_inside_a_container(declared, ctx, tmp_path):
     """THE ONE THAT PROVES THE CHAIN: artifact written, container run, report
     parsed, verdict taken from the exit code, worktree left clean.
 
     The image needs pytest, and the container has no network, so it is built
     here rather than installed at run time. Slow, and the only way to show the
     whole path works.
+
+    THE SECOND CASE IS A TARGET WHOSE OWN COMMAND NEEDS THE CACHE. `--lf`,
+    `--ff` and `--nf` are options the cache plugin registers, and the `cache`
+    fixture is the plugin too. The first fix for the `.pytest_cache` mutation
+    appended `-p no:cacheprovider`, which stopped the directory appearing by
+    DELETING THE FEATURE: pytest then rejects `--lf` during startup, exits 4,
+    and the controller files an `inconclusive` verdict about the user's defect
+    on the strength of its own flag. That is the tooling answering a question
+    about the code -- the exact class of wrong answer the marker convention
+    exists to prevent -- so the isolation has to be a cache DIRECTORY the
+    sandbox owns, not a disabled plugin.
     """
     context = tmp_path / "img"
     context.mkdir()
@@ -462,7 +478,7 @@ def test_the_controller_runs_the_artifact_inside_a_container(ctx, tmp_path):
     provider = _FakeProvider(
         _ok(_payload(artifact={"kind": "pytest", "content": _PASSES}))
     )
-    result, skips = reproduce(_CANDIDATE, ctx, provider, _TEST_COMMAND, tag)
+    result, skips = reproduce(_CANDIDATE, ctx, provider, declared, tag)
 
     assert result["verdict"] == "reproduced", skips
     assert result["reproduced"] is True
@@ -474,7 +490,12 @@ def test_the_controller_runs_the_artifact_inside_a_container(ctx, tmp_path):
     # worktree mutation on every successful run, and it stayed in the user's
     # repository afterwards. A skip that fires every time is a skip nobody
     # reads.
-    assert not (ctx.project_root / ".pytest_cache").exists()
+    #
+    # ASSERTED ON THE WORKTREE, not on the argv. `-o cache_dir=...` appearing
+    # in the command proves a flag was passed; only this proves no cache landed
+    # in somebody's repository, and this project has shipped that exact
+    # confusion before.
+    assert list(ctx.project_root.rglob(".pytest_cache")) == []
     assert result["mutation"] is None, skips
     assert skips == []
 
