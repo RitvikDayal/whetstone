@@ -66,7 +66,15 @@ _PASSES = (
     "    pytest.fail('WHETSTONE-REPRO: add([]) returned instead of raising')\n"
 )
 
-_TEST_COMMAND = "python -m pytest -q -p no:cacheprovider"
+# WHAT A USER ACTUALLY DECLARES, and it used to carry `-p no:cacheprovider`.
+# That flag belongs to the controller, not to the project's own command, and
+# having it here meant the container chain test never saw the `.pytest_cache/`
+# directory a real `commands.test` leaves in the mounted worktree -- a fixture
+# encoding a shape reality never produces. Measured in Task 10: every
+# successful reproduction on both fixtures reported "the reproduction modified
+# the worktree while it ran" naming four `.pytest_cache` paths, and left the
+# directory behind in the repository.
+_TEST_COMMAND = "python -m pytest -q"
 
 
 class _FakeProvider:
@@ -460,6 +468,15 @@ def test_the_controller_runs_the_artifact_inside_a_container(ctx, tmp_path):
     assert result["reproduced"] is True
     assert [p.name for p in ctx.project_root.rglob("*whetstone_repro*")] == []
     assert list(ctx.project_root.rglob("*.xml")) == []
+    # AND THE WORKTREE IS LEFT AS IT WAS FOUND. pytest's cache plugin writes
+    # `.pytest_cache/` into the mount, which is neither the artifact nor
+    # anything the model wrote -- so it was attributed to the reproduction as a
+    # worktree mutation on every successful run, and it stayed in the user's
+    # repository afterwards. A skip that fires every time is a skip nobody
+    # reads.
+    assert not (ctx.project_root / ".pytest_cache").exists()
+    assert result["mutation"] is None, skips
+    assert skips == []
 
 
 @docker_expected

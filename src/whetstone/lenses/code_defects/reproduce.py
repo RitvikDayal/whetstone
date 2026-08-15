@@ -314,7 +314,23 @@ def reproduce(
         # afterwards. No defensive quoting: the argv reaches docker without a
         # host shell, so the container's own `sh -lc` is the only thing that
         # parses this string.
-        inner = f"{test_command} {path.name} --junit-xml={report.name}"
+        #
+        # `-p no:cacheprovider` is the controller's, not the project's. Without
+        # it pytest writes `.pytest_cache/` into the mounted worktree, and the
+        # fingerprint below attributed those four files to the reproduction:
+        # every successful run on both Task 10 fixtures reported "the
+        # reproduction modified the worktree while it ran", and left the
+        # directory behind in the user's repository. Neither the artifact nor
+        # the model put it there, so the report was false in the one channel
+        # that exists to say a repro touched something it should not have -- and
+        # a skip that fires on every single run is a skip nobody reads. Appended
+        # here alongside `--junit-xml` for the same reason that flag is: the
+        # artifact is `kind: "pytest"` by contract, so the command being run is
+        # pytest and these are its own flags.
+        inner = (
+            f"{test_command} {path.name} --junit-xml={report.name} "
+            f"-p no:cacheprovider"
+        )
         shell = run_sandboxed(
             inner,
             ctx.project_root,
