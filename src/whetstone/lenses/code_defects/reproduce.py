@@ -74,7 +74,7 @@ from xml.etree import ElementTree
 from ...policy.profiles import profile_for
 from ...provider import sentinel
 from ...provider.base import Provider, StageRequest
-from ...sandbox import availability, run_sandboxed
+from ...sandbox import CONTAINER_SCRATCH, availability, run_sandboxed
 from ...schemas import load_schema
 from ..base import RunContext
 from .prompts import load_prompt
@@ -314,7 +314,34 @@ def reproduce(
         # afterwards. No defensive quoting: the argv reaches docker without a
         # host shell, so the container's own `sh -lc` is the only thing that
         # parses this string.
-        inner = f"{test_command} {path.name} --junit-xml={report.name}"
+        #
+        # `-o cache_dir=...` is the controller's, not the project's. Without it
+        # pytest writes `.pytest_cache/` into the mounted worktree, and the
+        # fingerprint below attributed those four files to the reproduction:
+        # every successful run on both Task 10 fixtures reported "the
+        # reproduction modified the worktree while it ran", and left the
+        # directory behind in the user's repository. Neither the artifact nor
+        # the model put it there, so the report was false in the one channel
+        # that exists to say a repro touched something it should not have -- and
+        # a skip that fires on every single run is a skip nobody reads. Appended
+        # here alongside `--junit-xml` for the same reason that flag is: the
+        # artifact is `kind: "pytest"` by contract, so the command being run is
+        # pytest and these are its own flags.
+        #
+        # RELOCATED, NOT DISABLED, and the difference is a wrong answer about
+        # somebody's defect. The first version of this appended
+        # `-p no:cacheprovider`, which removes `--lf`, `--ff`, `--nf` and the
+        # `cache` fixture along with the directory: a target whose declared test
+        # command carries `--lf` then fails in pytest's own argument parsing,
+        # exits 4, and `_verdict_from` files `inconclusive` -- our flag
+        # answering a question about their code. `-o` comes last, so it also
+        # wins over a `cache_dir` the target set in its own ini file, which is
+        # the direction that matters: we must not write there whatever they
+        # configured.
+        inner = (
+            f"{test_command} {path.name} --junit-xml={report.name} "
+            f"-o cache_dir={CONTAINER_SCRATCH}/pytest-cache"
+        )
         shell = run_sandboxed(
             inner,
             ctx.project_root,
