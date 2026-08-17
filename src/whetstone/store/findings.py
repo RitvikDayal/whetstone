@@ -216,7 +216,14 @@ def list_findings(
     *,
     state: str | None = None,
     lens: str | None = None,
+    grade: str | None = None,
 ) -> list[Finding]:
+    """Stored findings, filtered. `None` for a filter means "do not filter".
+
+    `grade=None` therefore returns UNGRADED rows too -- it is not a filter for
+    "has no grade". Nothing needs that yet, and spelling it as `None` would
+    make the absent-filter case unreachable.
+    """
     clauses: list[str] = []
     params: list[str] = []
     if state is not None:
@@ -225,6 +232,9 @@ def list_findings(
     if lens is not None:
         clauses.append("lens = ?")
         params.append(lens)
+    if grade is not None:
+        clauses.append("grade = ?")
+        params.append(grade)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     # GRADE FIRST, severity second. Severity is what the model claimed about
     # its own finding; grade is what survived the gate, and the gate is the
