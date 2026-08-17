@@ -14,10 +14,13 @@ from .config.loader import find_config, load_config
 from .config.model import Tier
 from .doctor import run_doctor
 from .errors import ReportError, WhetstoneError
+from .grade import Grade
 from .initialize.wizard import run_wizard
 from .paths import state_root
+from .queue.dispositions import Disposition
+from .queue.dispositions import apply as apply_disposition
 from .report.html import render_report, write_report
-from .runner import RunResult, execute_run, get_last_run
+from .runner import RunResult, _now, execute_run, get_last_run
 from .store.db import connect
 from .store.findings import FindingState, list_findings
 
@@ -49,6 +52,31 @@ _OutOption = typer.Option(
 _StateOption = typer.Option(
     FindingState.queued, "--state", help="Filter by finding state."
 )
+_GradeOption = typer.Option(
+    None, "--grade", help="Filter by grade: A, B, C or D."
+)
+_LensOption = typer.Option(None, "--lens", help="Filter by lens name.")
+_ReasonOption = typer.Option(None, "--reason", help="Why. Required by reject.")
+_WakeOption = typer.Option(
+    None, "--wake", help="A date or condition. Required by defer."
+)
+_AssigneeOption = typer.Option(
+    None, "--assignee", help="Who takes it. Required by hand-off."
+)
+_YesOption = typer.Option(
+    False, "--yes", help="Skip the confirmation on reject. For scripting."
+)
+
+# The prefix `findings` prints and `decide` accepts. Eight hex characters is
+# 4 billion values -- ample for one project's queue -- and short enough to
+# retype from a terminal, which a 32-character uuid4 is not.
+_ID_PREFIX = 8
+
+# Arguments as module-level singletons for the same B008 reason as the options
+# above: a `typer.Argument(...)` call in a default is flagged whenever the
+# parameter is not a plain builtin.
+_FindingIdArgument = typer.Argument(..., help="A finding id, or a prefix of one.")
+_DispositionArgument = typer.Argument(..., help="What to do with it.")
 
 
 # `no_args_is_help` is deliberately NOT set. Click implements it inside
@@ -253,6 +281,8 @@ def _grade_cell(grade: str | None) -> str:
 def findings(
     path: Path = _PathOption,
     state: FindingState = _StateOption,
+    grade: Grade = _GradeOption,
+    lens: str = _LensOption,
 ) -> None:
     """List findings.
 
@@ -263,7 +293,12 @@ def findings(
     try:
         cfg, _, root = _load(path.resolve())
         with contextlib.closing(connect(root)) as conn:
-            rows = list_findings(conn, state=str(state))
+            rows = list_findings(
+                conn,
+                state=str(state),
+                grade=None if grade is None else str(grade),
+                lens=lens,
+            )
             last = get_last_run(conn)
     except WhetstoneError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -279,10 +314,17 @@ def findings(
         console.print(f"No findings in state '{state}'.")
         return
 
-    table = Table("grade", "severity", "lens", "subject", "title")
+    table = Table("id", "grade", "severity", "lens", "subject", "title")
     for row in rows:
+        # The PREFIX, not the id. A 32-character uuid4 in every row is noise
+        # nobody reads and nobody can retype, and `decide` accepts the prefix.
         table.add_row(
-            _grade_cell(row.grade), row.severity, row.lens, row.subject, row.title[:70]
+            row.id[:_ID_PREFIX],
+            _grade_cell(row.grade),
+            row.severity,
+            row.lens,
+            row.subject,
+            row.title[:70],
         )
     console.print(table)
 
@@ -295,6 +337,92 @@ def findings(
             "shown, and sorted last, because a tool that quietly drops what it "
             "refuted cannot be checked.[/dim]"
         )
+
+
+def _resolve_finding_id(conn, given: str) -> str:
+    """A full id, or any UNAMBIGUOUS prefix of one.
+
+    Refuses an ambiguous prefix by listing what it matched rather than taking
+    the first. `reject` is irreversible, so picking whichever row came back
+    first would apply a permanent decision to a finding the user did not name.
+    """
+    # No exact-match shortcut. Every id is a 32-character uuid4 hex, so they
+    # are all the same length -- a full id can never be a strict prefix of a
+    # different one, which makes an exact match always an unambiguous prefix
+    # and the shortcut dead code. The mutation battery found it: removing the
+    # branch changed no behaviour and broke no test.
+    rows = list_findings(conn, state=None)
+    matches = [row for row in rows if row.id.startswith(given)] if given else rows
+    if not matches:
+        raise WhetstoneError(
+            f"no finding whose id starts with {given!r}. Run `whetstone "
+            "findings` to see the ids this project has."
+        )
+    if len(matches) > 1:
+        listed = "\n".join(
+            f"  {row.id[:_ID_PREFIX]}  {row.subject}  {row.title[:50]}"
+            for row in matches[:10]
+        )
+        raise WhetstoneError(
+            f"{given!r} matches {len(matches)} findings, so it is not a "
+            f"finding. Give more characters:\n{listed}"
+        )
+    return matches[0].id
+
+
+@app.command()
+def decide(
+    finding_id: str = _FindingIdArgument,
+    disposition: Disposition = _DispositionArgument,
+    path: Path = _PathOption,
+    reason: str = _ReasonOption,
+    wake: str = _WakeOption,
+    assignee: str = _AssigneeOption,
+    yes: bool = _YesOption,
+) -> None:
+    """Record a decision about a finding. The decision survives every re-run.
+
+    reject is the only one a later run cannot undo, so it asks first. --yes
+    skips that, for scripting.
+    """
+    try:
+        cfg, _, root = _load(path.resolve())
+        with contextlib.closing(connect(root)) as conn:
+            resolved = _resolve_finding_id(conn, finding_id)
+            (row,) = [f for f in list_findings(conn, state=None) if f.id == resolved]
+
+            # Shown before it happens, not after. The id was probably a prefix,
+            # so the user has not necessarily seen which finding this is.
+            console.print(
+                f"{disposition}: [bold]{row.subject}[/bold] - {row.title[:70]}"
+            )
+            # Only reject. A prompt on all six is a prompt nobody reads, and
+            # the other five are recoverable by deciding again.
+            needs_confirming = disposition is Disposition.reject and not yes
+            if needs_confirming and not typer.confirm(
+                "Rejecting is permanent -- it suppresses this finding on "
+                "every future run. Continue?"
+            ):
+                console.print("Nothing was recorded.")
+                raise typer.Exit(code=1)
+
+            new_state = apply_disposition(
+                conn,
+                resolved,
+                disposition,
+                reason=reason,
+                wake=wake,
+                assignee=assignee,
+                now=_now(),
+            )
+    except WhetstoneError as exc:
+        # DispositionError already carries the sentence naming the argument AND
+        # why it is required. Printed as-is rather than replaced with a second,
+        # worse message.
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]{row.subject} is now {new_state}.[/green]")
 
 
 @app.command()

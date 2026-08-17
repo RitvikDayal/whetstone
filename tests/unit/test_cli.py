@@ -1078,3 +1078,273 @@ def test_no_typed_config_field_is_named_like_a_secret():
         "hand it a SecretStr the annotation does not accept:\n  "
         + "\n  ".join(offenders)
     )
+
+
+# --- decide: driving the queue from the command line -------------------------
+#
+# Finding ids are 32-character uuid4 hex. Nobody types one, so `findings` shows
+# a short prefix and `decide` accepts any unambiguous prefix -- and refuses an
+# ambiguous one by listing the matches rather than picking whichever came first.
+
+
+def _seed_for_decide(root: Path) -> list[str]:
+    from whetstone.config.loader import find_config, load_config
+    from whetstone.grade import Grade
+    from whetstone.lenses.base import Candidate, Evidence, EvidenceKind, Severity
+    from whetstone.paths import state_root
+    from whetstone.store.db import connect
+    from whetstone.store.findings import list_findings, upsert
+
+    cfg = load_config(find_config(root))
+    conn = connect(state_root(root, cfg.state_dir))
+    for i, subject in enumerate(("a.py:1", "b.py:2")):
+        upsert(
+            conn,
+            Candidate(
+                lens="code-defects",
+                rule_id="defect",
+                subject=subject,
+                title=f"finding {i}",
+                detail="d",
+                severity=Severity.high,
+                evidence=Evidence(EvidenceKind.repro, "s", {}),
+                grade=Grade.A,
+                grade_reason="graded A: reproduced.",
+            ),
+            "run-1",
+            "2026-08-17T10:00:00+00:00",
+        )
+    ids = [f.id for f in list_findings(conn)]
+    conn.close()
+    return ids
+
+
+def _state_of(root: Path, finding_id: str) -> str:
+    from whetstone.config.loader import find_config, load_config
+    from whetstone.paths import state_root
+    from whetstone.store.db import connect
+    from whetstone.store.findings import list_findings
+
+    cfg = load_config(find_config(root))
+    conn = connect(state_root(root, cfg.state_dir))
+    try:
+        return next(f.state for f in list_findings(conn) if f.id == finding_id)
+    finally:
+        conn.close()
+
+
+def test_decide_moves_a_finding(tmp_path, monkeypatch):
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    fid = _seed_for_decide(tmp_path)[0]
+
+    result = runner.invoke(
+        app, ["decide", fid, "verify", "--path", str(tmp_path), "--yes"]
+    )
+    assert result.exit_code == 0, result.stdout
+    assert _state_of(tmp_path, fid) == "verified"
+
+
+@pytest.mark.parametrize(
+    "disposition,flags,expected",
+    [
+        ("verify", [], "verified"),
+        ("implement", [], "building"),
+        ("hand_off", ["--assignee", "ritvik"], "handed_off"),
+        ("defer", ["--wake", "2026-09-01"], "deferred"),
+        ("reject", ["--reason", "intended"], "rejected"),
+        ("needs_evidence", ["--reason", "no repro"], "queued"),
+    ],
+)
+def test_decide_drives_every_disposition(
+    tmp_path, monkeypatch, disposition, flags, expected
+):
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    fid = _seed_for_decide(tmp_path)[0]
+
+    result = runner.invoke(
+        app,
+        ["decide", fid, disposition, "--path", str(tmp_path), "--yes", *flags],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert _state_of(tmp_path, fid) == expected
+
+
+def test_a_missing_required_argument_reaches_the_user_with_its_reason(
+    tmp_path, monkeypatch
+):
+    """`DispositionError` already carries the sentence. The test is that it
+    survives to stdout, not that the CLI writes a second one."""
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    fid = _seed_for_decide(tmp_path)[0]
+
+    result = runner.invoke(
+        app, ["decide", fid, "reject", "--path", str(tmp_path), "--yes"]
+    )
+    assert result.exit_code != 0
+    assert "calibrates the lens" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
+def test_reject_asks_before_it_does_it(tmp_path, monkeypatch):
+    """The only disposition a re-run cannot undo."""
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    fid = _seed_for_decide(tmp_path)[0]
+
+    result = runner.invoke(
+        app,
+        ["decide", fid, "reject", "--reason", "no", "--path", str(tmp_path)],
+        input="n\n",
+    )
+    assert _state_of(tmp_path, fid) == "queued", "declined, and it happened anyway"
+    assert result.exit_code != 0
+
+
+def test_reject_proceeds_when_confirmed(tmp_path, monkeypatch):
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    fid = _seed_for_decide(tmp_path)[0]
+
+    runner.invoke(
+        app,
+        ["decide", fid, "reject", "--reason", "no", "--path", str(tmp_path)],
+        input="y\n",
+    )
+    assert _state_of(tmp_path, fid) == "rejected"
+
+
+def test_only_reject_asks(tmp_path, monkeypatch):
+    """A prompt on every disposition is a prompt nobody reads."""
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    fid = _seed_for_decide(tmp_path)[0]
+
+    result = runner.invoke(
+        app, ["decide", fid, "verify", "--path", str(tmp_path)], input=""
+    )
+    assert result.exit_code == 0, result.stdout
+    assert _state_of(tmp_path, fid) == "verified"
+
+
+def test_an_unambiguous_prefix_is_enough(tmp_path, monkeypatch):
+    """32 hex characters is not something anyone types."""
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    fid = _seed_for_decide(tmp_path)[0]
+
+    result = runner.invoke(
+        app, ["decide", fid[:8], "verify", "--path", str(tmp_path), "--yes"]
+    )
+    assert result.exit_code == 0, result.stdout
+    assert _state_of(tmp_path, fid) == "verified"
+
+
+def test_an_ambiguous_prefix_refuses_and_lists_the_matches(tmp_path, monkeypatch):
+    """Picking whichever matched first would apply an irreversible decision to
+    a finding the user did not name."""
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    ids = _seed_for_decide(tmp_path)
+    shared = ""  # every id shares the empty prefix, so this is always ambiguous
+
+    result = runner.invoke(
+        app, ["decide", shared, "verify", "--path", str(tmp_path), "--yes"]
+    )
+    assert result.exit_code != 0
+    assert all(_state_of(tmp_path, i) == "queued" for i in ids)
+    assert "Traceback" not in result.stdout
+
+
+def test_a_prefix_matching_nothing_says_so(tmp_path, monkeypatch):
+    """Asserted on the MESSAGE, not just the exit code.
+
+    Removing the no-match guard leaves `matches[0]` on an empty list -- an
+    IndexError, which CliRunner reports as exit 1 with the traceback on
+    `result.exception` rather than in stdout. "exit_code != 0 and no
+    'Traceback' in stdout" was true of both the guard and its absence.
+    """
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    _seed_for_decide(tmp_path)
+
+    result = runner.invoke(
+        app, ["decide", "zzzzzzzz", "verify", "--path", str(tmp_path), "--yes"]
+    )
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit), (
+        f"escaped as {result.exception!r} instead of a message"
+    )
+    assert "no finding whose id starts with" in result.stdout
+    assert "zzzzzzzz" in result.stdout
+
+
+def test_a_prefix_must_be_a_prefix_not_a_substring(tmp_path, monkeypatch):
+    """`given in row.id` would resolve a fragment from the MIDDLE of an id.
+
+    Ids are hex, so a middle fragment is a plausible thing to paste by
+    accident, and resolving it applies a decision to a finding the user never
+    named -- the same failure the ambiguity check exists to prevent, arriving
+    through a different door.
+    """
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    fid = _seed_for_decide(tmp_path)[0]
+    middle = fid[8:16]
+
+    result = runner.invoke(
+        app, ["decide", middle, "verify", "--path", str(tmp_path), "--yes"]
+    )
+    assert result.exit_code != 0, "a mid-id fragment resolved to a finding"
+    assert _state_of(tmp_path, fid) == "queued"
+
+
+def test_findings_shows_an_id_short_enough_to_type(tmp_path, monkeypatch):
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    ids = _seed_for_decide(tmp_path)
+
+    result = runner.invoke(app, ["findings", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
+    # The COLUMN as well as the value: dropping "id" from the header left the
+    # prefix in every row and the table one header short, which no assertion
+    # on the value alone can see.
+    header = next(
+        line
+        for line in result.stdout.splitlines()
+        if "grade" in line and "severity" in line
+    )
+    assert "id" in header
+    assert ids[0][:8] in result.stdout
+    assert ids[0] not in result.stdout, "the full 32-char id is noise in a table"
+
+
+def test_findings_filters_by_grade_and_by_lens(tmp_path, monkeypatch):
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    _seed_graded_findings(tmp_path)
+
+    graded = runner.invoke(app, ["findings", "--path", str(tmp_path), "--grade", "D"])
+    assert graded.exit_code == 0, graded.stdout
+    assert "z.py" in graded.stdout
+    assert "m.py" not in graded.stdout
+
+    lensed = runner.invoke(
+        app, ["findings", "--path", str(tmp_path), "--lens", "hygiene"]
+    )
+    assert lensed.exit_code == 0, lensed.stdout
+    assert "requests" in lensed.stdout
+    assert "m.py" not in lensed.stdout
+
+
+@pytest.mark.parametrize("bad", ["E", "a", "critical"])
+def test_findings_rejects_a_grade_that_is_not_a_grade(tmp_path, monkeypatch, bad):
+    """Same argument as `--state`: an unvalidated filter answers a typo with an
+    empty list and exit 0, which reads exactly like a clean project."""
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    result = runner.invoke(app, ["findings", "--path", str(tmp_path), "--grade", bad])
+    assert result.exit_code != 0
+    assert "No findings" not in result.output
