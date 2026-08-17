@@ -73,7 +73,17 @@ def _payload(**overrides) -> dict:
     return base
 
 
-def _result(*, mutation: str | None = "M orders.py", ok: bool = True, **overrides):
+# What `sentinel.assert_unchanged` actually returns: a human-readable sentence,
+# not a porcelain status token. The fixture said "M orders.py", which is a shape
+# this code never receives -- and a fixture encoding a shape reality does not
+# produce is how this project has locked in the illusion of a check before.
+_MUTATION = (
+    "the worktree at /tmp/wt changed while the stage ran. "
+    "now: M orders.py; ?? test_orders.py"
+)
+
+
+def _result(*, mutation: str | None = _MUTATION, ok: bool = True, **overrides):
     base = dict(
         ok=ok,
         data=_payload(),
