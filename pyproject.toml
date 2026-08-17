@@ -17,6 +17,17 @@ dependencies = [
     "jsonschema>=4.26.0",
 ]
 
+[project.optional-dependencies]
+# The browser lens only. An OPTIONAL extra rather than a runtime dependency,
+# because Playwright pulls a browser download of a few hundred megabytes and
+# most people run `hygiene` and `code-defects` and never a browser at all --
+# the same argument that keeps pip-audit out of `dependencies`. Installing
+# `whetstone` should not cost a Chromium build.
+#
+# The lens reports its absence and says so, exactly as `deps` does for a
+# missing pip-audit. It never silently skips.
+browser = ["playwright>=1.47"]
+
 [project.scripts]
 whetstone = "whetstone.cli:app"
 
@@ -30,7 +41,7 @@ Source = "https://github.com/RitvikDayal/whetstone"
 # says so when there is none. It is pinned here because the regression tests for
 # the ambient-environment defect run the real tool, and a test that silently
 # never runs is how that defect survived three review passes.
-dev = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.5", "pip-audit>=2.9"]
+dev = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.5", "pip-audit>=2.9", "playwright>=1.47"]
 
 [build-system]
 requires = ["hatchling"]
