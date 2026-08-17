@@ -238,6 +238,19 @@ def test_changed_files_on_a_clean_tree_is_empty(tree):
     assert changed_files(tree) == []
 
 
+def test_a_rename_reports_the_destination_and_not_a_corrupted_origin(tree):
+    """`--porcelain -z` emits a rename as TWO fields: the record, then a bare
+    origin path.
+
+    The first parser treated that origin as another record and sliced three
+    characters off it, reporting a path no file has -- which would then be
+    handed to the verifier to revert. Only untracked files were tested, so
+    nothing noticed.
+    """
+    subprocess.run(["git", "mv", "orders.py", "renamed.py"], cwd=tree, check=True)
+    assert changed_files(tree) == ["renamed.py"]
+
+
 # --- refusals ---------------------------------------------------------------------
 
 
@@ -297,9 +310,25 @@ def test_the_implementer_is_told_not_to_touch_the_reproduction(tmp_path, tree):
     assert "test_reproduces" in facts["reproduction"]
 
 
-def test_the_implementer_gets_the_hypothesis_unlike_the_falsifier(tmp_path):
+def test_the_implementer_gets_the_hypothesis_unlike_the_falsifier():
     """Deliberate asymmetry. The falsifier is denied the hunter's hypothesis to
     prevent anchoring; the implementer is fixing the cause, and withholding the
-    cause from the thing asked to fix it would be theatre."""
+    cause from the thing asked to fix it would be theatre.
+
+    Asserts the HYPOTHESIS, by its exact value. The first version searched
+    `observation` for a substring and passed while `_substitutions` discarded
+    `root_cause_hypothesis` entirely -- the docstring claimed the implementer
+    got it and the map did not contain it, and the test looked at the wrong
+    field to notice.
+    """
     facts = _substitutions(_CANDIDATE, _REPRODUCTION, _VERDICT)
-    assert "no guard" in facts["observation"]
+    assert facts["root_cause_hypothesis"] == _CANDIDATE["root_cause_hypothesis"]
+    assert facts["root_cause_hypothesis"] != facts["observation"]
+
+
+def test_the_hypothesis_reaches_the_rendered_prompt():
+    """A substitution nothing references is a substitution that does nothing."""
+    from whetstone.lenses.code_defects.implement import _prompt_for
+
+    rendered = _prompt_for(_CANDIDATE, _REPRODUCTION, _VERDICT)
+    assert _CANDIDATE["root_cause_hypothesis"] in rendered

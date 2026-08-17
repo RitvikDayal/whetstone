@@ -73,14 +73,27 @@ def changed_files(worktree: Path) -> list[str]:
     )
     if completed.returncode != 0:
         return []
-    # Each record is "XY <path>"; the status letters are two columns plus a
-    # space, and a rename carries a second NUL-separated path which is dropped
-    # here because the destination is the file that exists now.
-    return sorted(
-        record[3:]
-        for record in completed.stdout.split("\0")
-        if len(record) > 3
-    )
+    # Each record is "XY <path>". A RENAME or COPY emits a SECOND, bare
+    # NUL-separated field holding the ORIGIN path -- measured:
+    # `git mv orders.py renamed.py` produces `R  renamed.py` then `orders.py`.
+    # The first version treated that origin as another status record and sliced
+    # three characters off it, so a rename reported `ers.py` -- a path no file
+    # has, which would then be handed to the verifier to revert. Only untracked
+    # files were tested, so nothing noticed.
+    records = [r for r in completed.stdout.split(chr(0)) if r]
+    paths: list[str] = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if len(record) <= 3:
+            continue
+        status, path = record[:2], record[3:]
+        paths.append(path)
+        if "R" in status or "C" in status:
+            # Consume the origin. It is a bare path, not a record.
+            index += 1
+    return sorted(paths)
 
 
 def _reproduction_text(reproduction: dict[str, Any]) -> str:
@@ -123,6 +136,12 @@ def _substitutions(
     """
     return {
         "observation": str(candidate.get("observation") or ""),
+        # PASSED, not merely claimed. The docstring below said the implementer
+        # gets the hypothesis and the map did not contain it -- an argued
+        # guarantee with nothing behind it, which is the shape this project
+        # keeps producing. The prompt has a `$root_cause_hypothesis` slot now,
+        # so the placeholder test would go red if it were dropped again.
+        "root_cause_hypothesis": str(candidate.get("root_cause_hypothesis") or ""),
         "subject": str(candidate.get("subject") or ""),
         "reproduction": _reproduction_text(reproduction),
         "counterargument": str(verdict.get("strongest_counterargument") or ""),

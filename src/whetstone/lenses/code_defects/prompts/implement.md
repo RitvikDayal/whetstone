@@ -10,6 +10,13 @@ $observation
 
 $subject
 
+## What the hunter believed the cause was
+
+$root_cause_hypothesis
+
+Treat that as a lead, not a finding. It was one process's reading and nothing
+has verified it -- if the code says otherwise, the code is right.
+
 ## What the reproduction established
 
 $reproduction
