@@ -9,6 +9,7 @@ whitespace character that is also a command separator.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import pytest
 
@@ -391,3 +392,91 @@ def test_profile_for_an_unknown_stage_refuses_rather_than_defaulting():
     """Defaulting to a permissive set would make a typo a privilege escalation."""
     with pytest.raises(PolicyError, match="nosuchstage"):
         profile_for("nosuchstage")
+
+
+# --- the implement profile: the first stage in this project that may write ----
+#
+# D21 gave no M1a stage a shell and every stage since has been bounded to
+# Read/Grep/Glob. An implementer that cannot write cannot implement, so this is
+# where that posture changes -- and it changes for exactly one stage, by exactly
+# two tools, with the worktree as the write root.
+#
+# What does NOT change: Bash, Agent and TaskCreate stay forbidden. A subagent is
+# an unbounded tool set reachable from a bounded one, and a reviewer already
+# proved the escape -- a subagent spawned from a profile granting neither fell
+# back to Bash when its Write was refused and wrote the file anyway.
+
+
+def test_the_implement_profile_may_write():
+    from whetstone.policy.profiles import implement_profile
+
+    permissions = implement_profile(Path("/tmp/worktree"))
+    assert "Write" in permissions.available_tools
+    assert "Edit" in permissions.available_tools
+
+
+def test_the_implement_profile_still_has_no_shell_and_no_subagent():
+    """The tools that make a bound escapable, not the tools that make it a
+    writer. Granting Write is the point; granting Bash would make the write
+    root advisory, because a shell can write anywhere."""
+    from whetstone.policy.profiles import FORBIDDEN_IN_M1A, implement_profile
+
+    permissions = implement_profile(Path("/tmp/worktree"))
+    assert not (permissions.available_tools & FORBIDDEN_IN_M1A)
+    assert not (permissions.auto_approve & FORBIDDEN_IN_M1A)
+    # The deny list too. It is redundant today -- a name absent from
+    # `available_tools` cannot be called anyway -- and this module's docstring
+    # keeps it for the day a CLI release changes what `--tools` means. That is
+    # an argued guarantee, so it gets an assertion: emptying `denied_tools`
+    # survived a battery that checked only the available set.
+    assert FORBIDDEN_IN_M1A <= permissions.denied_tools
+
+
+def test_the_implement_profile_scopes_writes_to_the_worktree():
+    from whetstone.policy.profiles import implement_profile
+
+    tree = Path("/tmp/worktree")
+    assert implement_profile(tree).write_root == tree
+
+
+def test_the_implement_profile_refuses_to_be_built_without_a_worktree():
+    """`write_root=None` is what every read-only profile carries, and it means
+    "no writes are expected". A writing profile with no root is the one
+    combination that must never exist -- it reads as bounded and is not."""
+    from whetstone.policy.gate import PolicyError
+    from whetstone.policy.profiles import implement_profile
+
+    with pytest.raises(PolicyError, match="write root"):
+        implement_profile(None)
+
+
+def test_no_read_only_profile_acquired_a_write_tool():
+    """The guard for the change this milestone makes. Adding Write to the
+    implement profile must not be the edit that adds it to hunt as well."""
+    from whetstone.policy.profiles import PROFILES
+
+    for name, permissions in PROFILES.items():
+        assert not (permissions.available_tools & {"Edit", "Write", "NotebookEdit"}), (
+            f"{name} acquired a write tool"
+        )
+        assert permissions.write_root is None, f"{name} acquired a write root"
+
+
+def test_the_implement_profile_is_not_in_the_static_table():
+    """It cannot be: its write root is the run's worktree, which does not exist
+    when this module is imported. A static entry would have to carry
+    `write_root=None`, which is the combination the constructor refuses."""
+    from whetstone.policy.profiles import PROFILES
+
+    assert "implement" not in PROFILES
+
+
+def test_profile_for_still_refuses_implement_by_name():
+    """`profile_for` reads the static table, and a caller reaching for the
+    implement profile through it has forgotten to supply a worktree. Refusing
+    beats returning something read-only that silently cannot write."""
+    from whetstone.policy.gate import PolicyError
+    from whetstone.policy.profiles import profile_for
+
+    with pytest.raises(PolicyError, match="implement"):
+        profile_for("implement")

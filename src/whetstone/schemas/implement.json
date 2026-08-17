@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "implement",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["changed_files", "summary", "regression_test"],
+  "properties": {
+    "changed_files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "description": "Every file the stage edited or created, worktree-relative. THE SENTINEL RE-DERIVES THIS FROM THE FILESYSTEM AND OVERRIDES IT -- a stage that under-reports what it touched is the case this field exists to expose, not to be believed about.",
+      "items": {"type": "string", "minLength": 1, "maxLength": 300}
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "What was changed and why, in prose a reviewer reads before the diff."
+    },
+    "regression_test": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["path", "test_name"],
+      "description": "The test that fails without the fix and passes with it. Null is honest when none could be written, and the controller then refuses to verify -- a fix with no regression test cannot be re-checked, which is invariant 3 one layer up from the reproduction.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Worktree-relative path of the test file."
+        },
+        "test_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "The test function's name, so the verifier can select it rather than running the whole suite and hoping."
+        }
+      }
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "maxLength": 2000,
+      "description": "Anything the stage wants on the record. An empty implement stage says so here rather than inventing a change."
+    }
+  }
+}

@@ -32,7 +32,7 @@ from typing import Any
 
 _HERE = Path(__file__).parent
 
-SCHEMA_NAMES: tuple[str, ...] = ("hunt", "reproduce", "falsify")
+SCHEMA_NAMES: tuple[str, ...] = ("hunt", "reproduce", "falsify", "implement")
 
 
 @cache

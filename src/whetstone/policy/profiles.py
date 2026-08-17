@@ -37,6 +37,8 @@ result.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .gate import PermissionSet, PolicyError
 
 _READ_DENIED = (
@@ -86,6 +88,12 @@ def profile_for(stage: str) -> PermissionSet:
     Defaulting to a permissive set would turn a typo into a privilege
     escalation, so an unknown stage is an error rather than a fallback.
     """
+    if stage == "implement":
+        raise PolicyError(
+            "the implement profile is per-run and cannot be looked up by "
+            "name: it is scoped to that run's worktree. Call "
+            "`implement_profile(worktree)`."
+        )
     try:
         return PROFILES[stage]
     except KeyError as exc:
@@ -93,3 +101,50 @@ def profile_for(stage: str) -> PermissionSet:
             f"no permission profile for stage {stage!r}. "
             f"Known stages: {', '.join(sorted(PROFILES))}."
         ) from exc
+
+
+# Read-only inspection PLUS the two tools that write. Not `NotebookEdit`: a
+# notebook is not what this stage fixes, and every tool granted is one whose
+# behaviour has to be understood before it can be bounded.
+_WRITE = frozenset({"Edit", "Write"})
+_IMPLEMENT_TOOLS = _INSPECT | _WRITE
+
+
+def implement_profile(worktree: Path | None) -> PermissionSet:
+    """The first profile in this project that may write. Scoped to *worktree*.
+
+    THIS IS WHERE M1a's POSTURE CHANGES, for exactly one stage and by exactly
+    two tools. D21 gave no M1a stage a shell and every stage since has held
+    `Read`, `Grep`, `Glob` and nothing else; an implementer that cannot write
+    cannot implement.
+
+    WHAT DOES NOT CHANGE: `Bash`, `Agent` and `TaskCreate` stay forbidden, and
+    that is what keeps the write root meaningful. A shell can write anywhere,
+    so granting one would make `--add-dir` advisory; and a subagent is an
+    unbounded tool set reachable from a bounded one -- a reviewer spawned one
+    from a profile granting neither, and when its `Write` was refused it fell
+    back to `Bash` and wrote the file anyway.
+
+    A WRITING PROFILE WITH NO WRITE ROOT IS REFUSED. `write_root=None` is what
+    every read-only profile carries and it means "no writes are expected".
+    Combined with `Write` it reads as bounded and is not -- the exact shape of
+    the `--allowedTools` defect that cost M1a three revisions.
+
+    THE RESIDUAL, live rather than latent now that a stage can write:
+    `--add-dir` scopes WRITES only. Reads stay unbounded filesystem-wide, so a
+    stage that can write is a stage that can copy what it read into a file it
+    writes. Closing that needs a process boundary and is not this task's.
+    """
+    if worktree is None:
+        raise PolicyError(
+            "an implement profile needs a write root -- the run's worktree. A "
+            "profile holding Write with no root reads as bounded and is not."
+        )
+    return PermissionSet(
+        available_tools=_IMPLEMENT_TOOLS,
+        auto_approve=_IMPLEMENT_TOOLS,
+        denied_tools=FORBIDDEN_IN_M1A,
+        bash_allowlist=frozenset(),
+        read_denied=_READ_DENIED,
+        write_root=worktree,
+    )
