@@ -18,7 +18,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).parent
 
-PROMPT_NAMES: tuple[str, ...] = ("hunt", "reproduce", "falsify")
+PROMPT_NAMES: tuple[str, ...] = ("hunt", "reproduce", "falsify", "implement")
 
 
 @cache
