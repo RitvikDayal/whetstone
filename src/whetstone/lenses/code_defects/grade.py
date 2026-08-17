@@ -17,22 +17,10 @@ is a decision they cannot check.
 
 from __future__ import annotations
 
-from enum import StrEnum
-
-
-class Grade(StrEnum):
-    """Best to worst, in declaration order, so callers can sort on it.
-
-    A -- reproduced, executable, survived falsification.
-    B -- survived, but nothing runnable backs it.
-    C -- not reproduced.
-    D -- the falsifier killed it.
-    """
-
-    A = "A"
-    B = "B"
-    C = "C"
-    D = "D"
+# Re-exported: `Grade` is shared with `lenses/base.py`, which validates
+# `Candidate.grade` and must not import a lens pack to do it. See
+# whetstone/grade.py -- same argument, and same shape, as `Severity`.
+from ...grade import Grade as Grade
 
 
 def grade_finding(

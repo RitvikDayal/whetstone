@@ -224,6 +224,31 @@ def run(
         raise typer.Exit(code=1)
 
 
+def _grade_cell(grade: str | None) -> str:
+    """One cell that a reader can act on without knowing the vocabulary.
+
+    D carries the WORD `killed`, not just the letter. M1a's measurement is the
+    reason: on the clean fixture the falsifier killed the only candidate and
+    the list rendered it identically to the grade A from the buggy fixture, so
+    the differentiator was invisible at the only surface a user reads. A letter
+    in a column is a distinction a skimming reader does not make; a word
+    survives a screenshot, a pipe into a file, and a colourless terminal.
+
+    An absent grade prints `-`, never `D`. `hygiene` does not grade, and
+    rendering "nobody looked" as "the falsifier refuted it" is the exact
+    inversion this column exists to prevent.
+    """
+    if grade is None:
+        return "[dim]-[/dim]"
+    if grade == "D":
+        return "[red]D killed[/red]"
+    if grade == "A":
+        return "[green]A[/green]"
+    if grade == "C":
+        return "[yellow]C[/yellow]"
+    return grade
+
+
 @app.command()
 def findings(
     path: Path = _PathOption,
@@ -254,10 +279,22 @@ def findings(
         console.print(f"No findings in state '{state}'.")
         return
 
-    table = Table("severity", "lens", "subject", "title")
+    table = Table("grade", "severity", "lens", "subject", "title")
     for row in rows:
-        table.add_row(row.severity, row.lens, row.subject, row.title[:70])
+        table.add_row(
+            _grade_cell(row.grade), row.severity, row.lens, row.subject, row.title[:70]
+        )
     console.print(table)
+
+    # Said once, under the table, rather than by hiding the killed rows. A
+    # falsified finding is not noise -- it is the falsifier's work made visible,
+    # and hiding it by default hides the evidence that the tool discriminates.
+    if any(row.grade == "D" for row in rows):
+        console.print(
+            "[dim]Rows marked killed were refuted by the falsifier. They are "
+            "shown, and sorted last, because a tool that quietly drops what it "
+            "refuted cannot be checked.[/dim]"
+        )
 
 
 @app.command()

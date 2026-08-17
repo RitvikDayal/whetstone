@@ -92,6 +92,17 @@ _TEMPLATE = """\
   .sev-low { color: var(--low); } .sev-medium { color: var(--medium); }
   .sev-high { color: var(--high); } .sev-critical { color: var(--critical); }
   .empty { color: var(--muted); }
+  /* Grade is the more important axis: severity is what the model claimed,
+     grade is what survived the falsifier. A killed finding is dimmed whole and
+     labelled in words -- a letter in a badge is a distinction a skimming
+     reader does not make, and this report is read by people who will never
+     learn the vocabulary. */
+  .grade { font-weight: 600; }
+  .grade-A { color: var(--low); } .grade-B { color: var(--medium); }
+  .grade-C { color: var(--high); } .grade-D { color: var(--muted); }
+  .finding.killed { opacity: .62; }
+  .finding.killed h3 { font-weight: 500; }
+  .why { color: var(--muted); font-size: .85rem; margin: .35rem 0 0; }
 </style>
 </head>
 <body>
@@ -139,14 +150,21 @@ _TEMPLATE = """\
   {% endif %}
 
   {% for f in findings %}
-  <article class="finding">
+  <article class="finding{% if f.grade == 'D' %} killed{% endif %}">
     <h3>{{ f.title }}</h3>
     <p class="meta">
+      {% if f.grade %}
+      <span class="grade grade-{{ f.grade }}">{% if f.grade == 'D' %}killed by
+        the falsifier{% else %}grade {{ f.grade }}{% endif %}</span> ·
+      {% endif %}
       <span class="sev sev-{{ f.severity }}">{{ f.severity }}</span>
       · {{ f.lens }} · {{ f.rule_id }} · {{ f.subject }}
       · first seen {{ f.first_seen_run }}
     </p>
     <p class="detail">{{ f.detail }}</p>
+    {% if f.grade_reason %}
+    <p class="why">{{ f.grade_reason }}</p>
+    {% endif %}
   </article>
   {% endfor %}
 </main>

@@ -16,9 +16,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-# Re-exported: `Severity` is shared with `config`, which must not import the
-# lens layer. See whetstone/severity.py.
+# Re-exported: `Severity` is shared with `config`, and `Grade` with the store
+# and the CLI. Neither may import the lens layer. See whetstone/severity.py and
+# whetstone/grade.py.
 from ..errors import LensError
+from ..grade import Grade as Grade
 from ..severity import Severity as Severity
 from ..severity import severity_at_least as severity_at_least
 
@@ -326,6 +328,20 @@ class Candidate:
     detail: str
     severity: Severity
     evidence: Evidence
+    # What the evidence is worth, and why. Optional because most lenses do not
+    # grade: `hygiene` measures a threshold and is done, and an absent grade is
+    # NOT D. D is a verdict the falsifier reached; absent means nobody looked,
+    # and showing the second as the first reports a real defect as dismissed.
+    #
+    # It rides on the candidate rather than on `upsert(..., grade=...)` because
+    # the only caller of `upsert` is the runner, which is lens-agnostic by
+    # design. Passing it as a store argument would mean the spine reaching into
+    # `candidate.evidence.data["grade"]` -- parsing a lens pack's private
+    # payload by a string key no contract declares, and special-casing lens
+    # names for the packs that have no such key. `severity` is already here for
+    # exactly the same reason.
+    grade: Grade | None = None
+    grade_reason: str | None = None
 
     def __post_init__(self) -> None:
         """Validate every leaf at construction, not per detector.
@@ -369,6 +385,38 @@ class Candidate:
                 f"{type(self.evidence).__name__} ({self.evidence!r}). The store "
                 "calls evidence.to_json(); anything else raises AttributeError "
                 "inside the transaction."
+            )
+        self._validate_grade(owner)
+
+    def _validate_grade(self, owner: str) -> None:
+        """The grade and its reason travel together or not at all.
+
+        Issue #9's shape, one field over: the store writes `str(grade)`, so a
+        plain 'a' or 'sev-1' is recorded as plausible-looking text that no
+        filter matches and no reader can rank. The enum is required for the
+        same reason `severity` requires it.
+
+        And a grade without its reason is a verdict the user cannot check --
+        the vault's own rule that a bare date is a nag and a date with a reason
+        is a task. `grade_finding` returns the pair and always has, so there is
+        no honest caller with one and not the other; refusing here is what
+        stops a lens written later from inventing one.
+        """
+        if self.grade is not None and not isinstance(self.grade, Grade):
+            raise LensError(
+                f"{owner}: grade must be a Grade or None, not "
+                f"{type(self.grade).__name__} ({self.grade!r}). Valid grades: "
+                f"{', '.join(g.value for g in Grade)}. The store writes "
+                "str(grade), so anything else is recorded as text no filter "
+                "matches and no reader can rank."
+            )
+        if self.grade is not None:
+            _require_text(owner, "grade_reason", self.grade_reason)
+        elif self.grade_reason is not None:
+            raise LensError(
+                f"{owner}: grade_reason was given without a grade "
+                f"({self.grade_reason!r}). A reason explaining a verdict that "
+                "was never reached is a claim about evidence nobody weighed."
             )
 
     @property

@@ -20,17 +20,95 @@ FINDING = Finding(
     severity="high",
     evidence={"kind": "metric", "summary": "s", "data": {}, "artifacts": []},
     state="queued",
+    # `hygiene` does not grade. `Finding` takes both explicitly rather than
+    # defaulting them, so a construction site that has a grade cannot forget to
+    # pass it and silently render as ungraded.
+    grade=None,
+    grade_reason=None,
     first_seen_run="run-1",
     last_seen_run="run-1",
     created_at="2026-08-10T10:00:00+00:00",
     updated_at="2026-08-10T10:00:00+00:00",
 )
 
+
+def _graded(grade: str, reason: str, **overrides) -> Finding:
+    return Finding(**{**FINDING.__dict__, "grade": grade, "grade_reason": reason, **overrides})
+
+
 RUN = RunResult(run_id="run-1", tier="quick", file_count=3, status="complete")
 
 
 def test_report_is_self_contained(assert_self_contained):
     assert_self_contained(render_report([FINDING], project_name="demo", run=RUN))
+
+
+# --- the grade reaches the report, and a killed finding looks killed ----------
+
+
+def _body(html: str) -> str:
+    """Everything after the stylesheet.
+
+    The grade classes are DEFINED in the stylesheet, so `"grade-D" in html` is
+    true of every report ever rendered -- including one with no grade D finding
+    in it. Asserting on the whole document made the ungraded test pass against
+    a template that stamped `grade-D` on every row.
+    """
+    return html.split("</style>", 1)[1]
+
+
+def test_the_grade_and_its_reason_reach_the_report():
+    """Severity is the model's claim; grade is what survived the gate.
+
+    The report already distinguished severity and said nothing about the grade,
+    so the falsifier's verdict -- the one thing that separates this tool from a
+    linter -- was absent from the artifact people share.
+    """
+    html = render_report(
+        [_graded("A", "graded A: reproduced, survived falsification.")],
+        project_name="demo",
+        run=RUN,
+    )
+    body = _body(html)
+    assert "grade-A" in body
+    assert "reproduced, survived falsification" in body
+
+
+def test_a_killed_finding_is_marked_killed_in_the_report():
+    html = render_report(
+        [_graded("D", "graded D: the falsifier did not confirm it.")],
+        project_name="demo",
+        run=RUN,
+    )
+    body = _body(html)
+    assert "grade-D" in body
+    assert "killed" in body.lower()
+
+
+def test_an_ungraded_finding_claims_no_grade_in_the_report():
+    """`hygiene` does not grade, and absent must not render as D.
+
+    The badge must be ABSENT, not merely empty. Asserting only that `grade-D`
+    and `killed` are missing let a mutation through that dropped the
+    `{% if f.grade %}` guard: every ungraded finding then rendered
+    `<span class="grade grade-">` -- a labelled, styled, empty verdict on a
+    finding nobody graded, which is a claim rather than a rendering bug.
+    """
+    body = _body(render_report([FINDING], project_name="demo", run=RUN))
+    assert "grade-D" not in body
+    assert "killed" not in body.lower()
+    assert 'class="grade' not in body
+
+
+def test_the_grade_reason_is_escaped_like_every_other_model_string():
+    """`grade_reason` comes from `grade.py` today and from a lens pack
+    tomorrow. Every other model-authored field in this template is escaped."""
+    html = render_report(
+        [_graded("D", "<img src=x onerror=alert(1)>")], project_name="demo", run=RUN
+    )
+    body = _body(html)
+    assert "<img src=x" not in body
+    assert "&lt;img" in body
 
 
 # --- the self-containment guard, proved non-vacuous by mutation --------------
@@ -213,8 +291,9 @@ def test_long_unbroken_detail_text_can_wrap():
 def test_html_is_escaped():
     hostile = Finding(**{**FINDING.__dict__, "title": "<img src=x onerror=alert(1)>"})
     html = render_report([hostile], project_name="demo", run=None)
-    assert "<img src=x" not in html
-    assert "&lt;img" in html
+    body = _body(html)
+    assert "<img src=x" not in body
+    assert "&lt;img" in body
 
 
 # --- write_report: --out is user-supplied and is not trusted blindly ---------
