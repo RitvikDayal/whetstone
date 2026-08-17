@@ -22,11 +22,14 @@ not finished, it is waiting on one, and the whole design exists because
 from __future__ import annotations
 
 import sqlite3
-import uuid
 from enum import StrEnum
 
 from ..errors import WhetstoneError
 from ..store.findings import FindingState
+
+# Imported by name rather than as `decisions.record` so a test can monkeypatch
+# the module attribute and see every write this module makes.
+from .decisions import record
 
 
 class DispositionError(WhetstoneError):
@@ -164,6 +167,11 @@ def apply(
     # transaction for it to commit. BEGIN IMMEDIATE takes the write lock up
     # front rather than on first write, so two whetstone processes deciding at
     # once fail here instead of half way through.
+    #
+    # The transaction stays HERE rather than inside `record`, which is the only
+    # writer of the decisions table: the invariant being protected is that the
+    # finding move and its decision land together, and neither statement alone
+    # is the unit that has to be atomic.
     conn.execute("BEGIN IMMEDIATE")
     try:
         # `grade` is deliberately not touched. A human decision is about what
@@ -173,25 +181,20 @@ def apply(
             "UPDATE findings SET state = ?, updated_at = ? WHERE id = ?",
             (new_state, now, finding_id),
         )
-        conn.execute(
-            "INSERT INTO decisions (id, finding_id, lens, disposition, "
-            "from_state, to_state, reason, wake, assignee, decided_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                uuid.uuid4().hex,
-                finding_id,
-                # Denormalised: the acceptance rate is per-lens, and a decision
-                # has to stay answerable about which lens it judged even if the
-                # finding row is later gone.
-                row["lens"],
-                str(disposition),
-                current,
-                new_state,
-                reason,
-                wake,
-                assignee,
-                now,
-            ),
+        record(
+            conn,
+            finding_id=finding_id,
+            # Denormalised: the acceptance rate is per-lens, and a decision has
+            # to stay answerable about which lens it judged even if the finding
+            # row is later gone.
+            lens=row["lens"],
+            disposition=str(disposition),
+            from_state=current,
+            to_state=new_state,
+            reason=reason,
+            wake=wake,
+            assignee=assignee,
+            now=now,
         )
     except BaseException:
         conn.rollback()
