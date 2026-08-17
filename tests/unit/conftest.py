@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 
 import pytest
 
@@ -49,6 +50,44 @@ docker_expected = pytest.mark.skipif(
     not (sys.platform.startswith("linux") and os.environ.get("CI")),
     reason="docker is only expected on the Linux CI legs",
 )
+
+
+@pytest.fixture
+def sandbox_image(tmp_path_factory) -> str:
+    """A built pytest-capable image, or a skip with a reason.
+
+    Shared because `test_verify.py` needed the same thing and reached for a tag
+    I had built by hand on one machine -- which passed locally and failed on
+    both Linux CI legs, since the image simply was not there. `availability()`
+    checks the daemon, not the image, so nothing skipped: the tests ran and the
+    container could not start.
+
+    A FAILED BUILD IS NOT A SKIP where the build is expected to work. That is
+    `test_reproduce.py`'s argument and it applies identically here: a registry
+    outage or a rate limit would otherwise skip the only tests that prove the
+    chain, and the Linux leg would still report success.
+    """
+    if not docker_works():
+        pytest.skip("no linux-container docker daemon is reachable")
+    context = tmp_path_factory.mktemp("img")
+    (context / "Dockerfile").write_text(
+        "FROM python:3.11-slim\nRUN pip install --no-cache-dir pytest\n",
+        encoding="utf-8",
+    )
+    # A unique tag: a shared runner can have two of these in flight, and a
+    # fixed one makes them clobber each other's image.
+    tag = f"whetstone-test-sandbox:{uuid.uuid4().hex[:12]}"
+    built = subprocess.run(
+        ["docker", "build", "-q", "-t", tag, str(context)],
+        capture_output=True,
+        timeout=900,
+    )
+    if built.returncode != 0:
+        detail = built.stderr.decode("utf-8", "replace")[-300:]
+        if build_is_expected():
+            pytest.fail(f"the sandbox image failed to build on a Linux CI leg: {detail}")
+        pytest.skip(f"could not build the test image: {detail!r}")
+    return tag
 
 
 def build_is_expected() -> bool:

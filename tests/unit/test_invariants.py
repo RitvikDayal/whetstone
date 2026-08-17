@@ -163,6 +163,14 @@ _ALLOWED_WRITE_CALLS = {
         "the pytest artifact: model-authored CONTENT, uuid4 PATH. That "
         "distinction is why it is safe, and it stops being true the moment a "
         "model names the file"),
+    ("verify.py", "artifact.write_text"): (1,
+        "replays the reproduction artifact; same distinction as reproduce.py, "
+        "and the path is a fixed literal under the worktree"),
+    ("verify.py", "path.write_bytes"): (1,
+        "restores a file the verifier itself reverted, from bytes it read a "
+        "moment earlier -- the path came from git status, not from a model, "
+        "and refusing it would leave the worktree stripped of the fix it just "
+        "approved"),
     ("scope/resolver.py", "os.open"): (2,
         "the barrier itself. TWO calls, and the count says so: O_CREAT|O_EXCL "
         "first so it learns atomically whether it created the file, then a "
