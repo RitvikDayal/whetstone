@@ -193,13 +193,26 @@ def _remove(repo: Path, tree: Path, parent: Path, branch: str) -> None:
     left_behind: list[str] = []
     if _git(repo, ["worktree", "remove", "--force", str(tree)], check=False) is None:
         left_behind.append(f"worktree {tree}")
-    _git(repo, ["worktree", "prune"], check=False)
-    if _git(repo, ["branch", "-D", branch], check=False) is None:
-        left_behind.append(f"branch {branch}")
+
+    # The temp parent is ours, so removing it is not a git operation and does
+    # not depend on git having succeeded.
     try:
         shutil.rmtree(parent)
     except OSError as exc:
         left_behind.append(f"{parent} ({exc.strerror or exc})")
+
+    # PRUNE AFTER the directory is gone, not before. `git worktree prune` only
+    # clears a registration whose directory is missing -- so pruning first,
+    # while the directory still existed, could not clear anything that
+    # `remove --force` had just failed to. This ordering is the one that
+    # recovers from that failure rather than compounding it.
+    if _git(repo, ["worktree", "prune"], check=False) is None:
+        left_behind.append("worktree metadata (prune failed)")
+
+    # And the branch last: `branch -D` refuses a branch still checked out in a
+    # registered worktree, so it can only succeed once the prune above has run.
+    if _git(repo, ["branch", "-D", branch], check=False) is None:
+        left_behind.append(f"branch {branch}")
 
     if left_behind:
         warnings.warn(
