@@ -232,26 +232,31 @@ def test_one_lens_record_does_not_promote_another(store):
 # --- it enforces nothing --------------------------------------------------------
 
 
-def test_nothing_outside_the_queue_package_consults_earned_level():
-    """The absent enforcement must be visibly absent.
+def test_earned_level_is_consulted_only_by_the_spine():
+    """M1b-1's version of this asserted NOTHING read `earned_level`, because no
+    writer existed and a number gating nothing was the deliberate state.
 
-    No writer exists until M1b-2, so a level above 1 has nothing to
-    authorise. If `runner.py` or a lens starts reading this before that
-    writer exists, the number would be gating something with no gate behind
-    it -- which is worse than not computing it.
+    M1b-2 gives it a consumer, so the assertion changes -- and changing it was
+    that task's deliverable rather than a concession. What it now says is the
+    property that survives: the SPINE routes and a LENS never does. A lens that
+    could read its own earned level could act on it, and the design's
+    load-bearing rule is that everything with consequences belongs to the spine.
+
+    The specific list lives in `test_routing.py`, which owns the routing
+    module; this asserts the half that matters here.
     """
     from pathlib import Path
 
     src = Path(__file__).resolve().parents[2] / "src" / "whetstone"
     files = sorted(src.rglob("*.py"))
     assert len(files) >= 5, f"the scan is not reaching src/: {files}"
-    callers = [
-        str(p.relative_to(src))
+    lens_readers = [
+        p.relative_to(src).as_posix()
         for p in files
         if "earned_level" in p.read_text(encoding="utf-8")
-        and p.parent.name != "queue"
+        and p.relative_to(src).as_posix().startswith("lenses/")
     ]
-    assert callers == [], callers
+    assert lens_readers == [], lens_readers
 
 
 def test_the_thresholds_are_declared_as_recalibratable_constants():

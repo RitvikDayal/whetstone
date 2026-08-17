@@ -179,3 +179,23 @@ def assert_self_contained():
         )
 
     return _assert
+
+
+# Docker helpers, so the integration suite sees the same fixtures the unit suite
+# does. One definition, in `tests/_docker.py` -- see its docstring for why a
+# conftest could not be that definition.
+from _docker import (  # noqa: E402
+    build_is_expected as build_is_expected,
+)
+from _docker import (  # noqa: E402
+    docker_expected as docker_expected,
+)
+from _docker import (  # noqa: E402
+    docker_works as docker_works,
+)
+from _docker import (  # noqa: E402
+    needs_docker as needs_docker,
+)
+from _docker import (  # noqa: E402
+    sandbox_image as sandbox_image,
+)
