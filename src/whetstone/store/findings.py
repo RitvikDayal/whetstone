@@ -16,21 +16,28 @@ from ..lenses.base import Candidate
 class FindingState(StrEnum):
     """The states a stored finding can be in.
 
-    Two members, because M0 ships two. `queued` is what `upsert` writes;
-    `rejected` is the one a user sets by hand today, and the store honours it
-    by never touching `state` on a re-run so a rejection cannot be undone.
-    There is no command that moves a finding between them yet, and inventing
-    `accepted`/`fixed` here before anything can produce them would be a
-    vocabulary the tool cannot honour.
+    Seven, and every one of them is produced by something. M0 shipped two
+    because M0 had no way to move a finding; `queue/dispositions.py` now
+    produces the other five, and a state the store holds rows in but this enum
+    does not name is a state `findings --state` refuses as a typo -- the same
+    lie as the untyped version, running the other way.
 
-    It exists as an enum so `findings --state` can reject a typo. Untyped, the
-    CLI answered `--state bogus`, `--state Queued` and `--state ""` with "No
+    The enum exists so `findings --state` can reject a typo. Untyped, the CLI
+    answered `--state bogus`, `--state Queued` and `--state ""` with "No
     findings in state 'X'." and exit 0 -- indistinguishable from a valid state
     that is genuinely empty, which is the same lie as a clean report over a
     run that checked nothing.
+
+    There is still no `fixed`: nothing can verify a fix until M1b-2, and a
+    vocabulary the tool cannot honour is worse than a missing word.
     """
 
     queued = "queued"
+    verified = "verified"
+    building = "building"
+    handed_off = "handed_off"
+    deferred = "deferred"
+    stalled = "stalled"
     rejected = "rejected"
 
 

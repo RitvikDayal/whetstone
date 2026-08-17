@@ -35,6 +35,32 @@ CREATE TABLE IF NOT EXISTS findings (
 CREATE INDEX IF NOT EXISTS idx_findings_state ON findings(state);
 CREATE INDEX IF NOT EXISTS idx_findings_lens ON findings(lens);
 
+-- Every human decision about a finding, append-only. The findings table holds
+-- the CURRENT state; this holds how it got there, which is the only thing an
+-- acceptance rate can be computed from.
+--
+-- `lens` is denormalised off the finding on purpose: the rate is per-lens, and
+-- a decision must stay answerable about which lens it judged even after the
+-- finding row is gone. `reason`, `wake` and `assignee` are nullable because
+-- only some dispositions require one -- which of them is enforced in
+-- `queue/dispositions.py`, not here, so the message can say why.
+CREATE TABLE IF NOT EXISTS decisions (
+    id          TEXT PRIMARY KEY,
+    finding_id  TEXT NOT NULL,
+    lens        TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    from_state  TEXT NOT NULL,
+    to_state    TEXT NOT NULL,
+    reason      TEXT,
+    wake        TEXT,
+    assignee    TEXT,
+    decided_at  TEXT NOT NULL,
+    FOREIGN KEY (finding_id) REFERENCES findings(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_finding ON decisions(finding_id);
+CREATE INDEX IF NOT EXISTS idx_decisions_lens ON decisions(lens);
+
 CREATE TABLE IF NOT EXISTS runs (
     id           TEXT PRIMARY KEY,
     tier         TEXT NOT NULL,
