@@ -180,8 +180,14 @@ def test_every_write_in_src_goes_through_the_barrier_or_is_allowlisted():
         suffix = path.relative_to(src).as_posix()
         if suffix in _WRITES_WITHOUT_THE_BARRIER:
             continue
-        if "guarded_write" in text:
-            continue
+        # NO `"guarded_write" in text` ESCAPE HATCH. It used to clear a whole
+        # module, which meant a mention in a comment or an unused import
+        # exempted every other write in that file -- and `report/html.py`
+        # carries eighty lines of prose about `guarded_write` around one
+        # guarded call. Granularity was per file while the stated property is
+        # per write. The allowlist is now the only mechanism, so a module that
+        # routes one write through the barrier and then adds a direct
+        # `write_text` has to come back here and say so.
         offenders.append(suffix)
 
     assert offenders == [], (

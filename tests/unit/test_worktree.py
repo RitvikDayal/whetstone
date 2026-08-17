@@ -73,7 +73,7 @@ def test_the_worktree_is_removed_on_the_happy_path(repo):
     with worktree(repo, "main", run_id="r1") as tree:
         path = tree
     assert not path.exists()
-    assert "r1" not in _git(repo, "worktree", "list")
+    assert str(path) not in _git(repo, "worktree", "list")
 
 
 def test_the_worktree_is_removed_when_the_body_raises(repo):
@@ -101,7 +101,7 @@ def test_a_dirty_worktree_is_still_removed(repo):
         (tree / "app.py").write_text("modified\n", encoding="utf-8")
         (tree / "untracked.txt").write_text("stray\n", encoding="utf-8")
     assert not path.exists()
-    assert "r1" not in _git(repo, "worktree", "list"), (
+    assert str(path) not in _git(repo, "worktree", "list"), (
         "git still lists the worktree, so the user's repository is left "
         "carrying a stale registration"
     )
@@ -112,8 +112,11 @@ def test_the_branch_is_removed_too(repo):
     across projects far more readily than uuids do."""
     with worktree(repo, "main", run_id="r1"):
         pass
+    # The EXACT branch name. `"r1" not in branches` passed only because the
+    # template happens to be `whetstone/{run_id}`; rename the template and the
+    # substring vanishes while a leaked branch stays.
     branches = _git(repo, "branch", "--list")
-    assert "r1" not in branches
+    assert "whetstone/r1" not in branches
 
 
 # --- refusals ----------------------------------------------------------------------
@@ -189,6 +192,49 @@ def test_the_same_run_id_twice_in_a_row_works(repo):
         assert second.exists()
     assert not first_path.exists()
     assert not second.exists()
+
+
+# --- the environment cannot repoint git ------------------------------------------
+
+
+def test_git_dir_in_the_environment_cannot_redirect_the_worktree(repo, tmp_path, monkeypatch):
+    """`cwd=repo` does not bound git. `GIT_DIR` does.
+
+    Pointing GIT_DIR at a second repository made every git call in this module
+    operate on that one instead -- validation, `worktree add`, and the cleanup
+    that runs afterwards. The whole GIT_ namespace is stripped now, which is
+    what `sentinel.py` already did and what this module was copying the `-c`
+    flags from without copying the part that mattered.
+    """
+    other = tmp_path / "other"
+    other.mkdir()
+    _git(other, "init", "-b", "main", "-q")
+    _git(other, "config", "user.email", "t@e.com")
+    _git(other, "config", "user.name", "T")
+    (other / "elsewhere.py").write_text("STOLEN = 1\n", encoding="utf-8")
+    _git(other, "add", ".")
+    _git(other, "commit", "-m", "other", "--no-gpg-sign", "-q")
+
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+
+    with worktree(repo, "main", run_id="r1") as tree:
+        # The FIRST repository's content, not the one GIT_DIR names.
+        assert (tree / "app.py").exists()
+        assert not (tree / "elsewhere.py").exists()
+
+
+def test_global_git_config_cannot_reach_these_calls(repo, tmp_path, monkeypatch):
+    """`GIT_CONFIG_GLOBAL` reintroduces exactly the keys the `-c` overrides
+    remove, so stripping the namespace is what makes the hardening hold."""
+    hostile = tmp_path / "hostile.gitconfig"
+    hostile.write_text(
+        "[core]\n\thooksPath = /tmp/attacker-hooks\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(hostile))
+
+    with worktree(repo, "main", run_id="r1") as tree:
+        assert (tree / "app.py").exists()
 
 
 # --- the worktree is not inside the checkout -----------------------------------------

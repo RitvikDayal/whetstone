@@ -23,33 +23,53 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 
 from .errors import GitError
 
+# IMPORTED, NOT COPIED. The first version of this module reproduced sentinel's
+# `-c` list and left the ENVIRONMENT inherited -- which is the same hole by
+# another route: `cwd=root` does not stop `GIT_DIR` and `GIT_WORK_TREE` from
+# repointing git at a different repository entirely, and `GIT_CONFIG_GLOBAL`
+# reintroduces the very keys the `-c` overrides remove. Two copies of a
+# security control drift; one does not.
+from .provider.sentinel import _GIT_HARDENING as _HARDENING
+from .provider.sentinel import _git_env
+
 # Same ceiling `sentinel.py` uses. A git call that hangs is a run that hangs.
 _TIMEOUT = 60
 
-# Config keys that make git execute something on an ordinary command, forced
-# off for every call here. `core.fsmonitor` from an inspected repository's own
-# .git/config was arbitrary code execution from `git status` -- found in the
-# M1a gate, before any model ran and with zero tokens spent. This module runs
-# git against a repository Whetstone did not write, so it inherits that.
-_HARDENING = [
-    "-c", "core.fsmonitor=",
-    "-c", "core.hooksPath=/dev/null",
-    "-c", "protocol.ext.allow=never",
-    "-c", "core.sshCommand=",
-    "-c", "diff.external=",
-    "-c", "core.pager=cat",
-    "-c", "sequence.editor=",
-    "-c", "core.editor=",
-]
+
+@lru_cache(maxsize=1)
+def _empty_hooks_dir() -> Path:
+    """A real, empty directory to point `core.hooksPath` at.
+
+    NOT `/dev/null`. That is a POSIX device path, and on Windows git resolves
+    it through an msys layer where its meaning is not guaranteed -- an empty
+    value is worse still, because it restores `.git/hooks` and hands an
+    inspected repository its hooks back. An existing empty directory is
+    unambiguous everywhere and provably contains no hook.
+
+    Measured on this machine: git 2.x on Windows did NOT create a relative
+    `dev/null` from `-c core.hooksPath=/dev/null`, so the reported failure was
+    not reproduced here. This is the defensive form rather than a proven fix,
+    and it costs one `mkdir` per process.
+
+    Cached: one directory per process, not one per git call.
+    """
+    path = Path(tempfile.mkdtemp(prefix="whetstone-nohooks-"))
+    return path
 
 
-def _git(root: Path, args: list[str], *, check: bool = True) -> str:
+def _hooks_override() -> list[str]:
+    return ["-c", f"core.hooksPath={_empty_hooks_dir()}"]
+
+
+def _git(root: Path, args: list[str], *, check: bool = True) -> str | None:
     """Run git in *root*, hardened, and return stdout.
 
     `run_argv`-style: a list, never a flattened string. Flattening means the
@@ -59,8 +79,10 @@ def _git(root: Path, args: list[str], *, check: bool = True) -> str:
     """
     try:
         completed = subprocess.run(
-            ["git", "--no-optional-locks", *_HARDENING, *args],
+            ["git", "--no-optional-locks", *_HARDENING, *_hooks_override(),
+             *args],
             cwd=root,
+            env=_git_env(),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -71,11 +93,15 @@ def _git(root: Path, args: list[str], *, check: bool = True) -> str:
         raise GitError("git is not on PATH, so no worktree can be created.") from exc
     except subprocess.TimeoutExpired as exc:
         raise GitError(f"git did not answer within {_TIMEOUT}s: git {' '.join(args)}") from exc
-    if check and completed.returncode != 0:
-        raise GitError(
-            f"git {' '.join(args)} failed in {root}: "
-            f"{completed.stderr.strip() or completed.stdout.strip()}"
-        )
+    if completed.returncode != 0:
+        if check:
+            raise GitError(
+                f"git {' '.join(args)} failed in {root}: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
+        # None, not "". A best-effort call that FAILED and one that succeeded
+        # with no output are different facts, and `_remove` reports the first.
+        return None
     return completed.stdout.strip()
 
 
@@ -132,7 +158,16 @@ def worktree(repo: Path, base_ref: str, *, run_id: str) -> Iterator[Path]:
     # otherwise make the same run id unusable forever, and the failure would
     # arrive as "a branch named X already exists" long after the crash that
     # caused it.
-    _git(repo, ["worktree", "add", "-B", branch, str(tree), base_ref])
+    # CREATION IS INSIDE CLEANUP'S OWNERSHIP. `parent` exists before the add
+    # runs, so an add that fails -- a locked worktree, a full disk, a branch
+    # checked out elsewhere -- used to leave the temp directory behind and
+    # raise, with the `finally` never entered because it had not been reached.
+    try:
+        _git(repo, ["worktree", "add", "-B", branch, str(tree), base_ref])
+    except BaseException:
+        _remove(repo, tree, parent, branch)
+        raise
+
     try:
         yield tree
     finally:
@@ -144,12 +179,34 @@ def _remove(repo: Path, tree: Path, parent: Path, branch: str) -> None:
 
     `--force` because the whole point of the worktree is that something
     dirtied it, and `git worktree remove` refuses a dirty tree without it.
-    Every step is best-effort in sequence: a failure at one must not skip the
+    Every step is best-effort IN SEQUENCE: a failure at one must not skip the
     next, or a git-level failure leaves the directory on disk as well.
+
+    A CLEANUP FAILURE IS REPORTED, NOT SWALLOWED. An earlier version discarded
+    every git and filesystem error here, so a locked worktree or a permission
+    error left metadata, a branch, or a whole directory behind while the caller
+    saw a clean return -- which is the "declined to do work and said nothing"
+    shape this project refuses everywhere else. It still does not RAISE: the
+    body's own exception, when there is one, is the one worth propagating, and
+    a warning that replaces it would hide the actual failure.
     """
-    _git(repo, ["worktree", "remove", "--force", str(tree)], check=False)
+    left_behind: list[str] = []
+    if _git(repo, ["worktree", "remove", "--force", str(tree)], check=False) is None:
+        left_behind.append(f"worktree {tree}")
     _git(repo, ["worktree", "prune"], check=False)
-    _git(repo, ["branch", "-D", branch], check=False)
-    # The temp parent is ours, so removing it is not a git operation and does
-    # not depend on git having succeeded.
-    shutil.rmtree(parent, ignore_errors=True)
+    if _git(repo, ["branch", "-D", branch], check=False) is None:
+        left_behind.append(f"branch {branch}")
+    try:
+        shutil.rmtree(parent)
+    except OSError as exc:
+        left_behind.append(f"{parent} ({exc.strerror or exc})")
+
+    if left_behind:
+        warnings.warn(
+            "whetstone could not fully remove its worktree and left behind: "
+            + ", ".join(left_behind)
+            + ". Run `git worktree prune` in the repository to clear the "
+            "metadata.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
