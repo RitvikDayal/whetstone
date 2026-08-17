@@ -19,15 +19,8 @@ from pathlib import Path
 
 import pytest
 
-from whetstone.sandbox import availability
+from conftest import needs_docker
 from whetstone.verify import verify
-
-IMAGE = "whetstone-e2e:latest"
-
-_docker = pytest.mark.skipif(
-    availability(IMAGE) is not None,
-    reason=f"no linux-container docker daemon or {IMAGE} is absent",
-)
 
 # The reproduction PASSES while the defect is present. That direction is the
 # convention, and getting it backwards inverts every assertion below.
@@ -93,13 +86,13 @@ def fixed_tree(tmp_path: Path) -> Path:
     return root
 
 
-def _verify(tree: Path, **overrides):
+def _verify(tree: Path, image: str | None = None, **overrides):
     kwargs = dict(
         reproduction_artifact=_REPRO,
         regression_test={"path": "test_regression.py", "test_name": "test_empty_is_zero"},
         changed_files=["orders.py", "test_regression.py"],
         test_command="python -m pytest -q",
-        image=IMAGE,
+        image=image,
     )
     kwargs.update(overrides)
     return verify(tree, **kwargs)
@@ -132,10 +125,10 @@ def test_no_regression_test_means_nothing_is_verified(tmp_path):
 # --- the real thing ---------------------------------------------------------------
 
 
-@_docker
-def test_a_real_fix_verifies(fixed_tree):
+@needs_docker
+def test_a_real_fix_verifies(fixed_tree, sandbox_image):
     """All three sub-checks, in a container, against a real fix."""
-    outcome = _verify(fixed_tree)
+    outcome = _verify(fixed_tree, sandbox_image)
     assert outcome.executed is True
     assert outcome.reproduction_now_fails is True
     assert outcome.regression_passes_with_the_fix is True
@@ -143,8 +136,10 @@ def test_a_real_fix_verifies(fixed_tree):
     assert outcome.verified is True, outcome.reasons
 
 
-@_docker
-def test_a_regression_test_that_passes_without_the_fix_is_refused(fixed_tree):
+@needs_docker
+def test_a_regression_test_that_passes_without_the_fix_is_refused(
+    fixed_tree, sandbox_image
+):
     """THE CHECK THIS MODULE IS FOR.
 
     A test asserting something already true of the unfixed code guards nothing.
@@ -158,15 +153,17 @@ def test_a_regression_test_that_passes_without_the_fix_is_refused(fixed_tree):
         "    assert average_price([2, 4]) == 3.0\n",
         encoding="utf-8",
     )
-    outcome = _verify(fixed_tree)
+    outcome = _verify(fixed_tree, sandbox_image)
     assert outcome.regression_passes_with_the_fix is True
     assert outcome.regression_fails_without_the_fix is False
     assert outcome.verified is False
     assert any("UNFIXED" in r for r in outcome.reasons)
 
 
-@_docker
-def test_a_perfect_regression_test_is_not_enough_without_the_reproduction(fixed_tree):
+@needs_docker
+def test_a_perfect_regression_test_is_not_enough_without_the_reproduction(
+    fixed_tree, sandbox_image
+):
     """The reachable path where both regression checks pass and the answer is
     still no.
 
@@ -178,7 +175,7 @@ def test_a_perfect_regression_test_is_not_enough_without_the_reproduction(fixed_
     than decorative: every other failure returns early, so a mutation reducing
     `verified` to the regression result alone survived until this existed.
     """
-    outcome = _verify(fixed_tree, reproduction_artifact=None)
+    outcome = _verify(fixed_tree, sandbox_image, reproduction_artifact=None)
     assert outcome.regression_passes_with_the_fix is True
     assert outcome.regression_fails_without_the_fix is True
     assert outcome.reproduction_now_fails is None
@@ -186,29 +183,34 @@ def test_a_perfect_regression_test_is_not_enough_without_the_reproduction(fixed_
     assert any("no reproduction artifact" in r for r in outcome.reasons)
 
 
-@_docker
-def test_a_fix_that_did_not_fix_anything_is_refused(fixed_tree):
+@needs_docker
+def test_a_fix_that_did_not_fix_anything_is_refused(fixed_tree, sandbox_image):
     """The reproduction still passes, so the defect is still there -- whatever
     the implementer's summary said."""
     (fixed_tree / "orders.py").write_text(_BUGGY, encoding="utf-8")
-    outcome = _verify(fixed_tree)
+    outcome = _verify(fixed_tree, sandbox_image)
     assert outcome.reproduction_now_fails is False
     assert outcome.verified is False
     assert any("still passes" in r for r in outcome.reasons)
 
 
-@_docker
-def test_a_regression_test_that_does_not_exist_is_refused(fixed_tree):
+@needs_docker
+def test_a_regression_test_that_does_not_exist_is_refused(
+    fixed_tree, sandbox_image
+):
     outcome = _verify(
         fixed_tree,
+        sandbox_image,
         regression_test={"path": "test_regression.py", "test_name": "test_typo"},
     )
     assert outcome.verified is False
     assert any("collected nothing" in r for r in outcome.reasons)
 
 
-@_docker
-def test_deleting_the_reproduction_does_not_buy_a_pass(fixed_tree):
+@needs_docker
+def test_deleting_the_reproduction_does_not_buy_a_pass(
+    fixed_tree, sandbox_image
+):
     """The obvious attack: make the evidence pass by removing the evidence.
 
     The artifact is supplied by the CALLER from the stored finding and written
@@ -216,29 +218,33 @@ def test_deleting_the_reproduction_does_not_buy_a_pass(fixed_tree):
     nothing about what runs here.
     """
     (fixed_tree / "orders.py").write_text(_BUGGY, encoding="utf-8")
-    outcome = _verify(fixed_tree, changed_files=["orders.py"])
+    outcome = _verify(fixed_tree, sandbox_image, changed_files=["orders.py"])
     assert outcome.reproduction_now_fails is False, (
         "the replay used something other than the artifact it was handed"
     )
 
 
-@_docker
-def test_the_worktree_is_left_as_it_was_found(fixed_tree):
+@needs_docker
+def test_the_worktree_is_left_as_it_was_found(fixed_tree, sandbox_image):
     """Verification reverts the fix to force the test red and must put it
     back. A verifier that leaves the tree reverted has silently discarded the
     change it just approved."""
     before = (fixed_tree / "orders.py").read_text(encoding="utf-8")
-    _verify(fixed_tree)
+    _verify(fixed_tree, sandbox_image)
     assert (fixed_tree / "orders.py").read_text(encoding="utf-8") == before
     assert (fixed_tree / "test_regression.py").exists()
     assert not (fixed_tree / "test_whetstone_verify_repro.py").exists()
 
 
-@_docker
-def test_an_untracked_fix_file_is_restored_too(fixed_tree):
+@needs_docker
+def test_an_untracked_fix_file_is_restored_too(fixed_tree, sandbox_image):
     """`git checkout HEAD --` cannot restore a file HEAD never had, so the
     revert removes it -- and the restore has to put the content back from
     memory rather than from git."""
     (fixed_tree / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
-    _verify(fixed_tree, changed_files=["orders.py", "helper.py", "test_regression.py"])
+    _verify(
+        fixed_tree,
+        sandbox_image,
+        changed_files=["orders.py", "helper.py", "test_regression.py"],
+    )
     assert (fixed_tree / "helper.py").read_text(encoding="utf-8") == "VALUE = 1\n"
