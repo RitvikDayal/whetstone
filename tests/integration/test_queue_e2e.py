@@ -134,6 +134,7 @@ def test_a_rejection_survives_a_real_second_run(project):
     assert "coverage" in listed.stdout.lower()
 
     queued = _invoke("findings", "--path", str(project), "--state", "queued")
+    assert queued.exit_code == 0, queued.stdout
     assert "No findings in state 'queued'." in queued.stdout, (
         "the rejected finding came back to the queue on the second run"
     )
@@ -181,9 +182,8 @@ def test_the_rate_and_the_level_travel_with_their_counts(project):
     """After a real decision, both numbers exist and both carry their sample."""
     _run(project)
     fid = _one_finding_id(project)
-    _invoke(
-        "decide", fid[:8], "verify", "--path", str(project), "--yes"
-    )
+    decided = _invoke("decide", fid[:8], "verify", "--path", str(project), "--yes")
+    assert decided.exit_code == 0, decided.stdout
 
     conn = _store(project)
     try:
@@ -315,4 +315,5 @@ def test_rejecting_a_replayed_finding_survives_a_real_run(project):
     _run(project)
 
     listed = _invoke("findings", "--path", str(project), "--state", "rejected")
+    assert listed.exit_code == 0, listed.stdout
     assert "orders.py:16" in listed.stdout
