@@ -10,7 +10,12 @@ import pytest
 
 from whetstone.grade import Grade
 from whetstone.lenses.base import Candidate, Evidence, EvidenceKind, Severity
-from whetstone.queue.decisions import acceptance_rate, decisions_for, record
+from whetstone.queue.decisions import (
+    DecisionError,
+    acceptance_rate,
+    decisions_for,
+    record,
+)
 from whetstone.queue.dispositions import Disposition, apply
 from whetstone.store.db import connect
 from whetstone.store.findings import list_findings, upsert
@@ -163,6 +168,61 @@ def test_decisions_for_returns_them_newest_last(tmp_path):
     assert rows[0].decided_at == NOW
 
 
+def test_two_decisions_at_the_same_instant_keep_the_order_they_were_made(tmp_path):
+    """The `rowid ASC` tiebreaker, which `decided_at` alone cannot provide.
+
+    NOW and LATER are a day apart, so the ordering test above passes on the
+    timestamp comparison and says nothing about ties. Two decisions inside one
+    second share a `decided_at`, and `_trailing_collapse` reads the TAIL of
+    this list -- so the tie order decides which decisions fall inside the
+    demotion window.
+    """
+    conn = connect(tmp_path)
+    fid = _finding(conn)
+    apply(conn, fid, Disposition.needs_evidence, reason="first", now=NOW)
+    apply(conn, fid, Disposition.needs_evidence, reason="second", now=NOW)
+
+    rows = decisions_for(conn)
+    assert [d.reason for d in rows] == ["first", "second"]
+
+
+def test_a_decided_at_without_a_timezone_is_refused(tmp_path):
+    """Naive is ambiguous, and the ledger is ordered by this column."""
+    conn = connect(tmp_path)
+    fid = _finding(conn)
+    with pytest.raises(DecisionError, match="timezone"):
+        record(
+            conn,
+            finding_id=fid,
+            lens="code-defects",
+            disposition="verify",
+            from_state="queued",
+            to_state="verified",
+            reason=None,
+            wake=None,
+            assignee=None,
+            now="2026-08-17T10:00:00",
+        )
+
+
+def test_offsets_are_normalised_so_the_order_is_chronological(tmp_path):
+    """`+05:30` sorts before `+00:00` lexically and after it chronologically.
+
+    Stored raw, a ledger written from two machines in different offsets orders
+    wrongly, and `_trailing_collapse` reads the wrong ten decisions with
+    nothing anywhere saying so.
+    """
+    conn = connect(tmp_path)
+    early = _finding(conn, "early.py:1")
+    late = _finding(conn, "late.py:1")
+    # 09:00+00:00 is 14:30 IST -- later than 10:00+05:30, which is 04:30 UTC.
+    apply(conn, late, Disposition.verify, now="2026-08-17T09:00:00+00:00")
+    apply(conn, early, Disposition.verify, now="2026-08-17T10:00:00+05:30")
+
+    ordered = [d.finding_id for d in decisions_for(conn)]
+    assert ordered == [early, late], "stored offsets, so the order is lexical"
+
+
 def test_decisions_for_filters_by_lens_and_by_finding(tmp_path):
     conn = connect(tmp_path)
     _decide(conn, "a.py:1", Disposition.verify, lens="code-defects")
@@ -210,6 +270,15 @@ def test_record_is_the_only_writer_and_apply_goes_through_it(tmp_path, monkeypat
     assert calls[0]["disposition"] == "verify"
     assert calls[0]["from_state"] == "queued"
     assert calls[0]["to_state"] == "verified"
+    # THE CROSS-CHECK IS THE TEST. The spy delegates to the real `record`, so
+    # counting calls alone proves `record` was called -- not that it was the
+    # only thing that wrote. A second inline INSERT inside `apply` would leave
+    # `len(calls) == 1` true and add a row nobody recorded.
+    rows = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+    assert rows == len(calls), (
+        f"{rows} decision rows from {len(calls)} record() calls -- something "
+        "wrote to the table without going through the writer"
+    )
 
 
 def test_record_writes_every_non_null_column(tmp_path):

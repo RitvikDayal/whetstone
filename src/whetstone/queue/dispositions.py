@@ -136,25 +136,9 @@ def apply(
             f"{', '.join(d.value for d in Disposition)}."
         )
 
-    row = conn.execute(
-        "SELECT id, lens, state FROM findings WHERE id = ?", (finding_id,)
-    ).fetchone()
-    if row is None:
-        raise DispositionError(
-            f"no finding with id {finding_id!r}. Nothing was recorded -- run "
-            "`whetstone findings` to see the ids this project has."
-        )
-
-    current = row["state"]
-    if current in TERMINAL:
-        raise DispositionError(
-            f"finding {finding_id} is {current} and nothing moves it. A "
-            "decision a later click can undo is not a decision, and the "
-            "rejection is what suppresses this finding on every future run."
-        )
-
+    # Checked before the lock is taken: it touches no database and failing
+    # early avoids holding a write lock to answer a usage error.
     _require_argument(disposition, reason=reason, wake=wake, assignee=assignee)
-    new_state = _resolve_state(conn, finding_id, disposition)
 
     # ONE TRANSACTION, EXPLICITLY. `connect()` opens with isolation_level=None,
     # which is autocommit -- so the UPDATE committed before the INSERT ran, and
@@ -174,6 +158,30 @@ def apply(
     # is the unit that has to be atomic.
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # EVERY READ IS INSIDE THE LOCK. Reading the state first and then
+        # locking is a time-of-check-to-time-of-use gap: another whetstone
+        # process can reject the finding in between, and this one would then
+        # overwrite `rejected` -- the one state the whole milestone promises
+        # nothing moves -- and record a `from_state` that was never true.
+        # `_resolve_state` counts this finding's own needs_evidence decisions,
+        # so it has the same race and has to be inside too.
+        row = conn.execute(
+            "SELECT id, lens, state FROM findings WHERE id = ?", (finding_id,)
+        ).fetchone()
+        if row is None:
+            raise DispositionError(
+                f"no finding with id {finding_id!r}. Nothing was recorded -- "
+                "run `whetstone findings` to see the ids this project has."
+            )
+        current = row["state"]
+        if current in TERMINAL:
+            raise DispositionError(
+                f"finding {finding_id} is {current} and nothing moves it. A "
+                "decision a later click can undo is not a decision, and the "
+                "rejection is what suppresses this finding on every future run."
+            )
+        new_state = _resolve_state(conn, finding_id, disposition)
+
         # `grade` is deliberately not touched. A human decision is about what
         # to DO; it is not a re-judgement of the evidence, and overwriting the
         # grade would erase what the gate actually found.

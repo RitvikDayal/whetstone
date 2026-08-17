@@ -18,6 +18,9 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
+
+from ..errors import WhetstoneError
 
 # Which dispositions are a judgement about whether the finding was REAL.
 #
@@ -30,9 +33,15 @@ from dataclasses import dataclass
 # a busy week reads as a quality collapse and demotes a lens that did nothing
 # wrong; counted as acceptances, a queue nobody triaged reads as a perfect
 # record.
-_ACCEPTANCES = frozenset({"verify", "implement", "hand_off"})
-_REJECTIONS = frozenset({"reject"})
-_COUNTED = _ACCEPTANCES | _REJECTIONS
+#
+# EXPORTED, not private. `autonomy.py` needs the same classification for its
+# trailing window, and it had its own copy with a comment promising to keep
+# them in step -- which is a promise, not a mechanism. One definition means
+# `acceptance_rate` and `_trailing_collapse` cannot come to disagree about what
+# a decision means.
+ACCEPTANCES = frozenset({"verify", "implement", "hand_off"})
+REJECTIONS = frozenset({"reject"})
+COUNTED = ACCEPTANCES | REJECTIONS
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,41 @@ class Decision:
     wake: str | None
     assignee: str | None
     decided_at: str
+
+
+class DecisionError(WhetstoneError):
+    """A decision that cannot be recorded, and why."""
+
+
+def _canonical_time(value: str) -> str:
+    """*value* as a UTC ISO-8601 string, or refuse it.
+
+    `decided_at` is TEXT and `decisions_for` orders on it lexically, which is
+    only chronological if every value is in the same offset. `+05:30`, `Z` and
+    `+00:00` all sort against each other wrongly, and `_trailing_collapse`
+    reads the TAIL of that ordering -- so a mixed-offset ledger silently
+    demotes on the wrong ten decisions.
+
+    Normalised at the write boundary rather than fixed in the query, because
+    the query cannot repair what was stored. A naive timestamp is REFUSED
+    rather than assumed UTC: assuming is a guess about a value that decides
+    which decisions count, and the caller knows what it meant.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise DecisionError(
+            f"decided_at {value!r} is not an ISO-8601 timestamp. The ledger is "
+            "ordered by it, and the trailing window used for demotion reads "
+            "the end of that order."
+        ) from exc
+    if parsed.tzinfo is None:
+        raise DecisionError(
+            f"decided_at {value!r} has no timezone. Two decisions recorded in "
+            "different offsets would sort against each other wrongly, and "
+            "nothing downstream could tell."
+        )
+    return parsed.astimezone(UTC).isoformat()
 
 
 def record(
@@ -85,17 +129,24 @@ def record(
             reason,
             wake,
             assignee,
-            now,
+            _canonical_time(now),
         ),
     )
 
 
 def decisions_for(
     conn: sqlite3.Connection,
+    *,
     lens: str | None = None,
     finding_id: str | None = None,
 ) -> list[Decision]:
     """The ledger, oldest first.
+
+    KEYWORD-ONLY. Both filters are `str | None` and adjacent, so a positional
+    swap -- or a finding id passed where a lens goes -- returns an empty list
+    rather than raising. `autonomy.py` reads an empty ledger as "no decisions
+    recorded" and produces probation with a confident explanation, which is a
+    silent wrong answer with a sentence attached.
 
     Oldest first because this is a history: the order decisions were made in is
     the thing being read, and `autonomy.py` takes a TRAILING window off the end
@@ -147,9 +198,9 @@ def acceptance_rate(
     produced something that looked right and was not.
     """
     counted = [
-        d for d in decisions_for(conn, lens=lens) if d.disposition in _COUNTED
+        d for d in decisions_for(conn, lens=lens) if d.disposition in COUNTED
     ]
     if not counted:
         return None, 0
-    accepted = sum(1 for d in counted if d.disposition in _ACCEPTANCES)
+    accepted = sum(1 for d in counted if d.disposition in ACCEPTANCES)
     return accepted / len(counted), len(counted)

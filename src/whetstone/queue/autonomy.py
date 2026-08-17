@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from .decisions import acceptance_rate, decisions_for
+from .decisions import ACCEPTANCES, COUNTED, acceptance_rate, decisions_for
 
 # A lens on probation acts at report/propose only, whatever its ceiling says.
 PROBATION_LEVEL = 1
@@ -39,10 +39,10 @@ PROMOTION_RATE = 0.60
 TRAILING_WINDOW = 10
 DEMOTION_RATE = 0.40
 
-# Only these are a judgement about whether a finding was real. Kept in step with
-# `decisions.acceptance_rate`, which is the function that owns the rule.
-_COUNTED = frozenset({"verify", "implement", "hand_off", "reject"})
-_ACCEPTED = frozenset({"verify", "implement", "hand_off"})
+# The classification is imported, not restated. This module had its own copy
+# with a comment promising to keep it in step with `decisions.py` -- a promise
+# is not a mechanism, and the two functions would have drifted the first time
+# a disposition was added.
 
 
 def earned_level(
@@ -72,7 +72,7 @@ def earned_level(
     ceiling = max(0, int(configured_ceiling))
     probation = min(PROBATION_LEVEL, ceiling)
 
-    demoted, why_demoted = _trailing_collapse(conn, lens)
+    demoted, why_demoted = _trailing_collapse(conn, lens, probation)
     if demoted:
         return probation, why_demoted
 
@@ -109,7 +109,9 @@ def earned_level(
     )
 
 
-def _trailing_collapse(conn: sqlite3.Connection, lens: str) -> tuple[bool, str]:
+def _trailing_collapse(
+    conn: sqlite3.Connection, lens: str, probation: int
+) -> tuple[bool, str]:
     """Whether the trailing window has fallen below the demotion rate.
 
     Requires a FULL window before it can fire. Three rejections in a row on a
@@ -118,18 +120,21 @@ def _trailing_collapse(conn: sqlite3.Connection, lens: str) -> tuple[bool, str]:
     from a sustained failure.
     """
     counted = [
-        d for d in decisions_for(conn, lens=lens) if d.disposition in _COUNTED
+        d for d in decisions_for(conn, lens=lens) if d.disposition in COUNTED
     ]
     if len(counted) < TRAILING_WINDOW:
         return False, ""
 
     window = counted[-TRAILING_WINDOW:]
-    accepted = sum(1 for d in window if d.disposition in _ACCEPTED)
+    accepted = sum(1 for d in window if d.disposition in ACCEPTANCES)
     rate = accepted / len(window)
     if rate >= DEMOTION_RATE:
         return False, ""
+    # `probation`, not PROBATION_LEVEL: with a ceiling of 0 the caller returns
+    # 0 and this sentence claimed 1, so the number the user read was not the
+    # number they had.
     return True, (
-        f"{lens} was demoted to level {PROBATION_LEVEL}: {rate:.0%} of its "
+        f"{lens} was demoted to level {probation}: {rate:.0%} of its "
         f"trailing {TRAILING_WINDOW} decisions were accepted, below the "
         f"{DEMOTION_RATE:.0%} demotion threshold."
     )

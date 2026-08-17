@@ -154,6 +154,18 @@ def test_demotion_when_the_trailing_window_collapses(store):
     assert "trailing" in why.lower()
 
 
+def test_a_demotion_reason_names_the_level_it_actually_returns(store):
+    """With a ceiling of 0 the function returns 0 and the sentence claimed 1.
+
+    A number and an explanation that disagree is worse than either alone: the
+    explanation is the whole reason the number is trustworthy.
+    """
+    _record(store, accepted=0, rejected=10)
+    level, why = earned_level(store, "code-defects", 0, trust=None)
+    assert level == 0
+    assert "level 0" in why
+
+
 def test_exactly_at_the_demotion_rate_does_not_demote(store):
     """The rule is "below 40%", so 4 of the trailing 10 holds."""
     _record(store, accepted=20, rejected=0)
