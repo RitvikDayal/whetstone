@@ -814,6 +814,7 @@ def test_a_killed_finding_says_killed_rather_than_carrying_a_quiet_letter(
     _seed_graded_findings(tmp_path)
 
     result = runner.invoke(app, ["findings", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
     assert "killed" in _row(result.stdout, "z.py").lower()
 
 
@@ -829,7 +830,9 @@ def test_findings_are_ordered_by_grade_not_by_the_models_severity_claim(
     _write_config(tmp_path)
     _seed_graded_findings(tmp_path)
 
-    out = runner.invoke(app, ["findings", "--path", str(tmp_path)]).stdout
+    result = runner.invoke(app, ["findings", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
+    out = result.stdout
     assert out.index("m.py") < out.index("z.py"), (
         "a grade A finding must not sit below one the falsifier killed"
     )
@@ -847,6 +850,7 @@ def test_an_ungraded_finding_is_not_shown_as_killed(tmp_path, monkeypatch):
     _seed_graded_findings(tmp_path)
 
     result = runner.invoke(app, ["findings", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
     row = _row(result.stdout, "requests")
     assert "killed" not in row.lower()
     assert not re.search(r"\b[ABCD]\b", row), row

@@ -153,33 +153,50 @@ def apply(
     _require_argument(disposition, reason=reason, wake=wake, assignee=assignee)
     new_state = _resolve_state(conn, finding_id, disposition)
 
-    # `grade` is deliberately not touched. A human decision is about what to
-    # DO; it is not a re-judgement of the evidence, and overwriting the grade
-    # would erase what the gate actually found.
-    conn.execute(
-        "UPDATE findings SET state = ?, updated_at = ? WHERE id = ?",
-        (new_state, now, finding_id),
-    )
-    conn.execute(
-        "INSERT INTO decisions (id, finding_id, lens, disposition, from_state, "
-        "to_state, reason, wake, assignee, decided_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            uuid.uuid4().hex,
-            finding_id,
-            # Denormalised: the acceptance rate is per-lens, and a decision has
-            # to stay answerable about which lens it judged even if the finding
-            # row is later gone.
-            row["lens"],
-            str(disposition),
-            current,
-            new_state,
-            reason,
-            wake,
-            assignee,
-            now,
-        ),
-    )
+    # ONE TRANSACTION, EXPLICITLY. `connect()` opens with isolation_level=None,
+    # which is autocommit -- so the UPDATE committed before the INSERT ran, and
+    # a failing INSERT left the finding moved with no decision recorded. The
+    # docstring above claimed the two were "written together" and nothing
+    # implemented it, which is the same defect this file's own review found
+    # twice: a guarantee argued in prose with no code behind it.
+    #
+    # `with conn:` does NOT fix this on an autocommit connection -- there is no
+    # transaction for it to commit. BEGIN IMMEDIATE takes the write lock up
+    # front rather than on first write, so two whetstone processes deciding at
+    # once fail here instead of half way through.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # `grade` is deliberately not touched. A human decision is about what
+        # to DO; it is not a re-judgement of the evidence, and overwriting the
+        # grade would erase what the gate actually found.
+        conn.execute(
+            "UPDATE findings SET state = ?, updated_at = ? WHERE id = ?",
+            (new_state, now, finding_id),
+        )
+        conn.execute(
+            "INSERT INTO decisions (id, finding_id, lens, disposition, "
+            "from_state, to_state, reason, wake, assignee, decided_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                uuid.uuid4().hex,
+                finding_id,
+                # Denormalised: the acceptance rate is per-lens, and a decision
+                # has to stay answerable about which lens it judged even if the
+                # finding row is later gone.
+                row["lens"],
+                str(disposition),
+                current,
+                new_state,
+                reason,
+                wake,
+                assignee,
+                now,
+            ),
+        )
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
     return new_state
 
 
@@ -202,9 +219,10 @@ def _require_argument(
     value = {"reason": reason, "wake": wake, "assignee": assignee}[required]
     if value is not None and value.strip():
         return
-    raise DispositionError(
-        f"{disposition} needs {required}: {_WHY_REQUIRED[disposition]}"
-    )
+    # The noun is NOT interpolated in front of the sentence: every value in
+    # `_WHY_REQUIRED` already opens with it, so doing that printed "reject
+    # needs reason: a reason. The decision ledger is...".
+    raise DispositionError(f"{disposition} needs {_WHY_REQUIRED[disposition]}")
 
 
 _WHY_REQUIRED = {
@@ -244,4 +262,9 @@ def _resolve_state(
         "SELECT COUNT(*) FROM decisions WHERE finding_id = ? AND disposition = ?",
         (finding_id, str(Disposition.needs_evidence)),
     ).fetchone()[0]
-    return "queued" if asks < _MAX_EVIDENCE_ASKS else "stalled"
+    # Through `FindingState`, like `_RESULTING_STATE` above. As bare literals a
+    # rename in the enum would leave these two silently wrong, which is the
+    # thing the comment on that table says it is avoiding.
+    return str(
+        FindingState.queued if asks < _MAX_EVIDENCE_ASKS else FindingState.stalled
+    )

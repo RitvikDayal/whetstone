@@ -8,6 +8,8 @@ assignee is this project's founding failure: five correct recommendations, zero
 deployments, nobody named.
 """
 
+import sqlite3
+
 import pytest
 
 from whetstone.errors import WhetstoneError
@@ -41,45 +43,97 @@ def _candidate(subject: str = "orders.py:9", grade: Grade | None = Grade.A) -> C
     )
 
 
-def _one_finding(tmp_path, subject: str = "orders.py:9"):
-    conn = connect(tmp_path)
-    upsert(conn, _candidate(subject), "run-1", NOW)
-    return conn, list_findings(conn)[0].id
+@pytest.fixture
+def _open_stores():
+    """Every connection these tests open, closed at teardown.
+
+    The helper below used to hand back an open `sqlite3.Connection` that only
+    one test ever closed. On Windows an open SQLite handle can make `tmp_path`
+    cleanup fail, and two of the four CI legs are Windows -- so the leak was a
+    CI flake waiting for the directory to be big enough to matter.
+    """
+    opened: list = []
+    yield opened
+    for conn in opened:
+        conn.close()
+
+
+@pytest.fixture
+def one_finding(_open_stores):
+    def _make(tmp_path, subject: str = "orders.py:9"):
+        conn = connect(tmp_path)
+        _open_stores.append(conn)
+        upsert(conn, _candidate(subject), "run-1", NOW)
+        return conn, list_findings(conn)[0].id
+
+    return _make
 
 
 # --- the three required arguments --------------------------------------------
 
 
-def test_reject_requires_a_reason(tmp_path):
-    conn, fid = _one_finding(tmp_path)
+def test_reject_requires_a_reason(tmp_path, one_finding):
+    conn, fid = one_finding(tmp_path)
     with pytest.raises(DispositionError, match="reason"):
         apply(conn, fid, Disposition.reject, now=NOW)
 
 
-def test_defer_requires_a_wake_condition(tmp_path):
-    conn, fid = _one_finding(tmp_path)
+def test_defer_requires_a_wake_condition(tmp_path, one_finding):
+    conn, fid = one_finding(tmp_path)
     with pytest.raises(DispositionError, match="wake"):
         apply(conn, fid, Disposition.defer, now=NOW)
 
 
-def test_hand_off_requires_an_assignee(tmp_path):
-    conn, fid = _one_finding(tmp_path)
+def test_hand_off_requires_an_assignee(tmp_path, one_finding):
+    conn, fid = one_finding(tmp_path)
     with pytest.raises(DispositionError, match="assignee"):
         apply(conn, fid, Disposition.hand_off, now=NOW)
 
 
-def test_needs_evidence_requires_saying_what_is_missing(tmp_path):
+def test_needs_evidence_requires_saying_what_is_missing(tmp_path, one_finding):
     """"Come back with more" is the instruction that produced nothing twice."""
-    conn, fid = _one_finding(tmp_path)
+    conn, fid = one_finding(tmp_path)
     with pytest.raises(DispositionError, match="reason"):
         apply(conn, fid, Disposition.needs_evidence, now=NOW)
 
 
+@pytest.mark.parametrize(
+    "disposition,kwargs,noun",
+    [
+        (Disposition.reject, {}, "reason"),
+        (Disposition.defer, {}, "wake"),
+        (Disposition.hand_off, {}, "assignee"),
+        (Disposition.needs_evidence, {}, "reason"),
+    ],
+)
+def test_the_refusal_reads_as_a_sentence_and_says_why(
+    tmp_path, one_finding, disposition, kwargs, noun
+):
+    """The message is the whole mechanism -- "missing option" is a message a
+    user works around, and one naming the argument AND the reason is one they
+    answer. Interpolating the noun in front of a sentence that already opened
+    with it printed "reject needs reason: a reason. The decision ledger...".
+    """
+    conn, fid = one_finding(tmp_path)
+    with pytest.raises(DispositionError) as excinfo:
+        apply(conn, fid, disposition, now=NOW, **kwargs)
+    message = str(excinfo.value)
+
+    assert noun in message
+    # The exact opening, not merely "the noun is absent": interpolating the
+    # noun in front of a sentence that already opens with it produced
+    # "reject needs reason a reason. The decision ledger..." -- which contains
+    # the noun, reads as broken English, and satisfies any looser assertion.
+    assert message.startswith(f"{disposition} needs a"), message
+    # A reason, not just a demand: every one of these explains what breaks.
+    assert len(message.split()) > 12, message
+
+
 @pytest.mark.parametrize("blank", ["", "   ", "\n"])
-def test_a_blank_argument_is_not_an_argument(tmp_path, blank):
+def test_a_blank_argument_is_not_an_argument(tmp_path, one_finding, blank):
     """A space satisfies `if not reason` in exactly the codebases where the
     requirement was meant to bite."""
-    conn, fid = _one_finding(tmp_path)
+    conn, fid = one_finding(tmp_path)
     with pytest.raises(DispositionError, match="reason"):
         apply(conn, fid, Disposition.reject, reason=blank, now=NOW)
 
@@ -98,8 +152,10 @@ def test_a_blank_argument_is_not_an_argument(tmp_path, blank):
         (Disposition.needs_evidence, {"reason": "no repro"}, "queued"),
     ],
 )
-def test_each_disposition_resolves_to_its_state(tmp_path, disposition, kwargs, expected):
-    conn, fid = _one_finding(tmp_path)
+def test_each_disposition_resolves_to_its_state(
+    tmp_path, one_finding, disposition, kwargs, expected
+):
+    conn, fid = one_finding(tmp_path)
     assert apply(conn, fid, disposition, now=NOW, **kwargs) == expected
     assert list_findings(conn)[0].state == expected
 
@@ -107,23 +163,25 @@ def test_each_disposition_resolves_to_its_state(tmp_path, disposition, kwargs, e
 # --- open is not terminal -----------------------------------------------------
 
 
-def test_handed_off_is_open_not_terminal(tmp_path):
+def test_handed_off_is_open_not_terminal(tmp_path, one_finding):
     """The founding failure was "assigned to a human" becoming a black hole."""
-    conn, fid = _one_finding(tmp_path)
+    conn, fid = one_finding(tmp_path)
     apply(conn, fid, Disposition.hand_off, assignee="ritvik", now=NOW)
     assert "handed_off" in count_by_state(conn)
     assert "handed_off" not in TERMINAL
     assert "handed_off" in OPEN
 
 
-def test_deferred_is_open_not_terminal(tmp_path):
-    conn, fid = _one_finding(tmp_path)
+def test_deferred_is_open_not_terminal(tmp_path, one_finding):
+    conn, fid = one_finding(tmp_path)
     apply(conn, fid, Disposition.defer, wake="2026-09-01", now=NOW)
     assert "deferred" not in TERMINAL
     assert "deferred" in OPEN
 
 
-def test_open_and_terminal_partition_every_state_a_disposition_can_produce(tmp_path):
+def test_open_and_terminal_partition_every_state_a_disposition_can_produce(
+    tmp_path, one_finding
+):
     """A state in neither set is invisible to every "what is still open" query
     that will be written on top of these two names."""
     produced = {"queued", "stalled"} | {d.resulting_state for d in Disposition}
@@ -138,25 +196,33 @@ def test_rejected_is_the_only_terminal_state():
 def test_every_state_a_disposition_produces_is_a_state_the_cli_can_filter():
     """`FindingState` exists so `findings --state` can reject a typo. A valid
     state missing from it is the same lie in reverse: the CLI refuses a state
-    the store is holding rows in, and those rows are unreachable."""
+    the store is holding rows in, and those rows are unreachable.
+
+    Asserted against `FindingState` DIRECTLY, not against `OPEN | TERMINAL`.
+    `OPEN` is derived as `frozenset(FindingState) - TERMINAL`, so the earlier
+    version of this test -- `known == (OPEN | TERMINAL)` -- was true for any
+    `TERMINAL` drawn from the enum and could not fail. It restated the
+    derivation instead of the property.
+    """
     from whetstone.store.findings import FindingState
 
     known = {str(s) for s in FindingState}
-    assert known == (OPEN | TERMINAL)
+    produced = {d.resulting_state for d in Disposition} | {"stalled"}
+    assert produced <= known, produced - known
 
 
 # --- a decision outlives the run that produced the finding --------------------
 
 
-def test_a_rejected_finding_survives_a_rerun(tmp_path):
+def test_a_rejected_finding_survives_a_rerun(tmp_path, one_finding):
     """`upsert` never touches `state`; every disposition inherits that."""
-    conn, fid = _one_finding(tmp_path)
+    conn, fid = one_finding(tmp_path)
     apply(conn, fid, Disposition.reject, reason="intended behaviour", now=NOW)
     upsert(conn, _candidate(), "run-2", NOW)
     assert list_findings(conn)[0].state == "rejected"
 
 
-def test_every_disposition_survives_a_rerun(tmp_path):
+def test_every_disposition_survives_a_rerun(tmp_path, one_finding):
     """Not just rejection. A finding handed to a person must not silently
     return to the queue because the next run found it again."""
     for i, (disposition, kwargs, expected) in enumerate(
@@ -167,20 +233,19 @@ def test_every_disposition_survives_a_rerun(tmp_path):
             (Disposition.defer, {"wake": "2026-09-01"}, "deferred"),
         ]
     ):
-        conn, fid = _one_finding(tmp_path / f"s{i}", subject=f"f{i}.py:1")
+        conn, fid = one_finding(tmp_path / f"s{i}", subject=f"f{i}.py:1")
         apply(conn, fid, disposition, now=NOW, **kwargs)
         upsert(conn, _candidate(f"f{i}.py:1"), "run-2", LATER)
         assert list_findings(conn)[0].state == expected
-        conn.close()
 
 
 # --- needs_evidence returns once, then stalls ---------------------------------
 
 
-def test_needs_evidence_returns_once_then_stalls(tmp_path):
+def test_needs_evidence_returns_once_then_stalls(tmp_path, one_finding):
     """Unbounded, this is a loop: the lens is asked again, produces the same
     thing, and is asked again. The second ask is the last one."""
-    conn, fid = _one_finding(tmp_path)
+    conn, fid = one_finding(tmp_path)
     assert apply(conn, fid, Disposition.needs_evidence, reason="no repro", now=NOW) == (
         "queued"
     )
@@ -189,10 +254,10 @@ def test_needs_evidence_returns_once_then_stalls(tmp_path):
     ) == "stalled"
 
 
-def test_the_stall_counts_this_findings_own_asks_not_the_stores(tmp_path):
+def test_the_stall_counts_this_findings_own_asks_not_the_stores(tmp_path, one_finding):
     """Counting rows in `decisions` rather than rows for THIS finding makes the
     second finding in a project stall on its first ask."""
-    conn, first = _one_finding(tmp_path)
+    conn, first = one_finding(tmp_path)
     apply(conn, first, Disposition.needs_evidence, reason="no repro", now=NOW)
 
     upsert(conn, _candidate("other.py:1"), "run-1", NOW)
@@ -205,21 +270,71 @@ def test_the_stall_counts_this_findings_own_asks_not_the_stores(tmp_path):
 # --- refusals -----------------------------------------------------------------
 
 
-def test_an_unknown_transition_refuses_rather_than_defaulting(tmp_path):
-    conn, fid = _one_finding(tmp_path)
+def test_an_unknown_transition_refuses_rather_than_defaulting(tmp_path, one_finding):
+    conn, fid = one_finding(tmp_path)
     apply(conn, fid, Disposition.reject, reason="no", now=NOW)
     with pytest.raises(DispositionError, match="rejected"):
         apply(conn, fid, Disposition.verify, now=NOW)
 
 
-def test_a_finding_that_does_not_exist_refuses(tmp_path):
+def test_a_finding_that_does_not_exist_refuses(tmp_path, one_finding, _open_stores):
     """Silently doing nothing here reads to the caller as a recorded decision."""
     conn = connect(tmp_path)
+    _open_stores.append(conn)
     with pytest.raises(DispositionError, match="no finding"):
         apply(conn, "nope", Disposition.verify, now=NOW)
 
 
-def test_disposition_error_is_a_whetstone_error(tmp_path):
+@pytest.mark.parametrize("value", ["verify", "reject", None, 1, object()])
+def test_something_that_is_not_a_disposition_refuses_and_lists_the_six(
+    tmp_path, one_finding, value
+):
+    """The string `"verify"` is the likely caller mistake and is refused too.
+
+    `Disposition` is a `StrEnum`, so `"verify" == Disposition.verify` is True
+    and a laxer check would let a raw string through -- and then `"verrify"`
+    reaches `_RESULTING_STATE` as a KeyError three frames down instead of a
+    message naming the six valid values.
+    """
+    conn, fid = one_finding(tmp_path)
+    with pytest.raises(DispositionError, match="not a disposition"):
+        apply(conn, fid, value, now=NOW)
+    assert conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 0
+
+
+def test_the_finding_and_the_decision_are_written_in_one_transaction(
+    tmp_path, one_finding
+):
+    """`connect()` is autocommit, so these were two committed writes.
+
+    The UPDATE landed first; a failing INSERT then left the finding moved with
+    no decision recorded, and the acceptance rate is computed from the
+    decisions table. The docstring on `apply` claimed the two were "written
+    together" and nothing implemented it.
+
+    Forced with a trigger rather than a mock. `sqlite3.Connection.execute` is
+    read-only and cannot be monkeypatched, and a trigger is the truer injection
+    anyway: the INSERT really is attempted and really does fail, inside the
+    same connection and the same transaction the production path uses.
+    """
+    conn, fid = one_finding(tmp_path)
+    conn.execute(
+        "CREATE TRIGGER refuse_decisions BEFORE INSERT ON decisions "
+        "BEGIN SELECT RAISE(ABORT, 'injected'); END"
+    )
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            apply(conn, fid, Disposition.reject, reason="no", now=NOW)
+    finally:
+        conn.execute("DROP TRIGGER refuse_decisions")
+
+    assert list_findings(conn)[0].state == "queued", (
+        "the finding moved even though its decision was never recorded"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 0
+
+
+def test_disposition_error_is_a_whetstone_error(tmp_path, one_finding):
     """The CLI catches WhetstoneError; anything else reaches a user as a bare
     traceback."""
     assert issubclass(DispositionError, WhetstoneError)
@@ -228,8 +343,8 @@ def test_disposition_error_is_a_whetstone_error(tmp_path):
 # --- the ledger ---------------------------------------------------------------
 
 
-def test_the_decision_is_recorded_with_everything_it_needs_to_be_audited(tmp_path):
-    conn, fid = _one_finding(tmp_path)
+def test_the_decision_is_recorded_with_everything_it_needs_to_be_audited(tmp_path, one_finding):
+    conn, fid = one_finding(tmp_path)
     apply(conn, fid, Disposition.hand_off, assignee="ritvik", now=NOW)
     row = conn.execute("SELECT * FROM decisions").fetchone()
 
@@ -244,17 +359,17 @@ def test_the_decision_is_recorded_with_everything_it_needs_to_be_audited(tmp_pat
     assert row["lens"] == "code-defects"
 
 
-def test_every_disposition_writes_exactly_one_decision_row(tmp_path):
-    conn, fid = _one_finding(tmp_path)
+def test_every_disposition_writes_exactly_one_decision_row(tmp_path, one_finding):
+    conn, fid = one_finding(tmp_path)
     apply(conn, fid, Disposition.needs_evidence, reason="a", now=NOW)
     apply(conn, fid, Disposition.needs_evidence, reason="b", now=LATER)
     assert conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 2
 
 
-def test_a_refused_disposition_writes_no_decision(tmp_path):
+def test_a_refused_disposition_writes_no_decision(tmp_path, one_finding):
     """A ledger that records attempts the store rejected is a ledger that
     disagrees with the findings table about what happened."""
-    conn, fid = _one_finding(tmp_path)
+    conn, fid = one_finding(tmp_path)
     with pytest.raises(DispositionError):
         apply(conn, fid, Disposition.reject, now=NOW)
     assert conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 0
@@ -265,7 +380,7 @@ def test_a_refused_disposition_writes_no_decision(tmp_path):
     "column", ["finding_id", "lens", "disposition", "from_state", "to_state", "decided_at"]
 )
 def test_a_decision_cannot_be_written_without_the_columns_it_is_audited_by(
-    tmp_path, column
+    tmp_path, one_finding, column
 ):
     """The schema argues these are required; this is the assertion for it.
 
@@ -276,7 +391,7 @@ def test_a_decision_cannot_be_written_without_the_columns_it_is_audited_by(
     """
     import sqlite3
 
-    conn, fid = _one_finding(tmp_path)
+    conn, fid = one_finding(tmp_path)
     values = {
         "id": "d1",
         "finding_id": fid,
@@ -295,7 +410,7 @@ def test_a_decision_cannot_be_written_without_the_columns_it_is_audited_by(
         )
 
 
-def test_a_decision_cannot_reference_a_finding_that_does_not_exist(tmp_path):
+def test_a_decision_cannot_reference_a_finding_that_does_not_exist(tmp_path, one_finding):
     """`PRAGMA foreign_keys=ON` is set in `connect`; this is what it buys.
 
     Without it the ledger accumulates decisions about nothing, and every rate
@@ -303,7 +418,7 @@ def test_a_decision_cannot_reference_a_finding_that_does_not_exist(tmp_path):
     """
     import sqlite3
 
-    conn, _ = _one_finding(tmp_path)
+    conn, _ = one_finding(tmp_path)
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT INTO decisions (id, finding_id, lens, disposition, from_state, "
@@ -313,9 +428,9 @@ def test_a_decision_cannot_reference_a_finding_that_does_not_exist(tmp_path):
         )
 
 
-def test_the_grade_is_untouched_by_a_disposition(tmp_path):
+def test_the_grade_is_untouched_by_a_disposition(tmp_path, one_finding):
     """A human decision is about what to DO. It is not a re-judgement of the
     evidence, and overwriting the grade would erase what the gate found."""
-    conn, fid = _one_finding(tmp_path)
+    conn, fid = one_finding(tmp_path)
     apply(conn, fid, Disposition.reject, reason="wont fix", now=NOW)
     assert list_findings(conn)[0].grade == "A"
