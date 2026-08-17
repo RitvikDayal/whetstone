@@ -429,7 +429,7 @@ def test_the_implement_profile_still_has_no_shell_and_no_subagent():
     # keeps it for the day a CLI release changes what `--tools` means. That is
     # an argued guarantee, so it gets an assertion: emptying `denied_tools`
     # survived a battery that checked only the available set.
-    assert FORBIDDEN_IN_M1A <= permissions.denied_tools
+    assert permissions.denied_tools >= FORBIDDEN_IN_M1A
 
 
 def test_the_implement_profile_scopes_writes_to_the_worktree():
