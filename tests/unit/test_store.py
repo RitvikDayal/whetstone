@@ -3,7 +3,8 @@ from dataclasses import replace
 
 import pytest
 
-from whetstone.errors import StoreError
+from whetstone.errors import SchemaVersionError, StoreError
+from whetstone.grade import Grade
 from whetstone.lenses.base import Candidate, Evidence, EvidenceKind, Severity
 from whetstone.store.db import SCHEMA_VERSION, connect
 from whetstone.store.findings import count_by_state, list_findings, upsert
@@ -12,7 +13,13 @@ NOW = "2026-08-10T10:00:00+00:00"
 LATER = "2026-08-10T11:00:00+00:00"
 
 
-def _candidate(subject: str = "requests", rule_id: str = "CVE-2026-1") -> Candidate:
+def _candidate(
+    subject: str = "requests",
+    rule_id: str = "CVE-2026-1",
+    *,
+    grade: Grade | None = None,
+    grade_reason: str | None = None,
+) -> Candidate:
     return Candidate(
         lens="hygiene",
         rule_id=rule_id,
@@ -25,6 +32,8 @@ def _candidate(subject: str = "requests", rule_id: str = "CVE-2026-1") -> Candid
             summary="pip-audit reported 1 advisory",
             data={"advisory": rule_id, "package": subject},
         ),
+        grade=grade,
+        grade_reason=grade_reason,
     )
 
 
@@ -59,6 +68,90 @@ def test_distinct_subjects_are_distinct_findings(tmp_path):
     upsert(conn, _candidate("urllib3"), "run-1", NOW)
     assert len(list_findings(conn)) == 2
     conn.close()
+
+
+def test_grade_is_persisted_and_refreshed(tmp_path):
+    conn = connect(tmp_path)
+    upsert(
+        conn,
+        _candidate(grade=Grade.B, grade_reason="no runnable artifact"),
+        "run-1",
+        NOW,
+    )
+    assert list_findings(conn)[0].grade == "B"
+
+    upsert(
+        conn,
+        _candidate(grade=Grade.A, grade_reason="reproduced and survived"),
+        "run-2",
+        NOW,
+    )
+    row = list_findings(conn)[0]
+    assert row.grade == "A", "a re-grade must reach the row, like title and severity do"
+    assert "survived" in row.grade_reason
+    conn.close()
+
+
+def test_a_regrade_does_not_resurrect_a_rejection(tmp_path):
+    conn = connect(tmp_path)
+    upsert(
+        conn,
+        _candidate(grade=Grade.D, grade_reason="the falsifier killed it"),
+        "run-1",
+        NOW,
+    )
+    conn.execute("UPDATE findings SET state = 'rejected'")
+    upsert(conn, _candidate(grade=Grade.A, grade_reason="reproduced"), "run-2", NOW)
+    row = list_findings(conn)[0]
+    assert row.grade == "A"
+    assert row.state == "rejected", "the grade may change; the human decision may not"
+    conn.close()
+
+
+def test_findings_without_a_grade_are_not_claimed_to_have_one(tmp_path):
+    conn = connect(tmp_path)
+    upsert(conn, _candidate(), "run-1", NOW)
+    row = list_findings(conn)[0]
+    assert row.grade is None
+    assert row.grade_reason is None
+    conn.close()
+
+
+def test_an_ungraded_rerun_clears_the_grade_rather_than_keeping_a_stale_one(tmp_path):
+    """The grade describes the evidence THIS run gathered.
+
+    A run that did not grade the finding has not established that yesterday's
+    grade still holds, so keeping it would present a stale verdict as a current
+    one. The pack does not emit an ungraded candidate today -- an unchallenged
+    one is skipped by name rather than recorded -- so this asserts the rule
+    rather than a path in use, and it is the same rule title and severity
+    already follow.
+    """
+    conn = connect(tmp_path)
+    upsert(conn, _candidate(grade=Grade.A, grade_reason="reproduced"), "run-1", NOW)
+    upsert(conn, _candidate(), "run-2", NOW)
+    row = list_findings(conn)[0]
+    assert row.grade is None
+    assert row.grade_reason is None
+    conn.close()
+
+
+def test_a_database_from_an_older_schema_says_what_to_delete(tmp_path):
+    """The refusal is correct; a refusal the user cannot act on is not.
+
+    There is no migration path, so an existing .whetstone/ from a build before
+    the grade columns must error rather than silently mismatch. The message has
+    to name the file, because the only fix available is deleting it and the
+    user cannot be expected to guess that.
+    """
+    connect(tmp_path).close()
+    with sqlite3.connect(tmp_path / "whetstone.db") as raw:
+        raw.execute("PRAGMA user_version=1")
+    with pytest.raises(SchemaVersionError) as excinfo:
+        connect(tmp_path)
+    message = str(excinfo.value)
+    assert "whetstone.db" in message
+    assert "delete" in message.lower()
 
 
 def test_state_survives_reupsert(tmp_path):

@@ -423,6 +423,16 @@ class CodeDefectsPack:
                     summary=f"{grade}: {candidate.get('title')}",
                     data=data,
                 ),
+                # ALSO on the field, not only in `data` above. The store
+                # persists the field; nothing anywhere reads `evidence.data`.
+                # Task 10 measured what the blob-only version costs: the grade
+                # reached no column, no filter and no default, so the finding
+                # the falsifier killed printed exactly like the one it
+                # confirmed. `data` keeps its copy because the evidence blob is
+                # the record of what the stages produced, and a test above
+                # asserts the two cannot drift apart.
+                grade=grade,
+                grade_reason=why,
             )
         except LensError as exc:
             # Every string in `data` came from a model, so a field the store

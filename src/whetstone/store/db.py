@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ..errors import SchemaVersionError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS findings (
@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS findings (
     severity       TEXT NOT NULL,
     evidence_json  TEXT NOT NULL,
     state          TEXT NOT NULL DEFAULT 'queued',
+    -- Nullable on purpose: a lens that does not grade leaves both NULL, which
+    -- is not the same as grade D. Reading absent as killed would report a real
+    -- defect as dismissed by a stage that never looked at it.
+    grade          TEXT,
+    grade_reason   TEXT,
     first_seen_run TEXT NOT NULL,
     last_seen_run  TEXT NOT NULL,
     created_at     TEXT NOT NULL,
@@ -68,7 +73,11 @@ def connect(state_root: Path) -> sqlite3.Connection:
         raise SchemaVersionError(
             f"{db_path} was written by Whetstone schema version "
             f"{stamped_version}, but this build expects {SCHEMA_VERSION}. "
-            "There is no migration path yet."
+            "There is no migration path yet, so the only fix is to delete "
+            f"{db_path} and run whetstone again -- which discards recorded "
+            "findings AND any decisions made about them. Refusing rather "
+            "than reading it, because a column this build expects and that "
+            "file does not have is a value silently read as absent."
         )
 
     conn.executescript(_SCHEMA)

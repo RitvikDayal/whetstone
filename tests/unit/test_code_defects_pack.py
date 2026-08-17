@@ -266,6 +266,35 @@ def test_no_files_in_scope_declines_without_spending(ctx):
 # --- the grade wiring -----------------------------------------------------------
 
 
+def test_the_grade_reaches_the_candidate_field_not_only_the_evidence_blob(
+    ctx, monkeypatch
+):
+    """The store persists `Candidate.grade`; nothing reads `evidence.data`.
+
+    Task 10 measured the consequence of the grade living only inside
+    `evidence_json`: it reached no column, no filter and no default, so a
+    killed finding printed exactly like a surviving one. Writing it into the
+    blob and not into the field would leave the new column NULL on every real
+    run while every unit test above still passed.
+    """
+    _stub_reproduction(monkeypatch, verdict="reproduced", reproduced=True)
+    candidate = _run(_pack(_provider()), ctx)[0]
+
+    assert candidate.grade is Grade.A
+    assert candidate.grade_reason and "reproduced" in candidate.grade_reason
+    # And the two must not be able to drift apart.
+    data = json.loads(candidate.evidence.to_json())["data"]
+    assert data["grade"] == str(candidate.grade)
+    assert data["grade_reason"] == candidate.grade_reason
+
+
+def test_a_killed_finding_carries_grade_d_on_the_field(ctx, monkeypatch):
+    _stub_reproduction(monkeypatch, verdict="reproduced", reproduced=True)
+    provider = _provider(falsified=[_falsify_payload(confirmed=False)])
+    candidate = _run(_pack(provider), ctx)[0]
+    assert candidate.grade is Grade.D
+
+
 def test_a_surviving_finding_is_graded_and_carries_its_reason(ctx, monkeypatch):
     _stub_reproduction(monkeypatch, verdict="reproduced", reproduced=True)
     found = _run(_pack(_provider()), ctx)

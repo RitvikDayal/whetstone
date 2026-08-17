@@ -8,6 +8,7 @@ from whetstone.lenses.base import (
     Candidate,
     Evidence,
     EvidenceKind,
+    Grade,
     LensPack,
     RunContext,
     Severity,
@@ -28,6 +29,58 @@ def _candidate(**overrides) -> Candidate:
     )
     base.update(overrides)
     return Candidate(**base)
+
+
+def test_a_candidate_carries_no_grade_by_default():
+    """Most lenses never grade. `hygiene` measures a threshold and is done."""
+    candidate = _candidate()
+    assert candidate.grade is None
+    assert candidate.grade_reason is None
+
+
+def test_a_valid_grade_with_its_reason_is_accepted():
+    candidate = _candidate(grade=Grade.A, grade_reason="graded A: reproduced.")
+    assert candidate.grade is Grade.A
+
+
+@pytest.mark.parametrize("value", ["A", "a", 1, True, object()])
+def test_grade_must_be_the_enum_not_something_that_stringifies(value):
+    """Issue #9's shape, one field over.
+
+    The store writes `str(grade)`, so 'a' and 'sev-1' would land in the column
+    as plausible-looking text that no filter matches and no reader can rank.
+    """
+    with pytest.raises(LensError, match="grade"):
+        _candidate(grade=value, grade_reason="because")
+
+
+def test_a_grade_without_a_reason_is_refused():
+    """A bare letter is a verdict the user cannot check.
+
+    `grade_finding` returns the pair and always has; there is no honest caller
+    with one and not the other. Refusing here is what stops a later lens from
+    inventing one.
+    """
+    with pytest.raises(LensError, match="grade_reason"):
+        _candidate(grade=Grade.D)
+
+
+def test_a_reason_without_a_grade_is_refused():
+    """The inverse, and it is the likelier typo: a reason explaining nothing."""
+    with pytest.raises(LensError, match="grade"):
+        _candidate(grade_reason="graded D: the falsifier killed it.")
+
+
+def test_the_grade_is_not_part_of_the_dedupe_key():
+    """Same argument as title and severity.
+
+    A finding re-graded from D to A is the SAME finding, and if the grade
+    entered the key a re-grade would mint a new row -- which is exactly how a
+    rejection gets resurrected.
+    """
+    assert _candidate(grade=Grade.A, grade_reason="r").dedupe_key == (
+        _candidate(grade=Grade.D, grade_reason="r").dedupe_key
+    )
 
 
 def test_dedupe_key_is_stable_and_identity_bearing():

@@ -53,6 +53,10 @@ class Finding:
     severity: str
     evidence: dict[str, Any]
     state: str
+    # `None` means the lens did not grade this finding, NOT that it graded it
+    # badly. Every reader has to keep the two apart.
+    grade: str | None
+    grade_reason: str | None
     first_seen_run: str
     last_seen_run: str
     created_at: str
@@ -71,11 +75,23 @@ def _row_to_finding(row: sqlite3.Row) -> Finding:
         severity=row["severity"],
         evidence=json.loads(row["evidence_json"]),
         state=row["state"],
+        grade=row["grade"],
+        grade_reason=row["grade_reason"],
         first_seen_run=row["first_seen_run"],
         last_seen_run=row["last_seen_run"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _grade_text(candidate: Candidate) -> str | None:
+    """`str(grade)` only when there is one -- `str(None)` is the string 'None'.
+
+    Issue #9 verbatim, and the reason it is a function rather than an inline
+    conditional repeated at both write sites: the INSERT and the UPDATE must
+    not be able to disagree about how absence is spelled.
+    """
+    return None if candidate.grade is None else str(candidate.grade)
 
 
 def _existing_id(conn: sqlite3.Connection, key: str) -> str | None:
@@ -97,12 +113,20 @@ def _refresh(
     """
     cursor = conn.execute(
         "UPDATE findings SET evidence_json = ?, title = ?, detail = ?, "
-        "severity = ?, last_seen_run = ?, updated_at = ? WHERE dedupe_key = ?",
+        "severity = ?, grade = ?, grade_reason = ?, last_seen_run = ?, "
+        "updated_at = ? WHERE dedupe_key = ?",
         (
             candidate.evidence.to_json(),
             candidate.title,
             candidate.detail,
             str(candidate.severity),
+            # Written unconditionally, including back to NULL. The grade
+            # describes the evidence THIS run gathered; a run that did not
+            # grade the finding has not established that yesterday's grade
+            # still holds, and presenting a stale verdict as a current one is
+            # the failure the whole gate exists to prevent.
+            _grade_text(candidate),
+            candidate.grade_reason,
             run_id,
             now,
             key,
@@ -143,9 +167,9 @@ def upsert(
     try:
         conn.execute(
             "INSERT INTO findings (id, dedupe_key, lens, rule_id, subject, title, "
-            "detail, severity, evidence_json, state, first_seen_run, last_seen_run, "
-            "created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+            "detail, severity, evidence_json, state, grade, grade_reason, "
+            "first_seen_run, last_seen_run, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
             (
                 uuid.uuid4().hex,
                 key,
@@ -156,6 +180,8 @@ def upsert(
                 candidate.detail,
                 str(candidate.severity),
                 candidate.evidence.to_json(),
+                _grade_text(candidate),
+                candidate.grade_reason,
                 run_id,
                 run_id,
                 now,
@@ -193,12 +219,28 @@ def list_findings(
         clauses.append("lens = ?")
         params.append(lens)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    # GRADE FIRST, severity second. Severity is what the model claimed about
+    # its own finding; grade is what survived the gate, and the gate is the
+    # only thing here that ran. Under severity-first a critical the falsifier
+    # killed outranked a low it confirmed -- the model's opinion sorting above
+    # the evidence, on the one surface a user reads.
+    #
+    # An ABSENT grade ranks between B and C, not last. `hygiene` does not grade
+    # at all, and its findings are measured facts -- a CVE with an ID, a
+    # coverage number below a floor. Sorting them below D would bury the most
+    # reliable output the tool has underneath the output it just refuted, and
+    # sorting them above A would let a coverage warning outrank a proven crash.
+    # Both failures are avoided by putting "no verdict" in the middle.
+    #
     # Severity is stored as text, so alphabetical ordering is meaningless
-    # ("medium" would outrank "critical"). Rank explicitly.
+    # ("medium" would outrank "critical"). Both ranks are explicit.
     rows = conn.execute(
         "SELECT * FROM findings"
         + where
-        + " ORDER BY CASE severity"
+        + " ORDER BY CASE grade"
+        "   WHEN 'A' THEN 0 WHEN 'B' THEN 1"
+        "   WHEN 'C' THEN 3 WHEN 'D' THEN 4 ELSE 2 END,"
+        " CASE severity"
         "   WHEN 'critical' THEN 0 WHEN 'high' THEN 1"
         "   WHEN 'medium' THEN 2 ELSE 3 END, subject ASC",
         params,

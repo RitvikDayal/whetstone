@@ -732,6 +732,126 @@ def test_findings_says_so_when_no_run_has_ever_happened(tmp_path, monkeypatch):
     assert "No run has been recorded" in result.stdout
 
 
+# --- a killed finding has to look killed -------------------------------------
+#
+# M1a's Task 10 measurement is the reason this section exists. On the clean
+# fixture the falsifier did its job and killed the only candidate, and
+# `whetstone findings` then printed that grade D row exactly like run 1's grade
+# A: same columns, same colour, no letter anywhere. The falsifier is the whole
+# differentiator and its verdict reached no surface a user reads.
+
+
+def _seed_graded_findings(root: Path) -> None:
+    """Three findings in one store: a survivor, a killed one, an ungraded one."""
+    from whetstone.config.loader import find_config, load_config
+    from whetstone.grade import Grade
+    from whetstone.lenses.base import Candidate, Evidence, EvidenceKind, Severity
+    from whetstone.paths import state_root
+    from whetstone.store.db import connect
+    from whetstone.store.findings import upsert
+
+    cfg = load_config(find_config(root))
+    conn = connect(state_root(root, cfg.state_dir))
+    now = "2026-08-17T10:00:00+00:00"
+
+    def _c(subject, severity, grade, reason):
+        return Candidate(
+            lens="code-defects" if grade else "hygiene",
+            rule_id="R1",
+            subject=subject,
+            title=f"{subject} is suspicious",
+            detail="d",
+            severity=severity,
+            evidence=Evidence(EvidenceKind.critique, "s", {}),
+            grade=grade,
+            grade_reason=reason,
+        )
+
+    # Subjects deliberately contain no grade letter and no verdict word. The
+    # first version of these tests used `killed.py`, and two of them passed
+    # against the unfixed CLI because the word came out of the SUBJECT column
+    # -- a check that could not fail, which is the defect this project has
+    # shipped most often.
+    #
+    # The falsified one carries the HIGHEST severity on purpose: severity is
+    # the model's claim and grade is what survived the gate, so under the
+    # severity-first ordering that shipped it sits at the top of the list.
+    upsert(conn, _c("z.py", Severity.critical, Grade.D, "the falsifier won"), "r1", now)
+    upsert(conn, _c("m.py", Severity.low, Grade.A, "reproduced and survived"), "r1", now)
+    upsert(conn, _c("requests", Severity.medium, None, None), "r1", now)
+    conn.close()
+
+
+def _row(stdout: str, subject: str) -> str:
+    """The one table line for *subject*. Asserting on the whole of stdout lets
+    a word from any other row satisfy the assertion."""
+    return next(line for line in stdout.splitlines() if subject in line)
+
+
+def test_findings_shows_the_grade(tmp_path, monkeypatch):
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    _seed_graded_findings(tmp_path)
+
+    result = runner.invoke(app, ["findings", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
+    assert "grade" in result.stdout.lower()
+    assert "A" in _row(result.stdout, "m.py")
+    assert "D" in _row(result.stdout, "z.py")
+
+
+def test_a_killed_finding_says_killed_rather_than_carrying_a_quiet_letter(
+    tmp_path, monkeypatch
+):
+    """A letter in a column a user skims past is not a distinction.
+
+    The plan's wording is that a grade D finding must be VISUALLY DISTINCT from
+    a grade A one. A word is the cheapest signal that survives a screenshot, a
+    pipe into a file, and a reader who does not know the grade vocabulary.
+    """
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    _seed_graded_findings(tmp_path)
+
+    result = runner.invoke(app, ["findings", "--path", str(tmp_path)])
+    assert "killed" in _row(result.stdout, "z.py").lower()
+
+
+def test_findings_are_ordered_by_grade_not_by_the_models_severity_claim(
+    tmp_path, monkeypatch
+):
+    """Severity is what the model claimed. Grade is what survived the gate.
+
+    The falsified row is seeded `critical` and the survivor `low`, so this
+    fails against severity-first ordering -- which is what shipped.
+    """
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    _seed_graded_findings(tmp_path)
+
+    out = runner.invoke(app, ["findings", "--path", str(tmp_path)]).stdout
+    assert out.index("m.py") < out.index("z.py"), (
+        "a grade A finding must not sit below one the falsifier killed"
+    )
+    assert out.index("requests") < out.index("z.py"), (
+        "an ungraded finding from a deterministic lens is not worse than a "
+        "killed one; absent is not D"
+    )
+
+
+def test_an_ungraded_finding_is_not_shown_as_killed(tmp_path, monkeypatch):
+    """`hygiene` does not grade. Rendering that as D would report a measured
+    CVE as something the falsifier dismissed."""
+    _wide(monkeypatch)
+    _write_config(tmp_path)
+    _seed_graded_findings(tmp_path)
+
+    result = runner.invoke(app, ["findings", "--path", str(tmp_path)])
+    row = _row(result.stdout, "requests")
+    assert "killed" not in row.lower()
+    assert not re.search(r"\b[ABCD]\b", row), row
+
+
 # --- findings --state is a vocabulary, not free text -------------------------
 
 
