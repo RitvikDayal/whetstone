@@ -29,6 +29,7 @@ findings it would have gained.
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import NamedTuple
 
@@ -162,6 +163,7 @@ def capture(
                 # layout, and re-reading one page answers a different one.
                 second = measure_one(origin, check, viewport, None)
             except BrowserError as exc:
+                _discard_shot(shot)
                 skips.append(
                     f"rendered-ui [{check.route} @ {width}x{height}]: could not "
                     f"measure {check.selector_a!r} against {check.selector_b!r}: "
@@ -171,6 +173,7 @@ def capture(
 
             absent = first.missing
             if absent:
+                _discard_shot(shot)
                 skips.append(
                     f"rendered-ui [{check.route} @ {width}x{height}]: "
                     f"{', '.join(repr(s) for s in absent)} matched no element, so "
@@ -180,6 +183,7 @@ def capture(
                 continue
 
             if not _agrees(first.overlap_px, second.overlap_px, tolerance):
+                _discard_shot(shot)
                 skips.append(
                     f"rendered-ui [{check.route} @ {width}x{height}]: measured "
                     f"{first.overlap_px:.1f} and then {second.overlap_px:.1f} "
@@ -190,6 +194,7 @@ def capture(
 
             smaller = min(first.overlap_px, second.overlap_px)
             if smaller < min_overlap_px:
+                _discard_shot(shot)
                 # Not a skip when it is genuinely zero: the check ran, the page
                 # was fine, and saying so as work-not-done would be false.
                 if smaller > 0.0:
@@ -202,6 +207,33 @@ def capture(
                     )
                 continue
 
+            # THE FILE, NOT THE PATH WE ASKED FOR. A screenshot the driver never
+            # wrote would otherwise be cited as an artifact, and evidence
+            # pointing at a nonexistent image is worse than evidence with none:
+            # the first looks checkable and is not.
+            if not shot.exists():
+                skips.append(
+                    f"rendered-ui [{check.route} @ {width}x{height}]: the overlap "
+                    f"was measured but no screenshot reached {shot.name}, so it "
+                    f"is reported without one rather than citing an image that "
+                    f"is not there."
+                )
+                overlaps.append(Overlap(check, viewport, first, second, None))
+                continue
+
             overlaps.append(Overlap(check, viewport, first, second, shot))
 
     return CaptureResult(tuple(overlaps), tuple(skips))
+
+
+def _discard_shot(shot: Path) -> None:
+    """Remove the image of a check that is not being reported.
+
+    A discarded check leaves an ORPHAN otherwise: the evidence directory fills
+    with PNGs no finding references, and the one image that does belong to a
+    finding is indistinguishable from the ones that do not. Failure to unlink is
+    deliberately ignored -- a leftover file is untidy, and turning it into an
+    exception would lose the whole run over housekeeping.
+    """
+    with contextlib.suppress(OSError):
+        shot.unlink()

@@ -39,10 +39,11 @@ from ..base import (
     LensScope,
     RunContext,
 )
-from .browser import BrowserError, Origin, availability
+from .browser import Box, BrowserError, Origin, availability
 from .capture import (
     DEFAULT_MIN_OVERLAP_PX,
     DEFAULT_STABILITY_TOLERANCE,
+    Overlap,
     capture,
 )
 from .drive import drive
@@ -55,31 +56,77 @@ _RULE_ID = "overlap"
 _DEFAULT_VIEWPORTS: tuple[tuple[int, int], ...] = ((1280, 800),)
 
 
+def _is_size(value: object) -> bool:
+    """A positive int that is not a bool.
+
+    `isinstance(True, int)` is true, so `viewports: [[true, true]]` measured a
+    1x1 page without a word about it. Booleans are excluded explicitly because
+    Python will not do it for us.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def _viewports(ctx: RunContext) -> tuple[tuple[int, int], ...]:
-    """Declared viewports, or one desktop width.
+    """Declared viewports, or one desktop width -- SAYING SO when it substitutes.
 
     ANY lens that needs the app running needs these, which is the argument the
     abstraction gate accepted for `viewport` appearing in config: a product-ux
     lens measuring reading width wants the same field. It is not browser
     vocabulary leaking into the spine.
+
+    Every rejection is reported. A silently substituted default means the lens
+    measured under settings the user did not declare, and the report then reads
+    as a result about the declared configuration -- which is the same class of
+    lie as a run that quietly checked half the surface.
     """
     raw = ctx.options.get("viewports")
-    if not isinstance(raw, (list, tuple)) or not raw:
+    if raw is None:
         return _DEFAULT_VIEWPORTS
+    if not isinstance(raw, (list, tuple)) or not raw:
+        ctx.skip(
+            f"rendered-ui: `options.viewports` is {raw!r}, which is not a "
+            f"non-empty list, so {_DEFAULT_VIEWPORTS[0][0]}x"
+            f"{_DEFAULT_VIEWPORTS[0][1]} was measured instead of what you "
+            f"declared."
+        )
+        return _DEFAULT_VIEWPORTS
+
     out: list[tuple[int, int]] = []
     for item in raw:
         if (
             isinstance(item, (list, tuple))
             and len(item) == 2
-            and all(isinstance(n, int) and n > 0 for n in item)
+            and all(_is_size(n) for n in item)
         ):
             out.append((int(item[0]), int(item[1])))
-    return tuple(out) or _DEFAULT_VIEWPORTS
+        else:
+            ctx.skip(
+                f"rendered-ui: the viewport {item!r} is not a pair of positive "
+                f"whole numbers and was not measured."
+            )
+    if not out:
+        ctx.skip(
+            f"rendered-ui: no declared viewport was usable, so "
+            f"{_DEFAULT_VIEWPORTS[0][0]}x{_DEFAULT_VIEWPORTS[0][1]} was "
+            f"measured instead. A geometry finding is only true at a width, so "
+            f"this is not the run you asked for."
+        )
+        return _DEFAULT_VIEWPORTS
+    return tuple(out)
 
 
 def _float_option(ctx: RunContext, key: str, fallback: float) -> float:
-    value = ctx.options.get(key, fallback)
-    return float(value) if isinstance(value, (int, float)) and value >= 0 else fallback
+    """A declared threshold, or the default -- and it says when it substitutes."""
+    if key not in ctx.options:
+        return fallback
+    value = ctx.options[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        ctx.skip(
+            f"rendered-ui: `options.{key}` is {value!r}, which is not a "
+            f"non-negative number, so {fallback} was used instead."
+        )
+        return fallback
+    return float(value)
 
 
 class RenderedUiPack:
@@ -205,9 +252,9 @@ class RenderedUiPack:
         for reason in measured.skips:
             ctx.skip(reason)
 
-        return [self._candidate(overlap) for overlap in measured.overlaps]
+        return [self._candidate(o, origin) for o in measured.overlaps]
 
-    def _candidate(self, overlap) -> Candidate:
+    def _candidate(self, overlap: Overlap, origin: Origin) -> Candidate:
         width, height = overlap.viewport
         check = overlap.check
         area = overlap.overlap_px
@@ -251,8 +298,16 @@ class RenderedUiPack:
                     # The replayable navigation. Invariant 5: a fix is checked
                     # by rendering the same route at the same viewport and
                     # measuring the same two selectors again.
+                    #
+                    # THE FULL URL, plus its parts. `url` held a bare path and
+                    # nothing recorded the origin, so a consumer following the
+                    # replay instruction had no host or port to navigate to --
+                    # the evidence was not replayable, which is the one thing
+                    # the key name promised.
                     "replay": {
-                        "url": f"{check.route}",
+                        "url": f"{origin}{check.route}",
+                        "origin": str(origin),
+                        "route": check.route,
                         "viewport": [width, height],
                         "measure": [check.selector_a, check.selector_b],
                     },
@@ -279,7 +334,7 @@ class RenderedUiPack:
         return get_provider(self.provider_name or "claude-cli")
 
 
-def _box_json(box) -> dict[str, float] | None:
+def _box_json(box: Box | None) -> dict[str, float] | None:
     if box is None:
         return None
     return {"x": box.x, "y": box.y, "width": box.width, "height": box.height}

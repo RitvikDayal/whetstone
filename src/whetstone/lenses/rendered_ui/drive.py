@@ -191,12 +191,49 @@ def drive(
             (),
         )
 
-    note = (result.data.get("notes") or "").strip()
-    if note:
-        notes.append(f"drive: {note}")
+    # TYPE-GUARDED, though the schema already forbids anything else. This layer
+    # exists to recompute what a model claims rather than believe it, and
+    # `"notes": 3` reaching `.strip()` ends the lens run with an unhandled
+    # AttributeError instead of a recorded reason -- the schema is the model's
+    # side of the claim, and a model's self-assessment is never trusted.
+    raw_note = result.data.get("notes")
+    if isinstance(raw_note, str) and raw_note.strip():
+        notes.append(f"drive: {raw_note.strip()}")
+    elif raw_note is not None and not isinstance(raw_note, str):
+        skips.append(
+            f"drive returned {type(raw_note).__name__} for `notes` rather than "
+            f"text, so whatever it wanted to say about its own run was lost."
+        )
+
+    raw_checks = result.data.get("checks")
+    if raw_checks is None:
+        raw_checks = []
+    elif not isinstance(raw_checks, list):
+        return DriveResult(
+            (),
+            (
+                f"drive returned {type(raw_checks).__name__} for `checks` rather "
+                f"than a list, so nothing could be measured.",
+            ),
+            tuple(notes),
+        )
+
+    # THE CAP IS ENFORCED HERE, not only asked for in the prompt. The schema
+    # permits 12 and the configured cap may be lower, so a bound the caller
+    # believes it set was one nothing enforced -- the exact defect
+    # `StageRequest` names about `max_budget_usd`. The surplus costs two real
+    # renders per viewport each, so it is not free to wave through.
+    cap = _max_checks(ctx)
+    if len(raw_checks) > cap:
+        skips.append(
+            f"drive proposed {len(raw_checks)} checks and the cap is {cap}; the "
+            f"last {len(raw_checks) - cap} were not measured. Raise "
+            f"`options.max_checks` if they mattered."
+        )
+        raw_checks = raw_checks[:cap]
 
     checks: list[Check] = []
-    for raw in result.data.get("checks") or []:
+    for raw in raw_checks:
         problem = _check_problem(origin, raw)
         if problem is not None:
             skips.append(f"drive discarded a check: {problem}")

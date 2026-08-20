@@ -438,16 +438,136 @@ def test_the_candidate_carries_capture_evidence_and_a_replayable_script(tmp_path
     shots.mkdir()
     check = Check("/index.html", "#buy", "#badge", "absolutely positioned")
     with _Server(tmp_path) as base:
-        result = capture(Origin.parse(base), (check,), ((1280, 800),), shots)
+        origin = Origin.parse(base)
+        result = capture(origin, (check,), ((1280, 800),), shots)
 
-    candidate = RenderedUiPack()._candidate(result.overlaps[0])
+    candidate = RenderedUiPack()._candidate(result.overlaps[0], origin)
     assert candidate.evidence.kind is EvidenceKind.capture
-    assert candidate.evidence.data["replay"]["measure"] == ["#buy", "#badge"]
+    replay = candidate.evidence.data["replay"]
+    assert replay["measure"] == ["#buy", "#badge"]
+    # THE FULL URL, not a bare path. A consumer following the replay had no host
+    # or port to navigate to, so the evidence was not replayable -- which is the
+    # one thing invariant 5 requires of it.
+    assert replay["url"] == f"{origin}/index.html"
+    assert replay["origin"] == str(origin)
+    assert replay["route"] == "/index.html"
     assert candidate.evidence.data["viewport"] == [1280, 800]
     assert candidate.evidence.artifacts
     # The subject carries the viewport: the same pair at 360px is a different
     # finding, and a subject without the width would dedupe them into one.
     assert candidate.subject == "/index.html@1280x800"
+
+
+# --- the bounds are enforced, not merely asked for -----------------------------------
+
+
+def test_more_checks_than_the_cap_are_truncated_with_a_reason(tmp_path):
+    """The schema permits 12 and the configured cap may be lower, so a bound the
+    caller believed it set was one nothing enforced. Each surplus check costs two
+    real renders per viewport."""
+    provider = _FakeProvider(
+        {
+            "checks": [
+                {"route": f"/p{i}", "selector_a": "#a", "selector_b": "#b",
+                 "why": "x"}
+                for i in range(9)
+            ],
+            "notes": None,
+        }
+    )
+    result = drive(_ctx(tmp_path, max_checks=3), provider, _origin(), ((1280, 800),))
+    assert len(result.checks) == 3
+    assert any("were not measured" in s for s in result.skips)
+
+
+def test_a_non_string_notes_value_is_reported_not_raised(tmp_path):
+    """The schema forbids it and this layer does not trust the schema. `3` would
+    reach `.strip()` and end the run with an AttributeError."""
+    provider = _FakeProvider({"checks": [], "notes": 3})
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+    assert result.checks == ()
+    assert any("rather than text" in s for s in result.skips)
+
+
+def test_a_non_list_checks_value_is_reported_not_raised(tmp_path):
+    provider = _FakeProvider({"checks": {"route": "/"}, "notes": None})
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+    assert result.checks == ()
+    assert any("rather than a list" in s for s in result.skips)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [[[True, True]], [[0, 800]], [["1280", "800"]], [[1280]], "1280x800", []],
+    ids=["bools", "zero", "strings", "one-number", "not-a-list", "empty"],
+)
+def test_an_unusable_viewport_is_never_silently_substituted(tmp_path, declared):
+    """A silently substituted default means the lens measured under settings the
+    user did not declare, and the report then reads as a result about the
+    declared configuration.
+
+    `bools` is the sharp one: `isinstance(True, int)` is true, so `[[true, true]]`
+    measured a 1x1 page without a word about it."""
+    from whetstone.lenses.rendered_ui.pack import _viewports
+
+    ctx = _ctx(tmp_path, viewports=declared)
+    assert _viewports(ctx) == ((1280, 800),)
+    assert ctx.skips, "substituting a default without saying so is the defect"
+
+
+def test_an_unusable_threshold_is_never_silently_substituted(tmp_path):
+    from whetstone.lenses.rendered_ui.pack import _float_option
+
+    ctx = _ctx(tmp_path, min_overlap_px=True)
+    assert _float_option(ctx, "min_overlap_px", 4.0) == 4.0
+    assert any("min_overlap_px" in s for s in ctx.skips)
+
+
+def test_a_declared_threshold_is_used_without_complaint(tmp_path):
+    """The counterweight. A check that fires on the good case teaches people to
+    ignore it."""
+    from whetstone.lenses.rendered_ui.pack import _float_option
+
+    ctx = _ctx(tmp_path, min_overlap_px=12)
+    assert _float_option(ctx, "min_overlap_px", 4.0) == 12.0
+    assert ctx.skips == ()
+
+
+# --- a discarded check leaves no evidence behind -------------------------------------
+
+
+def test_a_discarded_check_removes_its_screenshot(monkeypatch, tmp_path):
+    """An orphan PNG makes the one image that belongs to a finding
+    indistinguishable from the ones that do not."""
+    from whetstone.lenses.rendered_ui import capture as capture_module
+
+    check, calls, fake = _fixed([500.0, 0.0], tmp_path)
+
+    def writing(origin, chk, viewport, shot_path):
+        if shot_path is not None:
+            shot_path.write_bytes(b"png")
+        return fake(origin, chk, viewport, shot_path)
+
+    monkeypatch.setattr(capture_module, "measure_one", writing)
+    result = capture_module.capture(_origin(), (check,), ((1280, 800),), tmp_path)
+    assert result.overlaps == ()
+    assert list(tmp_path.glob("*.png")) == []
+
+
+def test_a_finding_whose_screenshot_never_landed_cites_no_artifact(
+    monkeypatch, tmp_path
+):
+    """Evidence pointing at a nonexistent image is worse than evidence with
+    none: the first looks checkable and is not."""
+    from whetstone.lenses.rendered_ui import capture as capture_module
+
+    check, _calls, fake = _fixed([500.0, 500.0], tmp_path)
+    monkeypatch.setattr(capture_module, "measure_one", fake)
+    result = capture_module.capture(_origin(), (check,), ((1280, 800),), tmp_path)
+    assert result.overlaps[0].screenshot is None
+    assert any("no screenshot reached" in s for s in result.skips)
+    candidate = RenderedUiPack()._candidate(result.overlaps[0], _origin())
+    assert candidate.evidence.artifacts == ()
 
 
 # --- the pack declines loudly -------------------------------------------------------
