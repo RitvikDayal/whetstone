@@ -6,17 +6,18 @@ proposes fixes, or opens a pull request, within limits you configure per issue t
 
 It never merges and it never deploys.
 
-**Status:** M0's deterministic core verified end-to-end on encode/httpcore on
-2026-08-12 -- `init` -> `doctor` -> `run` -> `findings` -> `report`, locally on
-Windows. Full transcript in
-`.superpowers/sdd/2026-08-10-whetstone-m0-plan/task-12-report.md`; the fixes
-from the adversarial review of that work are in `pr5-adversarial-fixes.md`
-beside it. Still outstanding before M0 is done: the Ubuntu/Windows x
-3.11/3.12 CI matrix.
+**Status: pre-release, and the honest version is below under
+[Known limitations](#known-limitations).** Three lenses work end to end, CI is
+green on Ubuntu and Windows across Python 3.11 and 3.12, and the evidence
+pipeline — hunt, reproduce in a container, falsify in a separate process, grade
+— has been run against real defects in real repositories.
+
+What is not settled is how *reproducible* the falsifier's judgement is. Read the
+limitations before you rely on a grade.
 
 ## Install
 
-Nothing is published yet. To follow along:
+Not published yet. To follow along:
 
 ```bash
 git clone https://github.com/RitvikDayal/whetstone
@@ -24,15 +25,27 @@ cd whetstone
 uv sync --all-groups
 ```
 
+The browser lens needs an extra, because Playwright pulls a few hundred
+megabytes of Chromium and most people never run it:
+
+```bash
+uv sync --all-groups --all-extras
+uv run playwright install chromium
+```
+
+Without it the lens reports that it could not run, with the command to fix it.
+It never silently finds nothing.
+
 ## Commands
 
-All six are real.
+All seven are real.
 
 ```bash
 whetstone init      # interactive setup; verifies every answer by running it
 whetstone doctor    # re-verifies the config against reality
 whetstone run       # find issues
 whetstone findings  # list what it found
+whetstone decide    # accept, reject, defer, hand off - the decision survives re-runs
 whetstone report    # write a shareable HTML report
 whetstone version   # print the installed version
 ```
@@ -114,6 +127,67 @@ that does not declare is treated as file-scoped.
 Because nothing project-scoped reads the file list, a run made up entirely of
 project-scoped lenses does not resolve files at all, and works in a directory
 that is not a git repository.
+
+## The code-defects lens
+
+Model-driven, and every claim with a physical referent is recomputed rather than
+believed. A hunt stage proposes candidates along several angles; the controller
+executes the reproduction **itself**, inside a container, using your project's own
+declared test command; a falsifier runs in a separate process, is denied the
+hunter's hypothesis, and is told to kill the finding. The grade comes from what
+the controller observed, never from the model's confidence in itself — which is
+recorded and then deliberately never read.
+
+It costs real money and is off at `tier: quick`.
+
+## The rendered-ui lens
+
+Defects that only exist when the app is running. A drive stage reads your markup
+and proposes pairs of elements worth measuring; the controller renders the page
+at each declared viewport, measures both bounding boxes, and computes the
+intersection. A model saying two things overlap is a proposal. Two measured
+rectangles that intersect is evidence.
+
+Everything is measured twice, in separate browser contexts. Animations, web fonts
+and async render make a single measurement a coin flip, so anything that does not
+reproduce is dropped with the reason recorded.
+
+```yaml
+lenses:
+  rendered-ui:
+    enabled: true
+    options:
+      base_url: "http://127.0.0.1:3000"   # required; the browser is pinned to it
+      viewports: [[1280, 800], [390, 844]]
+      min_overlap_px: 4                    # below this is rounding, not a defect
+```
+
+The browser is pinned to that origin by scheme, host and port — not by prefix —
+and the origin is re-checked before every measurement, so a page that redirects
+cannot be reported as evidence about your app.
+
+## Known limitations
+
+Stated here rather than discovered later.
+
+- **A falsifier verdict is not reproducible.** Measured 2026-08-20: the same
+  borderline candidate, on the same unchanged file, ten independent runs — the
+  falsifier confirmed it 3 times and refuted it 6, with one run not reaching it.
+  That is the difference between grade A and grade D on identical input. Treat a
+  single grade as one opinion, not a measurement. Tracked in
+  [#33](https://github.com/RitvikDayal/whetstone/issues/33).
+- **A finding whose address is a line range can be silently dropped.** A subject
+  like `app.py:14-17` is parsed as a path, fails the scope check, and is
+  discarded with a message wrongly saying the file was out of scope.
+  [#39](https://github.com/RitvikDayal/whetstone/issues/39).
+- **The rendered-ui lens leaves a Playwright teardown message on stderr**, even
+  on successful runs. It looks like a crash and is not.
+  [#40](https://github.com/RitvikDayal/whetstone/issues/40).
+- **Reads are not sandboxed.** The container bounds the reproduction, not the
+  analysis stages, and the target repository's own `CLAUDE.md` is discovered into
+  every stage. Point it at code you trust.
+- **No estimator.** Cost is recorded per stage after the fact; nothing predicts a
+  run's spend before you start it. Set `budget.ceiling.usd_per_run`.
 
 ## Licence
 

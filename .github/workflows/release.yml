@@ -1,0 +1,93 @@
+# Publish to PyPI on a tag, and only on a tag.
+#
+# NOTHING HERE RUNS UNTIL SOMEBODY PUSHES `v*`. That is the whole safety
+# property: a merge to `main` cannot publish, and neither can a workflow_dispatch,
+# because there is not one.
+#
+# THE TESTS RUN AGAIN HERE rather than trusting the CI run on the merge commit.
+# A tag can point at any commit, including one CI never saw, and "it was green on
+# main" is not the same claim as "it is green at the thing being published".
+#
+# TRUSTED PUBLISHING, no API token in a secret. PyPI verifies the workflow
+# identity through OIDC, which is why `id-token: write` is here and why there is
+# no `password:`. The publisher has to be configured on PyPI for this repository
+# and this workflow filename before the first release will go through.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege at the top; the publish job asks for the one extra it needs.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --all-groups --all-extras
+      - if: runner.os == 'Linux'
+        run: uv run playwright install --with-deps chromium
+      - run: uv run ruff check src tests
+      - run: uv run pytest -q
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv build
+
+      # THE TAG MUST MATCH THE VERSION IN THE WHEEL. Without this, `v0.2.0`
+      # pointing at a tree that still says 0.1.0 publishes 0.1.0 and quietly
+      # fails as "file already exists" -- or worse, succeeds and ships something
+      # nobody asked for under a name nobody expects.
+      - name: The tag and the built version agree
+        run: |
+          set -eu
+          built=$(ls dist/*.whl | sed -E 's/.*whetstone_cli-([^-]+)-.*/\1/')
+          tagged="${GITHUB_REF_NAME#v}"
+          echo "tag=$tagged built=$built"
+          test "$built" = "$tagged"
+
+      # A wheel that imports is a weaker claim than one that runs, and the
+      # entry point is the thing every user touches first. Installed from the
+      # BUILT ARTIFACT into a clean venv, with no source tree on the path --
+      # which is how a missing package data file shows up, and it cannot show
+      # up any other way.
+      - name: The built wheel runs
+        run: |
+          set -eu
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install --quiet dist/*.whl
+          /tmp/fresh/bin/whetstone version
+          /tmp/fresh/bin/whetstone --help > /dev/null
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
