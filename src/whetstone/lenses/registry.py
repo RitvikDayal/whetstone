@@ -54,6 +54,7 @@ def available_lenses() -> list[str]:
 def _register_builtins() -> None:
     from .code_defects.pack import CodeDefectsPack
     from .hygiene.pack import HygienePack
+    from .rendered_ui.pack import RenderedUiPack
 
     register(HygienePack())
     # Registered UNCONFIGURED. It resolves its provider and its test command
@@ -62,6 +63,10 @@ def _register_builtins() -> None:
     # registry is process-wide and one project's settings must not reach
     # another's run.
     register(CodeDefectsPack())
+    # Same argument, and it is the one M2 was testing: registering a SECOND
+    # model-driven pack needed no change to `register`, to `LensPack`, or to
+    # anything this function does for the first one.
+    register(RenderedUiPack())
 
 
 _register_builtins()

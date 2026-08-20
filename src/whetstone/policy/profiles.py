@@ -62,7 +62,18 @@ _INSPECT = frozenset({"Read", "Grep", "Glob"})
 # when its `Write` was refused it fell back to `Bash` and wrote the file anyway.
 FORBIDDEN_IN_M1A = frozenset({"Bash", "Agent", "TaskCreate"})
 
-_READ_ONLY = PermissionSet(
+# PUBLIC, and that is the whole of the spine change M2 needed.
+#
+# `PROFILES` is keyed by STAGE NAME, so a second lens pack declaring a stage of
+# its own would have to edit this table to be granted anything -- the spine
+# learning a lens's vocabulary, which is exactly what M2's gate exists to catch.
+# Exporting the set instead lets a pack reuse the powers that are already
+# audited here without registering a name. The audit property the module
+# docstring claims is unchanged: what a stage MAY DO is still read off this
+# file, because this is still where the set is defined.
+#
+# A pack that wants MORE than this still cannot get it by importing something.
+READ_ONLY = PermissionSet(
     available_tools=_INSPECT,
     auto_approve=_INSPECT,
     denied_tools=_NO_WRITES,
@@ -70,6 +81,8 @@ _READ_ONLY = PermissionSet(
     read_denied=_READ_DENIED,
     write_root=None,
 )
+
+_READ_ONLY = READ_ONLY
 
 # All three stages hold the same powers and differ only in their prompt. That is
 # the honest shape of M1a: the separation between hunt, reproduce and falsify is
