@@ -331,7 +331,14 @@ class RenderedUiPack:
         # wrong on the first real run: a config with no `model.provider` key is
         # the ordinary case, and the lens skipped itself with "no provider is
         # configured" while the other pack ran perfectly on the same file.
-        return get_provider(self.provider_name or "claude-cli")
+        #
+        # `is None`, not `or`. `ModelConfig.provider` neither rejects nor
+        # normalises an empty string, so `provider: ""` in a config file is a
+        # typo the `or` spelling silently turns into "the default is fine".
+        # An explicit empty name reaches `get_provider` and is refused by name.
+        if self.provider_name is None:
+            return get_provider("claude-cli")
+        return get_provider(self.provider_name)
 
 
 def _box_json(box: Box | None) -> dict[str, float] | None:

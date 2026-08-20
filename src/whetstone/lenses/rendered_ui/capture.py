@@ -156,6 +156,21 @@ def capture(
             width, height = viewport
             stem = f"{index:02d}-{width}x{height}"
             shot = shots_dir / f"{stem}.png"
+            # CONTAINMENT, asserted rather than argued. Every component of this
+            # name is a loop index or a viewport integer, so nothing a model or
+            # a config wrote reaches it -- but "no untrusted input reaches this
+            # path" is exactly the kind of claim that stops being true when
+            # somebody later builds the name from a route. The check costs
+            # nothing and turns the argument into a guarantee. It is the only
+            # place a path is derived, so the screenshot write and the unlink
+            # below are both covered by it.
+            if not _inside(shots_dir, shot):
+                skips.append(
+                    f"rendered-ui [{check.route} @ {width}x{height}]: the "
+                    f"screenshot path escaped {shots_dir}, so nothing was "
+                    f"captured or measured for this check."
+                )
+                continue
             try:
                 first = measure_one(origin, check, viewport, shot)
                 # A SEPARATE CONTEXT, not a second read of the same page. The
@@ -224,6 +239,20 @@ def capture(
             overlaps.append(Overlap(check, viewport, first, second, shot))
 
     return CaptureResult(tuple(overlaps), tuple(skips))
+
+
+def _inside(root: Path, candidate: Path) -> bool:
+    """Whether *candidate* resolves inside *root*.
+
+    `resolve()` on both, and a real containment test rather than `startswith`:
+    prefix matching on a path is the defect the write barrier already refuses,
+    and `/state/shots-elsewhere` starts with `/state/shots`.
+    """
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
 
 
 def _discard_shot(shot: Path) -> None:

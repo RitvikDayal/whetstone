@@ -496,6 +496,51 @@ def test_a_non_list_checks_value_is_reported_not_raised(tmp_path):
     assert any("rather than a list" in s for s in result.skips)
 
 
+def test_both_malformed_fields_keep_both_reasons(tmp_path):
+    """The early return built a fresh tuple and dropped the reason recorded two
+    lines above it -- a path that declines to do work and then discards its own
+    explanation on the way out."""
+    provider = _FakeProvider({"checks": {}, "notes": 3})
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+    assert result.checks == ()
+    assert any("rather than text" in s for s in result.skips), (
+        "the notes reason was lost when checks was also malformed"
+    )
+    assert any("rather than a list" in s for s in result.skips)
+
+
+def test_a_boolean_max_checks_falls_back_rather_than_capping_at_one(tmp_path):
+    """`bool` is an `int` subclass, so `max_checks: true` was a cap of ONE that
+    passed every type check. The third option in this lens bitten by it."""
+    from whetstone.lenses.rendered_ui.drive import _DEFAULT_MAX_CHECKS, _max_checks
+
+    assert _max_checks(_ctx(tmp_path, max_checks=True)) == _DEFAULT_MAX_CHECKS
+    assert _max_checks(_ctx(tmp_path, max_checks=3)) == 3
+
+
+def test_a_screenshot_path_escaping_its_directory_is_refused(monkeypatch, tmp_path):
+    """Containment asserted rather than argued. Nothing untrusted reaches the
+    name today, which is precisely the claim that stops being true later."""
+    from whetstone.lenses.rendered_ui import capture as capture_module
+
+    check, _calls, fake = _fixed([500.0, 500.0], tmp_path)
+    monkeypatch.setattr(capture_module, "measure_one", fake)
+    monkeypatch.setattr(capture_module, "_inside", lambda root, candidate: False)
+    result = capture_module.capture(_origin(), (check,), ((1280, 800),), tmp_path)
+    assert result.overlaps == ()
+    assert any("escaped" in s for s in result.skips)
+
+
+def test_an_empty_provider_name_is_refused_rather_than_defaulted(tmp_path):
+    """`ModelConfig.provider` neither rejects nor normalises "", so `or` turned
+    a typo in a config file into "the default is fine"."""
+    from whetstone.errors import WhetstoneError
+
+    pack = RenderedUiPack(provider_name="")
+    with pytest.raises(WhetstoneError):
+        pack._resolve_provider()
+
+
 @pytest.mark.parametrize(
     "declared",
     [[[True, True]], [[0, 800]], [["1280", "800"]], [[1280]], "1280x800", []],

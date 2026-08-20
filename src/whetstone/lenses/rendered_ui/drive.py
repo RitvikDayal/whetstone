@@ -64,8 +64,17 @@ class DriveResult(NamedTuple):
 
 
 def _max_checks(ctx: RunContext) -> int:
+    """The configured cap, or the default.
+
+    `bool` is excluded explicitly: it is an `int` subclass, so `max_checks: true`
+    passed every test here and became a cap of ONE rather than the default.
+    Python will not do this for us and it has now bitten this lens in three
+    separate options.
+    """
     value = ctx.options.get("max_checks", _DEFAULT_MAX_CHECKS)
-    return value if isinstance(value, int) and value > 0 else _DEFAULT_MAX_CHECKS
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return _DEFAULT_MAX_CHECKS
+    return value
 
 
 def _prompt_for(
@@ -209,14 +218,15 @@ def drive(
     if raw_checks is None:
         raw_checks = []
     elif not isinstance(raw_checks, list):
-        return DriveResult(
-            (),
-            (
-                f"drive returned {type(raw_checks).__name__} for `checks` rather "
-                f"than a list, so nothing could be measured.",
-            ),
-            tuple(notes),
+        # `skips`, not a fresh tuple. Building a new one here discarded the
+        # reason recorded two lines above when BOTH fields were malformed -- a
+        # path that declines to do work and then drops its own explanation on
+        # the way out.
+        skips.append(
+            f"drive returned {type(raw_checks).__name__} for `checks` rather "
+            f"than a list, so nothing could be measured."
         )
+        return DriveResult((), tuple(skips), tuple(notes))
 
     # THE CAP IS ENFORCED HERE, not only asked for in the prompt. The schema
     # permits 12 and the configured cap may be lower, so a bound the caller
