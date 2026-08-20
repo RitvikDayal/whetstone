@@ -144,26 +144,28 @@ class Box:
         return dx * dy if dx > 0 and dy > 0 else 0.0
 
 
-def availability() -> str | None:
-    """None when a browser can be driven, or the reason it cannot.
-
-    Two separate failures with two separate fixes, and conflating them sends
-    somebody to the wrong place: the PACKAGE may be absent (`pip install
-    'whetstone-cli[browser]'`) or the BROWSER BINARY may be
-    (`playwright install chromium`). The second is the one people miss, because
-    the import succeeds and the failure arrives much later.
-    """
+def _missing_package() -> str | None:
+    """The import half of the check. No driver session behind it, so it is free."""
     try:
-        from playwright.sync_api import sync_playwright
+        import playwright.sync_api  # noqa: F401
     except ImportError:
         return (
             "playwright is not installed, so no page can be rendered. Install "
             "the browser extra: `pip install 'whetstone-cli[browser]'`. Nothing "
             "was checked."
         )
+    return None
+
+
+def _missing_binary(play: object) -> str | None:
+    """The binary half, checked inside a session the CALLER already opened.
+
+    Split from `availability()` so `rendered()` does not pay for a second driver
+    start. Same split, and the same reason, as `sandbox.py`: the probe and the
+    run are separate so the caller can decide which one it is doing.
+    """
     try:
-        with sync_playwright() as play:
-            path = Path(play.chromium.executable_path)
+        path = Path(play.chromium.executable_path)
     except Exception as exc:  # noqa: BLE001 -- playwright raises its own types
         return f"playwright could not start: {exc}"
     if not path.exists():
@@ -172,6 +174,34 @@ def availability() -> str | None:
             "`playwright install chromium`. Nothing was rendered."
         )
     return None
+
+
+def availability() -> str | None:
+    """None when a browser can be driven, or the reason it cannot.
+
+    Two separate failures with two separate fixes, and conflating them sends
+    somebody to the wrong place: the PACKAGE may be absent (`pip install
+    'whetstone-cli[browser]'`) or the BROWSER BINARY may be
+    (`playwright install chromium`). The second is the one people miss, because
+    the import succeeds and the failure arrives much later.
+
+    THIS OPENS A DRIVER SESSION, so `rendered()` deliberately does not call it --
+    it runs the two halves itself, the binary half inside the session it was
+    going to open anyway. A route crawl renders many URLs and would otherwise pay
+    two driver starts per page instead of one. Not cached to achieve that: a
+    cached probe reads whatever the first caller happened to see, which made this
+    function untestable the moment a test primed it at import time.
+    """
+    missing = _missing_package()
+    if missing is not None:
+        return missing
+    from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as play:
+            return _missing_binary(play)
+    except Exception as exc:  # noqa: BLE001 -- playwright raises its own types
+        return f"playwright could not start: {exc}"
 
 
 @dataclass
@@ -200,12 +230,7 @@ class Page:
         # AFTER settling, not only before the request. A page can redirect
         # anywhere, and checking only what was asked for is a
         # check-then-navigate gap.
-        landed = self._page.url
-        if not self.origin.admits(landed):
-            raise BrowserError(
-                f"the page redirected to {landed!r}, outside {self.origin}. "
-                "Nothing was captured."
-            )
+        self._require_origin("keep this page")
 
     def _settle(self) -> None:
         """Wait for the network to go quiet, then for the document to be ready.
@@ -224,6 +249,27 @@ class Page:
             with contextlib.suppress(Exception):
                 self._page.wait_for_load_state(state, timeout=_SETTLE_TIMEOUT_MS)
 
+    def _require_origin(self, what: str) -> None:
+        """Refuse to read from a page that has moved off the origin.
+
+        `goto()` checks once, after settling. That is a time-of-check gap: a
+        page can navigate itself afterwards -- a delayed redirect, a script, a
+        form -- and `box()` or `screenshot()` would then measure a foreign
+        document and report it as evidence about the app under test. Checked
+        before every read rather than only at navigation.
+        """
+        landed = self._page.url
+        if not self.origin.admits(landed):
+            # Deliberately says WHERE it is and not WHEN it moved. The same
+            # guard serves a redirect during load and a script navigating the
+            # page an hour later, and a message asserting "it navigated after it
+            # was loaded" is false for the first of those.
+            raise BrowserError(
+                f"refusing to {what}: the page is at {landed!r}, outside "
+                f"{self.origin}. Whatever is there is a different site, so "
+                "nothing was measured or captured."
+            )
+
     def box(self, selector: str) -> Box | None:
         """The element's bounding box, or None when it is absent or invisible.
 
@@ -231,6 +277,7 @@ class Page:
         collapsed to nothing are different findings, and a zero box would make
         the first look like the second.
         """
+        self._require_origin("measure an element")
         element = self._page.query_selector(selector)
         if element is None:
             return None
@@ -240,6 +287,7 @@ class Page:
         return Box(raw["x"], raw["y"], raw["width"], raw["height"])
 
     def screenshot(self, path: Path) -> None:
+        self._require_origin("capture a screenshot")
         self._page.screenshot(path=str(path))
 
 
@@ -252,15 +300,21 @@ def rendered(
     Headless, and the browser is closed whatever happens -- a leaked Chromium
     holds a profile directory and, on a shared runner, several hundred megabytes.
     """
-    blocked = availability()
+    blocked = _missing_package()
     if blocked is not None:
         raise BrowserError(blocked)
 
     from playwright.sync_api import sync_playwright
 
+    # Before the session: a malformed URL should not pay for a driver start.
     origin = Origin.parse(url)
     width, height = viewport
     with sync_playwright() as play:
+        # The binary half, inside the one session this function opens. Calling
+        # `availability()` here instead would open a second one per page.
+        blocked = _missing_binary(play)
+        if blocked is not None:
+            raise BrowserError(blocked)
         browser = play.chromium.launch(headless=True)
         context = None
         try:

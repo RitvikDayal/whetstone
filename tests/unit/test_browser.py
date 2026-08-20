@@ -15,6 +15,8 @@ rather than skipping on the Linux CI legs, for the reason `sandbox_image` gives.
 from __future__ import annotations
 
 import http.server
+import os
+import sys
 import threading
 from pathlib import Path
 
@@ -29,9 +31,40 @@ from whetstone.lenses.rendered_ui.browser import (
     rendered,
 )
 
+
+def _browser_is_expected() -> bool:
+    """Linux CI must have a browser. Anywhere else it is optional.
+
+    The workflow installs Chromium on the Linux legs, so a missing binary there
+    is a broken pipeline rather than an environment nobody set up. Without this,
+    every test below SKIPPED on CI and the leg stayed green -- the "check that
+    quietly does not run" defect, inside the tests written to prove the browser
+    lens works. The PR description claimed these failed rather than skipped on
+    CI, which was an argued guarantee with nothing behind it.
+    """
+    return bool(sys.platform.startswith("linux") and os.environ.get("CI"))
+
+
+_UNAVAILABLE = availability()
+
+if _UNAVAILABLE and _browser_is_expected():  # pragma: no cover - CI guard
+    raise RuntimeError(
+        f"a browser is required on the Linux CI legs and is not available: "
+        f"{_UNAVAILABLE}. The workflow runs `playwright install chromium`; if "
+        "that step was removed these tests would silently skip and the leg "
+        "would still be green."
+    )
+
 _needs_browser = pytest.mark.skipif(
-    availability() is not None, reason=availability() or "browser available"
+    _UNAVAILABLE is not None, reason=_UNAVAILABLE or "browser available"
 )
+
+
+def test_the_browser_is_present_where_it_is_expected():
+    """Loud rather than skipped. A guard that only runs as a module-level raise
+    is invisible in a test report; this puts it in the results."""
+    if _browser_is_expected():
+        assert _UNAVAILABLE is None, _UNAVAILABLE
 
 
 # --- the origin pin ------------------------------------------------------------------
@@ -299,7 +332,11 @@ def test_a_redirect_off_the_origin_is_caught_after_the_fact(tmp_path):
     # served by the very same process.
     server.redirect_to = f"http://localhost:{server.port}/index.html"
     with server as base, rendered(f"{base}/index.html") as page:  # noqa: SIM117
-        with pytest.raises(BrowserError, match="redirected"):
+        # Matches the phrase naming WHICH guard fired, not a generic word. The
+        # post-navigation check and the pre-read checks share one message now,
+        # so "outside" alone would pass if `goto` stopped checking and `box`
+        # caught it later instead.
+        with pytest.raises(BrowserError, match="refusing to keep this page"):
             page.goto(f"{base}/away")
 
 
@@ -325,6 +362,59 @@ def test_the_viewport_is_the_one_that_was_declared(tmp_path):
         f"{base}/index.html", viewport=(640, 480)
     ) as page:
         assert page.box("#full").width == pytest.approx(640, abs=1)
+
+
+@_needs_browser
+def test_rendering_a_page_starts_the_driver_exactly_once(tmp_path, monkeypatch):
+    """The assertion behind the claim, in the same commit as the claim.
+
+    `rendered()` used to call `availability()`, which opens a full driver session
+    of its own, and then open a second one for the page. A route crawl pays that
+    per URL. The docstring now says it opens one; this is what stops that from
+    being another argued guarantee with nothing behind it -- the recurring defect
+    on this project for three milestones running.
+    """
+    import playwright.sync_api as sync_api
+
+    real = sync_api.sync_playwright
+    starts = []
+
+    def _counted():
+        starts.append(1)
+        return real()
+
+    monkeypatch.setattr(sync_api, "sync_playwright", _counted)
+    (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
+    with _Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
+        assert page.box("#a") is not None
+    assert len(starts) == 1, (
+        f"one page render started {len(starts)} driver sessions, not 1"
+    )
+
+
+@_needs_browser
+def test_a_page_that_navigates_itself_is_refused_before_it_is_measured(tmp_path):
+    """The time-of-check gap `goto` alone leaves open.
+
+    `goto` checks the origin once, after settling. A page can navigate itself
+    afterwards -- a delayed redirect, a script, a form -- and `box` or
+    `screenshot` would then measure a foreign document and report it as evidence
+    about the app under test.
+    """
+    (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
+    server = _Server(tmp_path)
+    with server as base, rendered(f"{base}/index.html") as page:
+        # Move the page off-origin behind the adapter's back, exactly as a
+        # delayed client-side redirect would.
+        page._page.goto(f"http://localhost:{server.port}/index.html")
+        with pytest.raises(BrowserError, match="refusing to measure an element"):
+            page.box("#a")
+        with pytest.raises(BrowserError, match="refusing to capture a screenshot"):
+            page.screenshot(tmp_path / "shot.png")
+    assert not (tmp_path / "shot.png").exists(), (
+        "a refused capture must leave no file. A zero-byte screenshot on disk is "
+        "evidence about a site that was never under test."
+    )
 
 
 def test_the_page_surface_is_deliberately_narrow():
