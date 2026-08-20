@@ -446,6 +446,74 @@ def test_run_without_full_defaults_to_changed_only(tmp_path, monkeypatch):
     assert calls["changed_only"] is True
 
 
+# --- a skip reaches the user INTACT ------------------------------------------
+#
+# Found by installing the built wheel and running it. The source says
+# `pip install 'whetstone-cli[browser]'` and the terminal printed
+# `pip install 'whetstone-cli'` -- Rich read `[browser]` as a style tag and
+# dropped it, destroying the one instruction that tells a user how to fix their
+# problem. Every bracketed skip is affected: `code-defects [error handling: ...]`
+# and `rendered-ui [/route @ 1280x800]` both lose the part that says WHERE.
+#
+# The invariant this project keeps repeating is that any path declining to do
+# work records a reason THAT REACHES THE USER. A reason that arrives with its
+# middle removed has not reached them.
+
+
+def test_a_bracketed_skip_reaches_the_user_intact(tmp_path, monkeypatch):
+    _write_config(tmp_path)
+
+    def _fake_execute_run(conn, cfg, project_root, root, *, tier, changed_only):
+        from whetstone.runner import RunResult
+
+        return RunResult(
+            run_id="run-1",
+            tier=tier,
+            file_count=0,
+            status="complete",
+            lens_count=1,
+            skips=(
+                "rendered-ui [/checkout @ 1280x800]: install the browser extra: "
+                "`pip install 'whetstone-cli[browser]'`. Nothing was checked.",
+            ),
+        )
+
+    monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)
+    result = runner.invoke(app, ["run", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
+    assert "[browser]" in result.stdout, (
+        "Rich ate the extra name, so the fix instruction is wrong on screen"
+    )
+    assert "[/checkout @ 1280x800]" in result.stdout, (
+        "the skip no longer says which route and viewport it is about"
+    )
+
+
+def test_a_skip_with_unbalanced_brackets_does_not_crash_the_run(
+    tmp_path, monkeypatch
+):
+    """Model-authored text reaches this line. An unclosed tag is a MarkupError,
+    which would lose a completed run at the moment it prints its results."""
+    _write_config(tmp_path)
+
+    def _fake_execute_run(conn, cfg, project_root, root, *, tier, changed_only):
+        from whetstone.runner import RunResult
+
+        return RunResult(
+            run_id="run-1",
+            tier=tier,
+            file_count=0,
+            status="complete",
+            lens_count=1,
+            skips=("code-defects: subject 'a[0' could not be parsed",),
+        )
+
+    monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)
+    result = runner.invoke(app, ["run", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
+    assert "a[0" in result.stdout
+
+
 # --- report: the invariant a stale report is worse than none is only real
 # if the actual CLI wires a run's skips into the actual HTML. ------------------
 

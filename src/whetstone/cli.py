@@ -7,6 +7,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import __version__
@@ -162,7 +163,7 @@ def init_command(
     try:
         run_wizard(path.resolve(), console=console, assume_yes=yes, force=force)
     except (WhetstoneError, FileExistsError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from exc
 
 
@@ -172,7 +173,7 @@ def doctor(path: Path = _PathOption) -> None:
     try:
         cfg, project_root, root = _load(path.resolve())
     except WhetstoneError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from exc
 
     results = run_doctor(cfg, project_root, root)
@@ -190,7 +191,7 @@ def doctor(path: Path = _PathOption) -> None:
         # and destroyed `... is not a git repository.` -- the only actionable
         # half, cut off exactly the rows that FAIL. Rich wraps the column to
         # the terminal instead, which loses nothing.
-        table.add_row(result.name, status, result.detail)
+        table.add_row(result.name, status, escape(result.detail))
     console.print(table)
 
     if any(not r.ok for r in results):
@@ -235,7 +236,7 @@ def run(
                 changed_only=not full,
             )
     except WhetstoneError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from exc
 
     files = "file" if result.file_count == 1 else "files"
@@ -246,7 +247,13 @@ def run(
     if result.skips:
         console.print("\n[yellow]Not everything was checked:[/yellow]")
         for skip in result.skips:
-            console.print(f"  - {skip}")
+            # markup=False: a skip is TEXT, and Rich reads a bracket in it
+            # as a style tag. `[/checkout @ 1280x800]` parses as a CLOSING
+            # tag and raises MarkupError, losing a completed run at the
+            # moment it prints its results; `[browser]` is silently dropped,
+            # turning the one instruction that fixes the problem into a
+            # wrong one. Found by running the built wheel.
+            console.print(f"  - {skip}", markup=False)
 
     if result.lens_count == 0:
         raise typer.Exit(code=1)
@@ -301,7 +308,7 @@ def findings(
             )
             last = get_last_run(conn)
     except WhetstoneError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from exc
 
     # The same truth `report` discards: this list is drawn from whatever the
@@ -311,7 +318,7 @@ def findings(
     _warn_if_the_last_run_did_not_finish(last)
 
     if not rows:
-        console.print(f"No findings in state '{state}'.")
+        console.print(f"No findings in state '{escape(state)}'.", markup=False)
         return
 
     table = Table("id", "grade", "severity", "lens", "subject", "title")
@@ -323,8 +330,8 @@ def findings(
             _grade_cell(row.grade),
             row.severity,
             row.lens,
-            row.subject,
-            row.title[:70],
+            escape(row.subject),
+            escape(row.title[:70]),
         )
     console.print(table)
 
@@ -394,7 +401,8 @@ def decide(
             # Shown before it happens, not after. The id was probably a prefix,
             # so the user has not necessarily seen which finding this is.
             console.print(
-                f"{disposition}: [bold]{row.subject}[/bold] - {row.title[:70]}"
+                f"{disposition}: [bold]{escape(row.subject)}[/bold] - "
+                f"{escape(row.title[:70])}"
             )
             # Only reject. A prompt on all six is a prompt nobody reads, and
             # the other five are recoverable by deciding again.
@@ -419,10 +427,12 @@ def decide(
         # DispositionError already carries the sentence naming the argument AND
         # why it is required. Printed as-is rather than replaced with a second,
         # worse message.
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from exc
 
-    console.print(f"[green]{row.subject} is now {new_state}.[/green]")
+    console.print(
+        f"[green]{escape(row.subject)} is now {new_state}.[/green]"
+    )
 
 
 @app.command()
@@ -445,7 +455,7 @@ def report(
         html = render_report(rows, project_name=cfg.project.name, run=run)
         written = write_report(target, html, project_root=project_root)
     except WhetstoneError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from exc
 
     # soft_wrap: Rich wraps to the terminal by default, which broke the path
