@@ -130,11 +130,12 @@ def test_the_pack_satisfies_the_lens_protocol_unchanged():
     assert isinstance(RenderedUiPack(), LensPack)
 
 
-def test_the_pack_is_project_scoped():
-    """It reads a running app, not the files `boundaries.include` selects. A user
-    who excluded a path and still gets a finding has been told something false by
-    silence."""
-    assert RenderedUiPack().scope is LensScope.project
+def test_the_pack_is_file_scoped():
+    """Settled by the first real run, not by taste. The runner resolves no file
+    list at all when nothing enabled is file-scoped, so a project-scoped
+    rendered-ui got "(no files in scope)" and was asked to read markup it could
+    not see."""
+    assert RenderedUiPack().scope is LensScope.file
 
 
 def test_autonomy_stops_below_the_writer():

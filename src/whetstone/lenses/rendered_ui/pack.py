@@ -88,11 +88,14 @@ class RenderedUiPack:
     name = "rendered-ui"
     # See the module docstring. A measurement is not an executable proof.
     max_autonomy = 1
-    # Project-scoped: this lens reads a RUNNING APP at a declared origin. It is
-    # not narrowed by `boundaries.include`, which selects files, and saying so
-    # is what stops a user who excluded a path being told something false by
-    # silence when a finding about it appears anyway.
-    scope = LensScope.project
+    # FILE-SCOPED, and the first real run is what settled it. `project` looked
+    # right -- this lens measures a running app, not files -- but the runner
+    # does not resolve a file list at all when no enabled lens is file-scoped,
+    # so the drive stage was handed "(no files in scope)" and asked to read
+    # markup it could not see. The stage's INPUT is the app's own source, and
+    # `boundaries.include` narrowing which templates get read is correct rather
+    # than misleading.
+    scope = LensScope.file
 
     def __init__(
         self,
@@ -263,13 +266,17 @@ class RenderedUiPack:
     def _resolve_provider(self) -> Provider:
         if self._provider is not None:
             return self._provider
-        from ...provider import registry
+        # Imported here rather than at module scope, for the reason
+        # `code_defects/pack.py` gives: the provider registry instantiates the
+        # CLI provider at import time, and the lens registry imports this
+        # module during `whetstone --help`.
+        from ...provider.registry import get_provider
 
-        if not self.provider_name:
-            raise WhetstoneError(
-                "no provider is configured, so the drive stage cannot run."
-            )
-        return registry.get_provider(self.provider_name)
+        # The same default `code-defects` takes. Raising instead was measured
+        # wrong on the first real run: a config with no `model.provider` key is
+        # the ordinary case, and the lens skipped itself with "no provider is
+        # configured" while the other pack ran perfectly on the same file.
+        return get_provider(self.provider_name or "claude-cli")
 
 
 def _box_json(box) -> dict[str, float] | None:
