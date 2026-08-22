@@ -330,6 +330,13 @@ class Page:
             # A FULL OR READ-ONLY DISK, or a page that died mid-write. The
             # image is the evidence, so failing to write it is exactly the
             # thing a reader must be told rather than left to infer.
+            #
+            # AND THE PARTIAL FILE GOES. A half-written PNG left on disk is
+            # indistinguishable, to everything downstream, from a screenshot
+            # that succeeded -- `capture()` decides whether to cite an artifact
+            # by asking whether the file exists.
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
             raise BrowserError(
                 f"could not capture a screenshot to {path}: "
                 f"{type(exc).__name__}: {exc}"
@@ -374,10 +381,20 @@ def rendered(
             ) from exc
         context = None
         try:
-            context = browser.new_context(
-                viewport={"width": width, "height": height}
-            )
-            page = context.new_page()
+            try:
+                context = browser.new_context(
+                    viewport={"width": width, "height": height}
+                )
+                page = context.new_page()
+            except Exception as exc:  # noqa: BLE001 - driver errors share no base
+                # The last two raw driver calls in this function. A browser
+                # that dies between launch and here, or a driver that rejects
+                # the context options, raised past the boundary every other
+                # call in this module now respects.
+                raise BrowserError(
+                    f"the browser started but no page could be opened at "
+                    f"{width}x{height}: {type(exc).__name__}: {exc}"
+                ) from exc
             wrapped = Page(page, origin)
             wrapped.goto(url)
             yield wrapped

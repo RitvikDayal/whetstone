@@ -656,6 +656,29 @@ def test_a_screenshot_path_escaping_its_directory_is_refused(monkeypatch, tmp_pa
     assert any("escaped" in s for s in result.skips)
 
 
+def test_a_floor_of_zero_does_not_report_every_clean_pair(monkeypatch, tmp_path):
+    """`0` is finite, numeric and not negative, so `_float_option` accepts it --
+    and then `smaller < min_overlap_px` reads `0.0 < 0.0`, which is false. Two
+    elements that never touch measure 0.0 twice, agree with themselves, and
+    fall through as a reported candidate overlapping by nought square pixels.
+    Every proposed pair on a correct page becomes a finding.
+
+    The same direction as the `nan` case: the lens INVENTING findings, which is
+    the one failure a tool built on evidence cannot have."""
+    from whetstone.lenses.rendered_ui import capture as capture_module
+
+    check, _calls, fake = _fixed([0.0, 0.0], tmp_path)
+    monkeypatch.setattr(capture_module, "measure_one", fake)
+    result = capture_module.capture(
+        _origin(), (check,), ((1280, 800),), tmp_path, min_overlap_px=0.0
+    )
+
+    assert result.overlaps == (), "a zero intersection is not an overlap at any floor"
+    # NOT a skip either. The check ran and the page was fine; calling that
+    # work-not-done would put a false reason in the report.
+    assert result.skips == (), result.skips
+
+
 def test_duplicate_viewports_do_not_share_one_screenshot_path(monkeypatch, tmp_path):
     """A REPORTED FINDING CITING A DELETED IMAGE. Nothing deduplicates
     `viewports`, so two identical entries used to derive the same path: the

@@ -101,5 +101,11 @@ class Server:
         return f"http://127.0.0.1:{self.port}"
 
     def __exit__(self, *_exc: object) -> None:
-        self._httpd.shutdown()
+        # `shutdown()` BLOCKS until `serve_forever` acknowledges, so calling it
+        # on a server that was never entered waits on a thread that never
+        # started -- a hung CI leg instead of a failing one. Nothing reaches
+        # that today; a `with` chain that raises before this one is entered
+        # would.
+        if self._thread.is_alive():
+            self._httpd.shutdown()
         self._httpd.server_close()

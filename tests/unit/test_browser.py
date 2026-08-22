@@ -186,6 +186,49 @@ def test_a_navigation_failure_becomes_a_browser_error():
     )
 
 
+def test_a_browser_that_cannot_open_a_page_becomes_a_browser_error(monkeypatch):
+    """LAUNCHING IS NOT OPENING. A browser that dies between `launch()` and
+    `new_context()`, or a driver that rejects the context options, raised past
+    the boundary every other call in this module respects -- and `capture()`
+    catches only BrowserError."""
+    import playwright.sync_api as sync_api
+
+    from whetstone.lenses.rendered_ui import browser as browser_module
+
+    closed = []
+
+    class _Browser:
+        def new_context(self, **_kw):
+            raise RuntimeError("Target browser has been closed")
+
+        def close(self):
+            closed.append(True)
+
+    class _Chromium:
+        def launch(self, **_kw):
+            return _Browser()
+
+    class _Play:
+        chromium = _Chromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _Play())
+    monkeypatch.setattr(browser_module, "_missing_binary", lambda _play: None)
+
+    with pytest.raises(BrowserError) as caught:  # noqa: SIM117
+        with rendered("http://127.0.0.1:3000/x"):
+            pass
+
+    assert "no page could be opened" in str(caught.value)
+    assert "1280x800" in str(caught.value), "the viewport it failed at is the diagnosis"
+    assert closed, "a browser that opened no page must still be closed"
+
+
 def test_a_browser_that_cannot_start_becomes_a_browser_error(monkeypatch):
     """THE BINARY BEING PRESENT IS NOT THE BINARY STARTING. A runner with an
     unusable sandbox, a missing shared library, or no writable profile
@@ -233,6 +276,12 @@ def test_a_driver_error_while_reading_becomes_a_browser_error(tmp_path):
             raise RuntimeError(f"Unexpected token while parsing {selector!r}")
 
         def screenshot(self, path=None):
+            # WRITES, THEN FAILS. Raising before touching the disk made the
+            # "leaves no file" assertion below restate the stub -- it passed
+            # whatever `Page.screenshot` did, including doing nothing. A real
+            # driver filling a disk leaves a partial PNG behind, and that is
+            # the state worth asserting about.
+            Path(path).write_bytes(b"partial png, never finished")
             raise OSError(28, "No space left on device")
 
     page = Page(_Breaking(), Origin.parse("http://127.0.0.1:3000"))
@@ -249,7 +298,11 @@ def test_a_driver_error_while_reading_becomes_a_browser_error(tmp_path):
         page.screenshot(shot)
     assert "could not capture a screenshot" in str(caught.value)
     assert "No space left on device" in str(caught.value)
-    assert not shot.exists()
+    assert not shot.exists(), (
+        "a half-written PNG is indistinguishable downstream from one that "
+        "succeeded -- capture() decides whether to cite an artifact by asking "
+        "whether the file is there"
+    )
 
 
 # --- geometry is arithmetic ------------------------------------------------------------

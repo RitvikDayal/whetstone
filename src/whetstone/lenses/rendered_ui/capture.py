@@ -217,18 +217,30 @@ def capture(
                 continue
 
             smaller = min(first.overlap_px, second.overlap_px)
+            if smaller <= 0.0:
+                # ZERO IS NOT AN OVERLAP AT ANY FLOOR, and this is checked
+                # BEFORE the configured one rather than through it. `0` is
+                # finite, numeric and not negative, so `min_overlap_px: 0`
+                # passes `_float_option` -- and then `smaller < min_overlap_px`
+                # reads `0.0 < 0.0`, which is false. Every separated pair on a
+                # correct page agreed with itself at zero and was reported as a
+                # candidate overlapping by nought square pixels. Same direction
+                # as the `nan` case: the lens INVENTING findings, which is the
+                # one failure a tool built on evidence cannot have.
+                #
+                # Not a skip. The check ran, the page was fine, and calling
+                # that work-not-done would be false.
+                _discard_shot(shot)
+                continue
             if smaller < min_overlap_px:
                 _discard_shot(shot)
-                # Not a skip when it is genuinely zero: the check ran, the page
-                # was fine, and saying so as work-not-done would be false.
-                if smaller > 0.0:
-                    skips.append(
-                        f"rendered-ui [{check.route} @ {width}x{height}]: "
-                        f"{smaller:.1f} square pixels of overlap is below the "
-                        f"{min_overlap_px:.1f} floor and was not reported. Two "
-                        f"abutting elements round into each other by about this "
-                        f"much."
-                    )
+                skips.append(
+                    f"rendered-ui [{check.route} @ {width}x{height}]: "
+                    f"{smaller:.1f} square pixels of overlap is below the "
+                    f"{min_overlap_px:.1f} floor and was not reported. Two "
+                    f"abutting elements round into each other by about this "
+                    f"much."
+                )
                 continue
 
             # THE FILE, NOT THE PATH WE ASKED FOR. A screenshot the driver never
