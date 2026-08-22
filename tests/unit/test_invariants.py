@@ -171,6 +171,17 @@ _ALLOWED_WRITE_CALLS = {
         "moment earlier -- the path came from git status, not from a model, "
         "and refusing it would leave the worktree stripped of the fix it just "
         "approved"),
+    ("lenses/rendered_ui/browser.py", "self._page.screenshot"): (1,
+        "the one place Playwright is asked to put a PNG on disk. The path is "
+        "built by the controller and the origin is re-checked immediately "
+        "before, so a page that navigated away cannot have its image captured "
+        "and reported as evidence about the app under test"),
+    ("lenses/rendered_ui/capture.py", "page.screenshot"): (1,
+        "the capture stage's own call into that wrapper. Allowlisted "
+        "SEPARATELY on purpose: the count is what forces the next stage that "
+        "wants a screenshot to be reviewed rather than inheriting this one. The "
+        "path is built from a loop index and a viewport size, so no model or "
+        "user input reaches it"),
     ("scope/resolver.py", "os.open"): (2,
         "the barrier itself. TWO calls, and the count says so: O_CREAT|O_EXCL "
         "first so it learns atomically whether it created the file, then a "
@@ -185,6 +196,13 @@ _WRITE_ATTRS = frozenset({
     "write_text", "write_bytes", "writelines", "touch",
     "open", "fdopen", "mkstemp", "NamedTemporaryFile",
     "copy", "copyfile", "copytree", "copy2", "move", "dump",
+    # A SCREENSHOT IS A WRITE, and this scan had never heard of one. M2 added a
+    # stage that puts PNGs on disk through a third-party driver, and none of the
+    # spellings above appear anywhere near it -- so the whole mechanism would
+    # have slipped past a guard built precisely to stop the next write being
+    # added unreviewed. Adding it here is what makes the M2 constraint "a
+    # screenshot is a write" true rather than merely stated.
+    "screenshot",
 })
 
 

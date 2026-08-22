@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import __version__
@@ -23,6 +25,31 @@ from .report.html import render_report, write_report
 from .runner import RunResult, _now, execute_run, get_last_run
 from .store.db import connect
 from .store.findings import FindingState, list_findings
+
+# Terminal control characters, shown rather than executed. NEITHER
+# `markup=False` NOR `escape()` touches these -- both deal with Rich's own
+# markup, and Rich's sanitiser drops a small set of control characters while
+# letting ESC through. Every string this is applied to is written by a model
+# or read out of the repository under analysis, so `\x1b]0;...` in a
+# subject retitles the reader's window and `\x1b[2J` clears their
+# scrollback -- from a tool they ran to look at someone else's code.
+#
+# Escaped rather than deleted: a subject that silently loses characters is a
+# subject the reader cannot match against their own file.
+_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _printable(text: str) -> str:
+    """*text* with any terminal control character rendered visible and inert.
+
+    APPLIED TO EXCEPTION TEXT TOO, not only to model output. A WhetstoneError
+    quotes the value that caused it -- `--out`, a state name, a config setting
+    -- so the argument that reaches the screen is the one somebody typed or
+    scripted, and `escape()` in front of it neutralises Rich markup and
+    nothing else.
+    """
+    return _CONTROLS.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
 
 app = typer.Typer(
     add_completion=False,
@@ -140,7 +167,8 @@ def _warn_if_the_last_run_did_not_finish(run: RunResult | None) -> None:
     if not run.finished:
         console.print(
             f"[yellow]Warning: the most recent run did not finish (status "
-            f"'{run.status}'). What follows is a partial record of a partial "
+            f"'{_printable(run.status)}'). What follows is a partial record of "
+            f"a partial "
             "run - an absent finding may simply never have been looked "
             "for.[/yellow]"
         )
@@ -162,7 +190,7 @@ def init_command(
     try:
         run_wizard(path.resolve(), console=console, assume_yes=yes, force=force)
     except (WhetstoneError, FileExistsError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
 
@@ -172,7 +200,7 @@ def doctor(path: Path = _PathOption) -> None:
     try:
         cfg, project_root, root = _load(path.resolve())
     except WhetstoneError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
     results = run_doctor(cfg, project_root, root)
@@ -190,7 +218,7 @@ def doctor(path: Path = _PathOption) -> None:
         # and destroyed `... is not a git repository.` -- the only actionable
         # half, cut off exactly the rows that FAIL. Rich wraps the column to
         # the terminal instead, which loses nothing.
-        table.add_row(result.name, status, result.detail)
+        table.add_row(result.name, status, escape(_printable(result.detail)))
     console.print(table)
 
     if any(not r.ok for r in results):
@@ -235,7 +263,7 @@ def run(
                 changed_only=not full,
             )
     except WhetstoneError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
     files = "file" if result.file_count == 1 else "files"
@@ -246,7 +274,13 @@ def run(
     if result.skips:
         console.print("\n[yellow]Not everything was checked:[/yellow]")
         for skip in result.skips:
-            console.print(f"  - {skip}")
+            # markup=False: a skip is TEXT, and Rich reads a bracket in it
+            # as a style tag. `[/checkout @ 1280x800]` parses as a CLOSING
+            # tag and raises MarkupError, losing a completed run at the
+            # moment it prints its results; `[browser]` is silently dropped,
+            # turning the one instruction that fixes the problem into a
+            # wrong one. Found by running the built wheel.
+            console.print(f"  - {_printable(skip)}", markup=False)
 
     if result.lens_count == 0:
         raise typer.Exit(code=1)
@@ -301,7 +335,7 @@ def findings(
             )
             last = get_last_run(conn)
     except WhetstoneError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
     # The same truth `report` discards: this list is drawn from whatever the
@@ -311,7 +345,9 @@ def findings(
     _warn_if_the_last_run_did_not_finish(last)
 
     if not rows:
-        console.print(f"No findings in state '{state}'.")
+        console.print(
+            f"No findings in state '{_printable(state)}'.", markup=False
+        )
         return
 
     table = Table("id", "grade", "severity", "lens", "subject", "title")
@@ -322,9 +358,9 @@ def findings(
             row.id[:_ID_PREFIX],
             _grade_cell(row.grade),
             row.severity,
-            row.lens,
-            row.subject,
-            row.title[:70],
+            _printable(row.lens),
+            escape(_printable(row.subject)),
+            escape(_printable(row.title[:70])),
         )
     console.print(table)
 
@@ -360,7 +396,8 @@ def _resolve_finding_id(conn, given: str) -> str:
         )
     if len(matches) > 1:
         listed = "\n".join(
-            f"  {row.id[:_ID_PREFIX]}  {row.subject}  {row.title[:50]}"
+            f"  {row.id[:_ID_PREFIX]}  {_printable(row.subject)}  "
+            f"{_printable(row.title[:50])}"
             for row in matches[:10]
         )
         raise WhetstoneError(
@@ -394,7 +431,8 @@ def decide(
             # Shown before it happens, not after. The id was probably a prefix,
             # so the user has not necessarily seen which finding this is.
             console.print(
-                f"{disposition}: [bold]{row.subject}[/bold] - {row.title[:70]}"
+                f"{disposition}: [bold]{escape(_printable(row.subject))}"
+                f"[/bold] - {escape(_printable(row.title[:70]))}"
             )
             # Only reject. A prompt on all six is a prompt nobody reads, and
             # the other five are recoverable by deciding again.
@@ -419,10 +457,12 @@ def decide(
         # DispositionError already carries the sentence naming the argument AND
         # why it is required. Printed as-is rather than replaced with a second,
         # worse message.
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
-    console.print(f"[green]{row.subject} is now {new_state}.[/green]")
+    console.print(
+        f"[green]{escape(_printable(row.subject))} is now {new_state}.[/green]"
+    )
 
 
 @app.command()
@@ -445,10 +485,17 @@ def report(
         html = render_report(rows, project_name=cfg.project.name, run=run)
         written = write_report(target, html, project_root=project_root)
     except WhetstoneError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
     # soft_wrap: Rich wraps to the terminal by default, which broke the path
     # across two lines mid-directory and made the one thing on this line worth
     # having -- something to copy and paste -- unusable.
-    console.print(f"[green]Wrote[/green] {written}", soft_wrap=True)
+    # BOTH GUARDS. `_printable` stops the path DRIVING the terminal; `escape`
+    # stops it addressing Rich, which is a separate surface -- markup is on for
+    # this call, so `[link=file:///etc/passwd]report[/link]` in a path renders
+    # as a clickable hyperlink pointing somewhere the user did not ask for.
+    console.print(
+        f"[green]Wrote[/green] {escape(_printable(str(written)))}",
+        soft_wrap=True,
+    )

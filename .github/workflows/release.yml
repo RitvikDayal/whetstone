@@ -1,0 +1,129 @@
+# Verify and build on a tag. This workflow does NOT publish -- see the note
+# where the publish job used to be, at the bottom.
+#
+# NOTHING HERE RUNS UNTIL SOMEBODY PUSHES `v*`. A merge to `main` cannot start
+# it, and neither can a workflow_dispatch, because there is not one.
+#
+# THE TESTS RUN AGAIN HERE rather than trusting the CI run on the merge commit.
+# A tag can point at any commit, including one CI never saw, and "it was green on
+# main" is not the same claim as "it is green at the thing being published".
+#
+# NO PUBLICATION CREDENTIAL AND NO PUBLICATION CAPABILITY. GitHub still issues
+# the read-scoped `GITHUB_TOKEN` that `contents: read` asks for -- that is a
+# credential, and saying otherwise here was wrong -- but nothing in this
+# workflow can reach PyPI: no `id-token: write`, no token, no publish step.
+# That is the point. A tag can be pushed by anything holding write access, and
+# a tag that cannot reach a publishing credential cannot ship a release.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege, and nothing asks for more. There is no job here that needs
+# to write anything; `contents: read` is the whole grant for the workflow.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv python install ${{ matrix.python }}
+      # --python for the same reason ci.yml gives: without it the matrix does
+      # not bind, and a release could be verified twice on one interpreter.
+      - run: uv sync --python ${{ matrix.python }} --all-groups --all-extras
+      - if: runner.os == 'Linux'
+        run: uv run playwright install --with-deps chromium
+      - if: runner.os != 'Linux'
+        run: uv run playwright install chromium
+      - run: uv run ruff check src tests
+      - run: uv run pytest -q
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv build
+
+      # THE TAG MUST MATCH THE VERSION IN THE WHEEL. Without this, `v0.2.0`
+      # pointing at a tree that still says 0.1.0 publishes 0.1.0 and quietly
+      # fails as "file already exists" -- or worse, succeeds and ships something
+      # nobody asked for under a name nobody expects.
+      - name: The tag and the built version agree
+        run: |
+          set -eu
+          # GLOB, NOT `ls` (SC2012). And the count is checked first: with
+          # two wheels in dist/ the old pipeline silently compared the
+          # version of whichever one `ls` sorted first, so a stale artifact
+          # could pass the check whose whole job is catching a wrong one.
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected one wheel in dist/, found ${#wheels[@]}"
+            exit 1
+          fi
+          built=$(basename "${wheels[0]}" | sed -E 's/^whetstone_cli-([^-]+)-.*/\1/')
+          tagged="${GITHUB_REF_NAME#v}"
+          echo "tag=$tagged built=$built"
+          test "$built" = "$tagged"
+
+      # A wheel that imports is a weaker claim than one that runs, and the
+      # entry point is the thing every user touches first. Installed from the
+      # BUILT ARTIFACT into a clean venv, with no source tree on the path --
+      # which is how a missing package data file shows up, and it cannot show
+      # up any other way.
+      - name: The built wheel runs
+        run: |
+          set -eu
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install --quiet dist/*.whl
+          /tmp/fresh/bin/whetstone version
+          /tmp/fresh/bin/whetstone --help > /dev/null
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+
+  # THERE IS NO PUBLISH JOB, AND THAT IS THE CONTROL.
+  #
+  # There was one, gated on a repository variable. That gate does not hold: a
+  # tag push runs the workflow definition FROM THE TAGGED COMMIT, and PyPI
+  # Trusted Publishing identifies the repository and the workflow filename --
+  # never a commit SHA. So anything able to push a commit and a `v*` tag can
+  # delete the gate in the same commit it tags, and publish with
+  # `id-token: write`. A check the attacker edits is not a check.
+  #
+  # `environment: release` did not help either. Verified against the API on
+  # 2026-08-22: the environment does not exist (404), and this repository
+  # cannot create a protected one -- deployment protection rules and tag
+  # rulesets on a PRIVATE repo need a paid plan, and the rulesets API answers
+  # 403 "Upgrade to GitHub Pro or make this repository public". GitHub would
+  # have created it unprotected on first use and published unattended.
+  #
+  # With no enforceable control available on this plan, the honest shape is to
+  # not have the capability at all. A tag still verifies on four legs, checks
+  # that the tag and the built version agree, runs the wheel from a clean venv,
+  # and uploads `dist/` as an artifact. Publication is then a deliberate manual
+  # act against a build somebody has looked at.
+  #
+  # TO BRING IT BACK, all three, not any one of them:
+  #   1. The repo is public, or on a plan with deployment protection rules.
+  #   2. `release` exists as an environment with required reviewers, and a
+  #      ruleset restricts who may push `v*`.
+  #   3. Trusted Publishing is configured on PyPI for this repo and for THIS
+  #      filename -- renaming the file silently breaks the identity it asserts.
+  # Then add the job back with `environment: release` and `id-token: write`,
+  # and no `if:` -- the environment is the gate, and unlike an `if:` it is not
+  # part of the commit being tagged.

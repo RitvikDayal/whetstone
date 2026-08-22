@@ -446,6 +446,238 @@ def test_run_without_full_defaults_to_changed_only(tmp_path, monkeypatch):
     assert calls["changed_only"] is True
 
 
+# --- a skip reaches the user INTACT ------------------------------------------
+#
+# Found by installing the built wheel and running it. The source says
+# `pip install 'whetstone-cli[browser]'` and the terminal printed
+# `pip install 'whetstone-cli'` -- Rich read `[browser]` as a style tag and
+# dropped it, destroying the one instruction that tells a user how to fix their
+# problem. Every bracketed skip is affected: `code-defects [error handling: ...]`
+# and `rendered-ui [/route @ 1280x800]` both lose the part that says WHERE.
+#
+# The invariant this project keeps repeating is that any path declining to do
+# work records a reason THAT REACHES THE USER. A reason that arrives with its
+# middle removed has not reached them.
+
+
+def _flattened(text: str) -> str:
+    """*text* with every run of whitespace collapsed to one space.
+
+    Rich wraps to the terminal width, so a skip message arrives on screen with
+    newlines and padding inserted at positions nobody chose. Comparing the
+    whole message means comparing what survived the render rather than the
+    fragments a test happened to name.
+    """
+    return " ".join(text.split())
+
+
+def test_a_bracketed_skip_reaches_the_user_intact(tmp_path, monkeypatch):
+    _write_config(tmp_path)
+    skip = (
+        "rendered-ui [/checkout @ 1280x800]: install the browser extra: "
+        "`pip install 'whetstone-cli[browser]'`. Nothing was checked."
+    )
+
+    def _fake_execute_run(conn, cfg, project_root, root, *, tier, changed_only):
+        from whetstone.runner import RunResult
+
+        return RunResult(
+            run_id="run-1",
+            tier=tier,
+            file_count=0,
+            status="complete",
+            lens_count=1,
+            skips=[skip],
+        )
+
+    monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)
+    result = runner.invoke(app, ["run", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
+    # THE WHOLE MESSAGE, not the two brackets this test was written for.
+    # Asserting fragments let a regression drop the install command, or the
+    # "Nothing was checked" that tells the user the surface went unmeasured,
+    # while both fragment assertions stayed green.
+    assert _flattened(skip) in _flattened(result.stdout), (
+        f"the skip did not survive rendering intact. "
+        f"wanted <{_flattened(skip)}> "
+        f"but the screen had <{_flattened(result.stdout)}>"
+    )
+
+
+def test_a_skip_carrying_terminal_escapes_cannot_drive_the_terminal(
+    tmp_path, monkeypatch
+):
+    """MODEL TEXT REACHES A TERMINAL. Neither `markup=False` nor `escape()`
+    touches ESC -- both deal with Rich's own markup, and Rich's sanitiser drops
+    a small set of control characters while letting ESC through. An OSC
+    sequence in a subject retitles the reader's window; `ESC[2J` clears their
+    scrollback. From a tool they ran to look at somebody else's code."""
+    _write_config(tmp_path)
+    esc = chr(27)
+    hostile = (
+        f"code-defects: subject 'orders.py{esc}]0;OWNED{chr(7)}"
+        f"{esc}[2J' could not be parsed"
+    )
+
+    def _fake_execute_run(conn, cfg, project_root, root, *, tier, changed_only):
+        from whetstone.runner import RunResult
+
+        return RunResult(
+            run_id="run-1",
+            tier=tier,
+            file_count=0,
+            status="complete",
+            lens_count=1,
+            skips=[hostile],
+        )
+
+    monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)
+    result = runner.invoke(app, ["run", "--path", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert esc not in result.stdout, "an escape sequence reached the terminal"
+    assert chr(7) not in result.stdout, "a BEL reached the terminal"
+    # AND THE REASON IS STILL LEGIBLE. Deleting the characters would leave a
+    # subject the reader cannot match against their own file, so they are shown
+    # rather than dropped.
+    screen = _flattened(result.stdout)
+    assert "orders.py" in screen
+    assert "could not be parsed" in screen, screen
+    assert "x1b" in screen, "the control characters were dropped, not shown"
+
+
+def test_an_out_path_carrying_escapes_cannot_drive_the_terminal(tmp_path):
+    """EXCEPTION TEXT QUOTES WHAT CAUSED IT. `_report_target` puts the rejected
+    `--out` value into the ReportError, so the string reaching the screen is
+    the one somebody typed or scripted -- and `escape()` in front of it
+    neutralises Rich markup and nothing else."""
+    _write_config(tmp_path)
+    esc = chr(27)
+    hostile = f"../outside{esc}]0;OWNED{chr(7)}{esc}[2J/report.html"
+
+    result = runner.invoke(
+        app, ["report", "--path", str(tmp_path), "--out", hostile]
+    )
+
+    assert result.exit_code != 0, result.stdout
+    assert esc not in result.stdout, "an escape sequence reached the terminal"
+    assert chr(7) not in result.stdout, "a BEL reached the terminal"
+    assert "x1b" in _flattened(result.stdout), (
+        "the control characters were dropped rather than shown, so the user "
+        "cannot see what was wrong with the path they gave"
+    )
+
+
+def test_a_written_report_path_carrying_escapes_cannot_drive_the_terminal(
+    tmp_path, monkeypatch
+):
+    """THE SUCCESS PATH PRINTS A PATH TOO. `Wrote {written}` renders whatever
+    `write_report` returns, and on any filesystem that permits control
+    characters in a name -- ext4 does; NTFS does not -- that string came from
+    `--out`.
+
+    `write_report` is stubbed rather than handed a hostile filename, because
+    this test must mean the same thing on both platforms: NTFS refuses ESC in a
+    name with EINVAL, so a filesystem-based version would exercise the print
+    path on Linux and a write error on Windows. What changed here is the
+    printing, so that is what is driven.
+    """
+    _write_config(tmp_path)
+    esc = chr(27)
+    hostile = tmp_path / "report.html"
+    # A RICH LINK ALONGSIDE THE ESCAPES. Two different surfaces: the control
+    # characters drive the terminal, the markup addresses Rich -- which has
+    # markup ON for this call, so an unescaped path renders as a clickable
+    # hyperlink pointing wherever the path said.
+    disguised = (
+        f"{hostile}{esc}]0;OWNED{chr(7)}{esc}[2J"
+        f"[link=file:///etc/passwd]not-your-report[/link]"
+    )
+
+    monkeypatch.setattr(
+        "whetstone.cli.write_report", lambda *a, **k: disguised
+    )
+    result = runner.invoke(app, ["report", "--path", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert esc not in result.stdout, "an escape sequence reached the terminal"
+    assert chr(7) not in result.stdout, "a BEL reached the terminal"
+    screen = _flattened(result.stdout)
+    assert "Wrote" in screen, screen
+    assert "x1b" in screen, "the control characters were dropped rather than shown"
+    # AND THE PATH IS STILL THERE. Without this the test passes if the whole
+    # path is replaced by the word it is scanning for.
+    assert "report.html" in screen, screen
+    # The markup must survive as TEXT rather than becoming a link.
+    assert "[link=" in screen, (
+        "Rich parsed the path as markup, so it rendered as a hyperlink"
+    )
+
+
+def test_a_doctor_detail_carrying_escapes_cannot_drive_the_terminal(
+    tmp_path, monkeypatch
+):
+    """`doctor` renders each check's `detail`, and a detail quotes what it
+    found -- a path, a config value, a version string read off the machine."""
+    _write_config(tmp_path)
+    esc = chr(27)
+
+    def _fake_doctor(*_a, **_k):
+        from whetstone.doctor import CheckResult
+
+        return [
+            CheckResult(
+                name="browser",
+                ok=False,
+                detail=f"not found at /opt{esc}]0;OWNED{chr(7)}{esc}[2J/chrome",
+            )
+        ]
+
+    monkeypatch.setattr("whetstone.cli.run_doctor", _fake_doctor)
+    result = runner.invoke(app, ["doctor", "--path", str(tmp_path)])
+
+    assert esc not in result.stdout, "an escape sequence reached the terminal"
+    assert chr(7) not in result.stdout, "a BEL reached the terminal"
+    screen = _flattened(result.stdout)
+    assert "x1b" in screen, "the control characters were dropped rather than shown"
+    # AND THE DIAGNOSTIC IS STILL A DIAGNOSTIC. Every assertion above passes if
+    # `detail` is replaced wholesale by the literal string this one scans for,
+    # which would leave the user a check that failed and no idea why.
+    assert result.exit_code == 1, result.stdout
+    assert "not found at /opt" in screen, screen
+    assert "/chrome" in screen, screen
+
+
+def test_a_skip_with_unbalanced_brackets_does_not_crash_the_run(
+    tmp_path, monkeypatch
+):
+    """Model-authored text reaches this line. An unclosed tag is a MarkupError,
+    which would lose a completed run at the moment it prints its results."""
+    _write_config(tmp_path)
+    skip = "code-defects: subject 'a[0' could not be parsed"
+
+    def _fake_execute_run(conn, cfg, project_root, root, *, tier, changed_only):
+        from whetstone.runner import RunResult
+
+        return RunResult(
+            run_id="run-1",
+            tier=tier,
+            file_count=0,
+            status="complete",
+            lens_count=1,
+            skips=[skip],
+        )
+
+    monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)
+    result = runner.invoke(app, ["run", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
+    assert _flattened(skip) in _flattened(result.stdout), (
+        f"the skip did not survive rendering intact. "
+        f"wanted <{_flattened(skip)}> "
+        f"but the screen had <{_flattened(result.stdout)}>"
+    )
+
+
 # --- report: the invariant a stale report is worse than none is only real
 # if the actual CLI wires a run's skips into the actual HTML. ------------------
 

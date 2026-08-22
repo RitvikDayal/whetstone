@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "drive",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["checks"],
+  "if": {
+    "properties": {"checks": {"maxItems": 0}},
+    "required": ["checks"]
+  },
+  "then": {
+    "required": ["checks", "notes"],
+    "properties": {
+      "notes": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000,
+        "description": "REQUIRED WHEN THERE ARE NO CHECKS. An empty list with a null note is indistinguishable from a stage that declined, could not read the templates, or ran out of budget -- all of which read as a clean interface."
+      }
+    }
+  },
+  "properties": {
+    "checks": {
+      "type": "array",
+      "maxItems": 12,
+      "description": "Pairs of elements worth MEASURING. This is a proposal about where to look, never a claim that they overlap: the controller measures both boxes and computes the intersection itself.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["route", "selector_a", "selector_b", "why"],
+        "properties": {
+          "route": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300,
+            "description": "Path relative to the declared origin, beginning with '/'. It is pinned by scheme, host and port before anything is navigated; an absolute URL elsewhere is refused."
+          },
+          "selector_a": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "A CSS selector for the first element, read off the app's own markup."
+          },
+          "selector_b": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "A CSS selector for the second element."
+          },
+          "why": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "description": "What in the markup or CSS suggests these two can collide. A reason a human can check against the source without trusting anything else here."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "maxLength": 2000,
+      "description": "Anything about the stage itself: templates that could not be read, routes that could not be determined."
+    }
+  }
+}
