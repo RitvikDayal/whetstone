@@ -472,10 +472,10 @@ def test_a_bracketed_skip_reaches_the_user_intact(tmp_path, monkeypatch):
             file_count=0,
             status="complete",
             lens_count=1,
-            skips=(
+            skips=[
                 "rendered-ui [/checkout @ 1280x800]: install the browser extra: "
                 "`pip install 'whetstone-cli[browser]'`. Nothing was checked.",
-            ),
+            ],
         )
 
     monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)
@@ -505,7 +505,7 @@ def test_a_skip_with_unbalanced_brackets_does_not_crash_the_run(
             file_count=0,
             status="complete",
             lens_count=1,
-            skips=("code-defects: subject 'a[0' could not be parsed",),
+            skips=["code-defects: subject 'a[0' could not be parsed"],
         )
 
     monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)

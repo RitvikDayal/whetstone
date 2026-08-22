@@ -514,8 +514,50 @@ def test_a_boolean_max_checks_falls_back_rather_than_capping_at_one(tmp_path):
     passed every type check. The third option in this lens bitten by it."""
     from whetstone.lenses.rendered_ui.drive import _DEFAULT_MAX_CHECKS, _max_checks
 
-    assert _max_checks(_ctx(tmp_path, max_checks=True)) == _DEFAULT_MAX_CHECKS
-    assert _max_checks(_ctx(tmp_path, max_checks=3)) == 3
+    assert _max_checks(_ctx(tmp_path, max_checks=True))[0] == _DEFAULT_MAX_CHECKS
+    assert _max_checks(_ctx(tmp_path, max_checks=3)) == (3, None)
+    # ABSENT IS NOT REFUSED. The default arrives through the same `.get()` and
+    # must not manufacture a reason -- every run would carry one.
+    assert _max_checks(_ctx(tmp_path)) == (_DEFAULT_MAX_CHECKS, None)
+
+
+@pytest.mark.parametrize("configured", ["20", True, 0, -1, None, 2.5])
+def test_a_refused_max_checks_tells_the_user_it_was_refused(tmp_path, configured):
+    """`max_checks: "20"` means somebody wanted 20 and got 6. Falling back is
+    declining to do work the caller asked for, and a run that quietly measured
+    less than the configured surface reads as clean."""
+    provider = _FakeProvider({"checks": [], "notes": None})
+    result = drive(
+        _ctx(tmp_path, max_checks=configured), provider, _origin(), ((1280, 800),)
+    )
+    assert any("max_checks" in s and "fell back" in s for s in result.skips), (
+        f"a refused cap of {configured!r} left no reason the user can read"
+    )
+
+
+def test_a_refused_max_checks_survives_an_early_return(tmp_path):
+    """The reason is recorded before the request and every early return has to
+    carry it out. Building a fresh tuple on the way out is the same defect
+    `test_both_malformed_fields_keep_both_reasons` pins one layer down."""
+    provider = _FakeProvider({"checks": []}, denials=("Write",))
+    result = drive(
+        _ctx(tmp_path, max_checks="20"), provider, _origin(), ((1280, 800),)
+    )
+    assert result.checks == ()
+    assert any("was refused Write" in s for s in result.skips)
+    assert any("max_checks" in s for s in result.skips), (
+        "the denial discarded the reason the cap was refused"
+    )
+
+
+def test_the_prompt_asks_for_the_cap_that_is_actually_enforced(tmp_path):
+    """One cap, computed once. Two call sites reading `options` independently is
+    how a prompt asks for 20 while truncation enforces 6."""
+    provider = _FakeProvider({"checks": [], "notes": None})
+    drive(_ctx(tmp_path, max_checks="20"), provider, _origin(), ((1280, 800),))
+    prompt = provider.requests[0].prompt
+    assert "Return at most 6 checks" in prompt
+    assert "Return at most 20 checks" not in prompt
 
 
 def test_a_screenshot_path_escaping_its_directory_is_refused(monkeypatch, tmp_path):

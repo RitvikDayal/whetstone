@@ -63,22 +63,35 @@ class DriveResult(NamedTuple):
     notes: tuple[str, ...]
 
 
-def _max_checks(ctx: RunContext) -> int:
-    """The configured cap, or the default.
+def _max_checks(ctx: RunContext) -> tuple[int, str | None]:
+    """The cap to enforce, and why a configured value was refused.
 
     `bool` is excluded explicitly: it is an `int` subclass, so `max_checks: true`
     passed every test here and became a cap of ONE rather than the default.
     Python will not do this for us and it has now bitten this lens in three
     separate options.
+
+    THE REASON IS RETURNED RATHER THAN SWALLOWED. Falling back is declining to
+    do work the caller asked for -- `max_checks: "20"` means somebody wanted 20
+    and got 6 -- and a run that silently measured less than the configured
+    surface reads as clean. Absent is not refused: the default arrives here as a
+    valid value and produces no reason, so only an explicit bad one is reported.
     """
     value = ctx.options.get("max_checks", _DEFAULT_MAX_CHECKS)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return _DEFAULT_MAX_CHECKS
-    return value
+        return _DEFAULT_MAX_CHECKS, (
+            f"`options.max_checks` is {value!r}, which is not a positive whole "
+            f"number. The cap fell back to {_DEFAULT_MAX_CHECKS}, so this run "
+            f"measured less than you configured."
+        )
+    return value, None
 
 
 def _prompt_for(
-    ctx: RunContext, origin: Origin, viewports: tuple[tuple[int, int], ...]
+    ctx: RunContext,
+    origin: Origin,
+    viewports: tuple[tuple[int, int], ...],
+    max_checks: int,
 ) -> str:
     listed = [path.as_posix() for path in ctx.files[:_MAX_LISTED_FILES]]
     if len(ctx.files) > _MAX_LISTED_FILES:
@@ -87,7 +100,7 @@ def _prompt_for(
         origin=str(origin),
         files="\n".join(f"- {path}" for path in listed) or "- (no files in scope)",
         viewports="\n".join(f"- {w}x{h}" for w, h in viewports),
-        max_checks=_max_checks(ctx),
+        max_checks=max_checks,
     )
 
 
@@ -141,9 +154,19 @@ def drive(
     viewports: tuple[tuple[int, int], ...],
 ) -> DriveResult:
     """Ask one stage where to look, and keep only what can be measured."""
+    # BOTH LISTS EXIST BEFORE THE REQUEST. The cap is decided here, once, and
+    # its refusal reason has to outlive the early returns below -- a stage that
+    # rejected your `max_checks` and then died on a denial must still say it
+    # rejected your `max_checks`.
+    skips: list[str] = []
+    notes: list[str] = []
+    cap, cap_refused = _max_checks(ctx)
+    if cap_refused is not None:
+        skips.append(cap_refused)
+
     request = StageRequest(
         stage="drive",
-        prompt=_prompt_for(ctx, origin, viewports),
+        prompt=_prompt_for(ctx, origin, viewports, cap),
         schema=load_schema("drive"),
         # The lens's own read-only powers, reusing the spine's audited set
         # rather than registering a stage name in `PROFILES`. This stage reads
@@ -159,46 +182,33 @@ def drive(
     )
     result = provider.run_stage(request)
 
-    skips: list[str] = []
-    notes: list[str] = []
-
     # Unconditional and first. A read-only stage that wrote is not a stage whose
     # proposals mean anything, and its payload can look perfectly well-formed
     # while it happens.
     if result.mutation:
-        return DriveResult(
-            (),
-            (
-                f"drive modified the worktree and its proposals were discarded: "
-                f"{result.mutation}",
-            ),
-            (),
+        skips.append(
+            f"drive modified the worktree and its proposals were discarded: "
+            f"{result.mutation}"
         )
+        return DriveResult((), tuple(skips), tuple(notes))
     if result.denials:
-        return DriveResult(
-            (),
-            (
-                f"drive was refused {', '.join(sorted(set(result.denials)))} and "
-                f"answered on less than it asked for, so its proposals were "
-                f"discarded.",
-            ),
-            (),
+        skips.append(
+            f"drive was refused {', '.join(sorted(set(result.denials)))} and "
+            f"answered on less than it asked for, so its proposals were "
+            f"discarded."
         )
+        return DriveResult((), tuple(skips), tuple(notes))
     if not result.ok:
-        return DriveResult(
-            (),
-            (
-                f"drive did not run: "
-                f"{result.error or 'the provider failed without saying why'}",
-            ),
-            (),
+        skips.append(
+            f"drive did not run: "
+            f"{result.error or 'the provider failed without saying why'}"
         )
+        return DriveResult((), tuple(skips), tuple(notes))
     if result.data is None:
-        return DriveResult(
-            (),
-            ("drive returned success with no payload, so there is nothing to read.",),
-            (),
+        skips.append(
+            "drive returned success with no payload, so there is nothing to read."
         )
+        return DriveResult((), tuple(skips), tuple(notes))
 
     # TYPE-GUARDED, though the schema already forbids anything else. This layer
     # exists to recompute what a model claims rather than believe it, and
@@ -233,7 +243,6 @@ def drive(
     # believes it set was one nothing enforced -- the exact defect
     # `StageRequest` names about `max_budget_usd`. The surplus costs two real
     # renders per viewport each, so it is not free to wave through.
-    cap = _max_checks(ctx)
     if len(raw_checks) > cap:
         skips.append(
             f"drive proposed {len(raw_checks)} checks and the cap is {cap}; the "

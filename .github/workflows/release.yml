@@ -12,6 +12,10 @@
 # identity through OIDC, which is why `id-token: write` is here and why there is
 # no `password:`. The publisher has to be configured on PyPI for this repository
 # and this workflow filename before the first release will go through.
+#
+# A TAG IS NOT SUFFICIENT TO PUBLISH -- see the `publish` job. `environment:
+# release` reads like a gate and is not one on this repository, so the gate is
+# written down here instead of assumed.
 name: release
 
 on:
@@ -80,10 +84,37 @@ jobs:
           path: dist/
 
   publish:
+    name: publish to PyPI
     needs: build
     runs-on: ubuntu-latest
+
+    # THE TAG IS NOT THE GATE, THIS LINE IS.
+    #
+    # `environment: release` below looks like an approval gate and is not one
+    # here. Checked against the API on 2026-08-22: the `release` environment
+    # does not exist (404), and this repository cannot create a protected one --
+    # deployment protection rules and tag rulesets on a PRIVATE repo need a paid
+    # plan, and the rulesets API answers 403 "Upgrade to GitHub Pro or make this
+    # repository public". GitHub would have created the environment unprotected
+    # on first use and published unattended, which is the opposite of what
+    # naming it implied.
+    #
+    # So publication takes a second deliberate act that lives outside the tag:
+    # the repository variable PUBLISH_TO_PYPI must read `true`, set by hand
+    # before the tag and unset after. A tag pushed by anything else -- a script,
+    # a mistake, a compromised token that can write refs -- builds and verifies
+    # and stops here.
+    #
+    # WHEN THE REPO IS PUBLIC, or on a plan that can protect the environment:
+    # delete this `if:`, configure required reviewers on `release` and a tag
+    # ruleset on `v*`. Those are the controls this line is standing in for, and
+    # they are better because they cannot be flipped by the same person in the
+    # same breath as the tag.
+    if: vars.PUBLISH_TO_PYPI == 'true'
     environment: release
     permissions:
+      # Trusted Publishing exchanges this for a short-lived PyPI credential.
+      # Nothing else in the job needs it, and the top-level grant stays read.
       id-token: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
