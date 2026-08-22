@@ -568,6 +568,38 @@ def test_an_out_path_carrying_escapes_cannot_drive_the_terminal(tmp_path):
     )
 
 
+def test_a_written_report_path_carrying_escapes_cannot_drive_the_terminal(
+    tmp_path, monkeypatch
+):
+    """THE SUCCESS PATH PRINTS A PATH TOO. `Wrote {written}` renders whatever
+    `write_report` returns, and on any filesystem that permits control
+    characters in a name -- ext4 does; NTFS does not -- that string came from
+    `--out`.
+
+    `write_report` is stubbed rather than handed a hostile filename, because
+    this test must mean the same thing on both platforms: NTFS refuses ESC in a
+    name with EINVAL, so a filesystem-based version would exercise the print
+    path on Linux and a write error on Windows. What changed here is the
+    printing, so that is what is driven.
+    """
+    _write_config(tmp_path)
+    esc = chr(27)
+    hostile = tmp_path / "report.html"
+    disguised = f"{hostile}{esc}]0;OWNED{chr(7)}{esc}[2J"
+
+    monkeypatch.setattr(
+        "whetstone.cli.write_report", lambda *a, **k: disguised
+    )
+    result = runner.invoke(app, ["report", "--path", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert esc not in result.stdout, "an escape sequence reached the terminal"
+    assert chr(7) not in result.stdout, "a BEL reached the terminal"
+    screen = _flattened(result.stdout)
+    assert "Wrote" in screen, screen
+    assert "x1b" in screen, "the control characters were dropped rather than shown"
+
+
 def test_a_doctor_detail_carrying_escapes_cannot_drive_the_terminal(
     tmp_path, monkeypatch
 ):
