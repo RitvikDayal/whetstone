@@ -526,6 +526,65 @@ def test_an_empty_proposal_with_no_note_is_not_read_as_a_clean_interface(tmp_pat
     assert any("gave no reason" in s for s in result.skips), result.skips
 
 
+def test_an_empty_proposal_is_reported_even_when_something_else_was_skipped(tmp_path):
+    """TWO FACTS, NOT ONE. The guard also required `not skips`, so a refused
+    `max_checks` earlier in the same run suppressed it: the empty answer went
+    unremarked with an unrelated reason standing beside it, and an unrelated
+    reason is not the reason."""
+    provider = _FakeProvider({"checks": [], "notes": ""})
+    result = drive(
+        _ctx(tmp_path, max_checks="20"), provider, _origin(), ((1280, 800),)
+    )
+
+    assert result.checks == ()
+    assert any("max_checks" in s for s in result.skips), result.skips
+    assert any("gave no reason" in s for s in result.skips), (
+        "the unrelated skip swallowed the fact that the proposal was empty"
+    )
+
+
+def test_discarded_checks_are_not_reported_as_proposing_nothing(tmp_path):
+    """`raw_checks`, not `checks`. A model that PROPOSED pairs which were then
+    all discarded has had each one explained already -- telling the user it
+    proposed nothing would be false."""
+    provider = _FakeProvider(
+        {
+            "checks": [
+                {"route": "nope", "selector_a": "#a", "selector_b": "#b", "why": "y"}
+            ],
+            "notes": None,
+        }
+    )
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+
+    assert result.checks == ()
+    assert any("discarded a check" in s for s in result.skips), result.skips
+    assert not any("gave no reason" in s for s in result.skips), (
+        "it proposed a check; it was discarded, which is a different fact"
+    )
+
+
+def test_an_unenforced_calls_per_day_is_reported(tmp_path, monkeypatch):
+    """Accepted in the constructor and silently dropped. `Budget` has
+    `ceiling_calls`, but that bounds ONE RUN -- passing a daily limit through
+    as an equivalent is worse than dropping it, because the user would believe
+    the wrong promise was being kept. `code-defects` already says this."""
+    from whetstone.lenses.rendered_ui import pack as pack_module
+
+    monkeypatch.setattr(pack_module, "availability", lambda: None)
+    from whetstone.lenses.rendered_ui.drive import DriveResult
+
+    monkeypatch.setattr(pack_module, "drive", lambda *a, **k: DriveResult((), (), ()))
+    pack = RenderedUiPack(provider=_FakeProvider({"checks": [], "notes": "x"}),
+                          calls_per_day=50)
+    ctx = _ctx(tmp_path, base_url="http://127.0.0.1:3000")
+    pack._collect(ctx)
+
+    assert any("calls_per_day" in s and "NOT enforced" in s for s in ctx.skips), (
+        ctx.skips
+    )
+
+
 def test_an_empty_proposal_with_a_real_note_is_left_alone(tmp_path):
     """The complaint above must not fire on the legitimate case, or every
     sound interface reports a skip."""
@@ -873,6 +932,12 @@ def test_the_clamped_tolerance_is_what_capture_actually_receives(
         seen.update(kwargs)
         return CaptureResult((), ())
 
+    # PATCHED, because `_collect` calls `availability()` long before it reaches
+    # `capture`. Without this the test returns early on any machine with no
+    # browser and fails with "capture() was never reached", which names the
+    # wrong cause -- and this test asserts an argument-passing contract that
+    # needs no browser at all.
+    monkeypatch.setattr(pack_module, "availability", lambda: None)
     monkeypatch.setattr(pack_module, "capture", spy)
     pack = RenderedUiPack(
         provider=_FakeProvider(

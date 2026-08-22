@@ -246,6 +246,21 @@ class RenderedUiPack:
             ctx.skip(f"rendered-ui: {exc} No stage of this lens ran.")
             return []
 
+        if self.calls_per_day is not None:
+            # ACCEPTED AND NOT ENFORCED, said out loud. `Budget` has
+            # `ceiling_calls`, but that bounds ONE RUN and a daily limit is a
+            # different promise -- passing it through as an equivalent would be
+            # worse than dropping it, because the user would believe the wrong
+            # thing was being honoured. `code-defects` reports the same setting
+            # the same way; this pack took it in its constructor and said
+            # nothing.
+            ctx.skip(
+                f"rendered-ui: `budget.ceiling.calls_per_day` is set to "
+                f"{self.calls_per_day} and is NOT enforced -- Whetstone keeps no "
+                f"cross-run call accounting yet, so a daily limit cannot be "
+                f"applied. Only `usd_per_run` bounds this run."
+            )
+
         budget = Budget(ceiling_usd=self.ceiling_usd)
         budgeted = BudgetedProvider(provider, budget, subject="(drive)")
         viewports = _viewports(ctx)

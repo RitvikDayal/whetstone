@@ -310,13 +310,22 @@ def drive(
                 why=str(raw.get("why") or "").strip(),
             )
         )
-    if not checks and not notes and not skips:
+    if not raw_checks and not notes:
         # THE CONTRACT REQUIRES A NOTE WHEN THERE ARE NO CHECKS, and the schema
         # is the model's side of that. An empty list with a blank note is
         # indistinguishable from a stage that declined, could not read the
         # templates, or ran out of budget -- all of which read as a clean
         # interface. `DriveResult` says an empty proposal is a real answer; an
         # empty proposal that says nothing is not one.
+        #
+        # TWO FACTS, TESTED INDEPENDENTLY. This read `not skips` as well, so a
+        # refused `max_checks` earlier in the run suppressed it -- the empty
+        # answer went unremarked with an unrelated reason standing beside it,
+        # which is not the same reason at all.
+        #
+        # `raw_checks`, not `checks`. A model that PROPOSED pairs which were
+        # all then discarded has already had each one explained; saying it
+        # "proposed nothing" there would be false.
         skips.append(
             "drive proposed nothing and gave no reason. An empty proposal with "
             "no note cannot be told apart from a stage that declined, so it is "
