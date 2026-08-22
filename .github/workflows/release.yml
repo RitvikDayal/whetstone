@@ -124,6 +124,19 @@ jobs:
     # A `v*` tag ruleset covers the other half: release tags cannot be deleted
     # or force-updated, so a published version cannot later point at different
     # code.
+    #
+    # WHAT THIS GATE DOES NOT DEFEND AGAINST, said plainly so nobody reads more
+    # into it. `prevent_self_review` is OFF, because this repository has exactly
+    # one collaborator: the only account that can push a `v*` tag is also the
+    # only account that can approve the deployment. Turning it on would not add
+    # a second pair of eyes -- there is no second pair -- it would deadlock
+    # releases outright.
+    #
+    # So the gate stops an UNATTENDED publish: a tag pushed by a script, a
+    # mis-typed command, or a workflow, none of which can click approve. It does
+    # NOT stop a compromised maintainer account, and no configuration of a
+    # single-maintainer repository can. The honest fix is a second maintainer,
+    # and until there is one this is a smaller claim than it looks.
     environment: release
     permissions:
       # Trusted Publishing exchanges this for a short-lived PyPI credential.
