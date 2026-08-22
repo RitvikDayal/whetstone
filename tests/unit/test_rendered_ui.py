@@ -485,11 +485,8 @@ def test_a_non_string_notes_value_is_reported_not_raised(tmp_path):
     assert any("rather than text" in s for s in result.skips)
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [{}, {"checks": None}, {"checks": None, "notes": "looked fine"}],
-    ids=["empty-object", "null-checks", "null-checks-with-note"],
-)
+@pytest.mark.parametrize("payload", [{}, {"notes": "looked fine"}],
+                         ids=["empty-object", "note-only"])
 def test_a_payload_without_checks_is_not_a_clean_interface(tmp_path, payload):
     """ABSENT IS NOT EMPTY. These returned no checks, no skips and no notes --
     identical to a stage that looked at the interface and found it sound, which
@@ -501,6 +498,25 @@ def test_a_payload_without_checks_is_not_a_clean_interface(tmp_path, payload):
 
     assert result.checks == ()
     assert any("no `checks` field" in s for s in result.skips), result.skips
+
+
+@pytest.mark.parametrize(
+    "payload", [{"checks": None}, {"checks": None, "notes": "looked fine"}],
+    ids=["null-checks", "null-checks-with-note"],
+)
+def test_a_null_checks_field_is_not_reported_as_a_missing_one(tmp_path, payload):
+    """PRESENT AND NULL IS NOT ABSENT. `.get()` collapsed the two, so
+    `{"checks": null}` was reported as "no `checks` field at all" -- sending
+    the reader to look for a field that is right there in the payload in front
+    of them."""
+    provider = _FakeProvider(payload)
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+
+    assert result.checks == ()
+    assert any("`checks: null`" in s for s in result.skips), result.skips
+    assert not any("no `checks` field" in s for s in result.skips), (
+        "a null value was reported as a missing field"
+    )
 
 
 @pytest.mark.parametrize("payload", [[], "checks", 3], ids=["list", "str", "int"])
@@ -1134,6 +1150,27 @@ def test_an_unusable_viewport_is_never_silently_substituted(tmp_path, declared):
     ctx = _ctx(tmp_path, viewports=declared)
     assert _viewports(ctx) == ((1280, 800),)
     assert ctx.skips, "substituting a default without saying so is the defect"
+
+
+def test_a_null_viewports_is_reported_rather_than_treated_as_absent(tmp_path):
+    """`.get()` collapsed `viewports: null` into "not configured", so the lens
+    measured the default and said nothing -- and the run then reads as a result
+    about the configuration the user actually wrote."""
+    from whetstone.lenses.rendered_ui.pack import _viewports
+
+    ctx = _ctx(tmp_path, viewports=None)
+    assert _viewports(ctx) == ((1280, 800),)
+    assert any("viewports" in s for s in ctx.skips), ctx.skips
+
+
+def test_absent_viewports_stays_silent(tmp_path):
+    """Not configured is not the same as configured wrongly, and only one of
+    them has anything to report."""
+    from whetstone.lenses.rendered_ui.pack import _viewports
+
+    ctx = _ctx(tmp_path)
+    assert _viewports(ctx) == ((1280, 800),)
+    assert not ctx.skips, ctx.skips
 
 
 def test_an_unusable_threshold_is_never_silently_substituted(tmp_path):

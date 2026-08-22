@@ -277,8 +277,7 @@ def drive(
             f"text, so whatever it wanted to say about its own run was lost."
         )
 
-    raw_checks = result.data.get("checks")
-    if raw_checks is None:
+    if "checks" not in result.data:
         # ABSENT IS NOT EMPTY. `{}` and `{"checks": null}` used to become a
         # clean run with no checks, no skips and no notes -- indistinguishable
         # from a stage that looked at the interface and found it sound, which
@@ -288,6 +287,16 @@ def drive(
             "drive returned no `checks` field at all. That is not an empty "
             "proposal, it is an answer that does not fit the contract, so "
             "nothing was measured."
+        )
+        return DriveResult((), tuple(skips), tuple(notes))
+    raw_checks = result.data["checks"]
+    if raw_checks is None:
+        # PRESENT AND NULL, which is not the same answer as absent. Reporting
+        # "no `checks` field at all" for `{"checks": null}` sends the reader
+        # looking for a field that is right there in the payload they can see.
+        skips.append(
+            "drive returned `checks: null`. The field is there and its value "
+            "is not a list, so nothing could be measured."
         )
         return DriveResult((), tuple(skips), tuple(notes))
     if not isinstance(raw_checks, list):

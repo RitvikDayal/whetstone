@@ -568,6 +568,35 @@ def test_an_out_path_carrying_escapes_cannot_drive_the_terminal(tmp_path):
     )
 
 
+def test_a_doctor_detail_carrying_escapes_cannot_drive_the_terminal(
+    tmp_path, monkeypatch
+):
+    """`doctor` renders each check's `detail`, and a detail quotes what it
+    found -- a path, a config value, a version string read off the machine."""
+    _write_config(tmp_path)
+    esc = chr(27)
+
+    def _fake_doctor(*_a, **_k):
+        from whetstone.doctor import CheckResult
+
+        return [
+            CheckResult(
+                name="browser",
+                ok=False,
+                detail=f"not found at /opt{esc}]0;OWNED{chr(7)}{esc}[2J/chrome",
+            )
+        ]
+
+    monkeypatch.setattr("whetstone.cli.run_doctor", _fake_doctor)
+    result = runner.invoke(app, ["doctor", "--path", str(tmp_path)])
+
+    assert esc not in result.stdout, "an escape sequence reached the terminal"
+    assert chr(7) not in result.stdout, "a BEL reached the terminal"
+    assert "x1b" in _flattened(result.stdout), (
+        "the control characters were dropped rather than shown"
+    )
+
+
 def test_a_skip_with_unbalanced_brackets_does_not_crash_the_run(
     tmp_path, monkeypatch
 ):

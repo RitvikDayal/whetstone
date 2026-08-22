@@ -63,7 +63,17 @@ jobs:
       - name: The tag and the built version agree
         run: |
           set -eu
-          built=$(ls dist/*.whl | sed -E 's/.*whetstone_cli-([^-]+)-.*/\1/')
+          # GLOB, NOT `ls` (SC2012). And the count is checked first: with
+          # two wheels in dist/ the old pipeline silently compared the
+          # version of whichever one `ls` sorted first, so a stale artifact
+          # could pass the check whose whole job is catching a wrong one.
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected one wheel in dist/, found ${#wheels[@]}"
+            exit 1
+          fi
+          built=$(basename "${wheels[0]}" | sed -E 's/^whetstone_cli-([^-]+)-.*/\1/')
           tagged="${GITHUB_REF_NAME#v}"
           echo "tag=$tagged built=$built"
           test "$built" = "$tagged"

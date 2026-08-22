@@ -80,9 +80,12 @@ def _viewports(ctx: RunContext) -> tuple[tuple[int, int], ...]:
     as a result about the declared configuration -- which is the same class of
     lie as a run that quietly checked half the surface.
     """
-    raw = ctx.options.get("viewports")
-    if raw is None:
+    if "viewports" not in ctx.options:
         return _DEFAULT_VIEWPORTS
+    # PRESENT AND NULL IS A DECLARED VALUE. `.get()` collapsed it into absent,
+    # so `viewports: null` measured the default and said nothing -- the run
+    # then reads as a result about the configuration the user wrote.
+    raw = ctx.options["viewports"]
     if not isinstance(raw, (list, tuple)) or not raw:
         ctx.skip(
             f"rendered-ui: `options.viewports` is {raw!r}, which is not a "

@@ -167,7 +167,8 @@ def _warn_if_the_last_run_did_not_finish(run: RunResult | None) -> None:
     if not run.finished:
         console.print(
             f"[yellow]Warning: the most recent run did not finish (status "
-            f"'{run.status}'). What follows is a partial record of a partial "
+            f"'{_printable(run.status)}'). What follows is a partial record of "
+            f"a partial "
             "run - an absent finding may simply never have been looked "
             "for.[/yellow]"
         )
@@ -217,7 +218,7 @@ def doctor(path: Path = _PathOption) -> None:
         # and destroyed `... is not a git repository.` -- the only actionable
         # half, cut off exactly the rows that FAIL. Rich wraps the column to
         # the terminal instead, which loses nothing.
-        table.add_row(result.name, status, escape(result.detail))
+        table.add_row(result.name, status, escape(_printable(result.detail)))
     console.print(table)
 
     if any(not r.ok for r in results):
@@ -357,7 +358,7 @@ def findings(
             row.id[:_ID_PREFIX],
             _grade_cell(row.grade),
             row.severity,
-            row.lens,
+            _printable(row.lens),
             escape(_printable(row.subject)),
             escape(_printable(row.title[:70])),
         )
@@ -490,4 +491,4 @@ def report(
     # soft_wrap: Rich wraps to the terminal by default, which broke the path
     # across two lines mid-directory and made the one thing on this line worth
     # having -- something to copy and paste -- unusable.
-    console.print(f"[green]Wrote[/green] {written}", soft_wrap=True)
+    console.print(f"[green]Wrote[/green] {_printable(str(written))}", soft_wrap=True)
