@@ -386,6 +386,43 @@ def test_an_ipv6_origin_still_refuses_a_foreign_one():
     assert not origin.admits("http://evil.test/?next=http://[::1]:8000")
 
 
+@needs_browser
+def test_availability_leaves_no_teardown_noise():
+    """ISSUE #40, and it is the tool's first impression. `executable_path` is
+    served out of the initializer the driver already sent, so a session that
+    only reads it closes with `Connection.run.init()` still pending -- and
+    asyncio reaps that at INTERPRETER SHUTDOWN, printing "Task was destroyed
+    but it is pending" and an unretrieved TargetClosedError AFTER the run
+    summary. A tool that worked, reading as a tool that crashed.
+
+    A SUBPROCESS, because that is the only place the failure exists. It happens
+    after the last line of the program, so nothing inside this process can
+    observe it and an in-process assertion would pass against the bug.
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from whetstone.lenses.rendered_ui.browser import availability;"
+            " print('reason:', availability())",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "reason: None" in proc.stdout, (
+        f"the probe did not find a browser, so this asserts nothing: {proc.stdout}"
+    )
+    assert "Task was destroyed" not in proc.stderr, proc.stderr
+    assert "TargetClosedError" not in proc.stderr, proc.stderr
+
+
 # --- geometry is arithmetic ------------------------------------------------------------
 
 

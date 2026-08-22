@@ -471,6 +471,35 @@ def _flattened(text: str) -> str:
     return " ".join(text.split())
 
 
+def test_the_reported_version_is_the_packaged_version():
+    """TWO VERSION STRINGS IN TWO FILES DRIFT, and this pair drifts silently.
+    The release workflow checks the git tag against the built wheel, so a wheel
+    correctly labelled 0.1.0 whose `whetstone version` still reports 0.0.1
+    passes every gate that exists -- which is exactly what happened when the
+    bump landed in pyproject.toml alone."""
+    import re
+    import tomllib
+    from pathlib import Path
+
+    from whetstone import __version__
+
+    root = Path(__file__).resolve().parents[2]
+    declared = tomllib.loads(
+        (root / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+
+    assert __version__ == declared, (
+        f"pyproject.toml says {declared} and the package reports "
+        f"{__version__}; a release built from this tree would ship a CLI that "
+        f"misreports itself"
+    )
+
+    result = runner.invoke(app, ["version"])
+    assert result.exit_code == 0, result.stdout
+    assert declared in result.stdout, result.stdout
+    assert re.search(r"\d+\.\d+\.\d+", result.stdout), result.stdout
+
+
 def test_a_bracketed_skip_reaches_the_user_intact(tmp_path, monkeypatch):
     _write_config(tmp_path)
     skip = (

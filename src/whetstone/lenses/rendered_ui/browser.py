@@ -178,6 +178,25 @@ def _missing_binary(play: object) -> str | None:
     """
     try:
         path = Path(play.chromium.executable_path)
+        # A REAL ROUND-TRIP, AND IT IS NOT DECORATION. `executable_path` is
+        # served out of the initializer the driver already sent, so reading it
+        # never makes `Connection.run.init()` finish -- and a session that
+        # closes with init still pending leaves an asyncio task to be reaped at
+        # interpreter shutdown. That is the traceback on every successful run
+        # in issue #40: "Task was destroyed but it is pending", then a
+        # TargetClosedError nobody retrieved, printed AFTER the run summary so
+        # it reads as a crash by a tool that worked.
+        #
+        # An APIRequestContext is the cheapest thing that forces init to
+        # complete and then disposes in order: 0.26s against 0.50s for
+        # launching a browser, measured. `selectors.set_test_id_attribute` does
+        # NOT work -- it is fire-and-forget and init stays pending.
+        #
+        # This does not change what the probe asserts. It still reports whether
+        # the BINARY is on disk; whether it starts is `rendered()`'s business
+        # and has its own error path.
+        request = play.request.new_context()
+        request.dispose()
     except Exception as exc:  # noqa: BLE001 -- playwright raises its own types
         return f"playwright could not start: {exc}"
     if not path.exists():

@@ -181,15 +181,16 @@ Stated here rather than discovered later.
   borderline candidate, on the same unchanged file, ten independent runs — the
   falsifier confirmed it 3 times and refuted it 6, with one run not reaching it.
   That is the difference between grade A and grade D on identical input. Treat a
-  single grade as one opinion, not a measurement. Tracked in
-  [#33](https://github.com/RitvikDayal/whetstone/issues/33).
-- **A finding whose address is a line range can be silently dropped.** A subject
-  like `app.py:14-17` is parsed as a path, fails the scope check, and is
-  discarded with a message wrongly saying the file was out of scope.
-  [#39](https://github.com/RitvikDayal/whetstone/issues/39).
-- **The rendered-ui lens leaves a Playwright teardown message on stderr**, even
-  on successful runs. It looks like a crash and is not.
-  [#40](https://github.com/RitvikDayal/whetstone/issues/40).
+  single grade as one opinion, not a measurement.
+
+  Two things that measurement does **not** establish, stated because it is easy
+  to read more into it than it holds. It is nine runs on **one** candidate, so
+  the 3-to-6 split fixes no rate: the 95% interval on it runs from about 0.12 to
+  0.65 and does not exclude a coin. And the rate that decides what any fix costs
+  — how often the falsifier wrongly refutes a **genuine** defect — has never
+  been measured at all. Tracked in
+  [#33](https://github.com/RitvikDayal/whetstone/issues/33), which now carries
+  the root-cause analysis and the measurement that has to come before a fix.
 - **Reads are not sandboxed.** The container bounds the reproduction, not the
   analysis stages, and the target repository's own `CLAUDE.md` is discovered into
   every stage. Point it at code you trust.

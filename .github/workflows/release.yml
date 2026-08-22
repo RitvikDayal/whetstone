@@ -1,5 +1,5 @@
-# Verify and build on a tag. This workflow does NOT publish -- see the note
-# where the publish job used to be, at the bottom.
+# Verify, build, and publish on a tag -- and only on a tag, and only after a
+# human approves the deployment.
 #
 # NOTHING HERE RUNS UNTIL SOMEBODY PUSHES `v*`. A merge to `main` cannot start
 # it, and neither can a workflow_dispatch, because there is not one.
@@ -8,12 +8,15 @@
 # A tag can point at any commit, including one CI never saw, and "it was green on
 # main" is not the same claim as "it is green at the thing being published".
 #
-# NO PUBLICATION CREDENTIAL AND NO PUBLICATION CAPABILITY. GitHub still issues
-# the read-scoped `GITHUB_TOKEN` that `contents: read` asks for -- that is a
-# credential, and saying otherwise here was wrong -- but nothing in this
-# workflow can reach PyPI: no `id-token: write`, no token, no publish step.
-# That is the point. A tag can be pushed by anything holding write access, and
-# a tag that cannot reach a publishing credential cannot ship a release.
+# THE PUBLISHING CREDENTIAL IS BEHIND A HUMAN. Only the `publish` job asks for
+# `id-token: write`, and it cannot start until a reviewer approves the `release`
+# environment -- a rule stored in repository settings, out of reach of the
+# commit being tagged. `verify` and `build` hold nothing but `contents: read`.
+#
+# TRUSTED PUBLISHING, so there is no API token in a secret at all. PyPI must
+# have a publisher configured for this repository AND this workflow filename
+# before the first release goes through; renaming this file breaks the identity
+# it asserts.
 name: release
 
 on:
@@ -21,8 +24,7 @@ on:
     tags:
       - "v*"
 
-# Least privilege, and nothing asks for more. There is no job here that needs
-# to write anything; `contents: read` is the whole grant for the workflow.
+# Least privilege at the top; only `publish` asks for the one extra it needs.
 permissions:
   contents: read
 
@@ -96,34 +98,41 @@ jobs:
           name: dist
           path: dist/
 
-  # THERE IS NO PUBLISH JOB, AND THAT IS THE CONTROL.
-  #
-  # There was one, gated on a repository variable. That gate does not hold: a
-  # tag push runs the workflow definition FROM THE TAGGED COMMIT, and PyPI
-  # Trusted Publishing identifies the repository and the workflow filename --
-  # never a commit SHA. So anything able to push a commit and a `v*` tag can
-  # delete the gate in the same commit it tags, and publish with
-  # `id-token: write`. A check the attacker edits is not a check.
-  #
-  # `environment: release` did not help either. Verified against the API on
-  # 2026-08-22: the environment does not exist (404), and this repository
-  # cannot create a protected one -- deployment protection rules and tag
-  # rulesets on a PRIVATE repo need a paid plan, and the rulesets API answers
-  # 403 "Upgrade to GitHub Pro or make this repository public". GitHub would
-  # have created it unprotected on first use and published unattended.
-  #
-  # With no enforceable control available on this plan, the honest shape is to
-  # not have the capability at all. A tag still verifies on four legs, checks
-  # that the tag and the built version agree, runs the wheel from a clean venv,
-  # and uploads `dist/` as an artifact. Publication is then a deliberate manual
-  # act against a build somebody has looked at.
-  #
-  # TO BRING IT BACK, all three, not any one of them:
-  #   1. The repo is public, or on a plan with deployment protection rules.
-  #   2. `release` exists as an environment with required reviewers, and a
-  #      ruleset restricts who may push `v*`.
-  #   3. Trusted Publishing is configured on PyPI for this repo and for THIS
-  #      filename -- renaming the file silently breaks the identity it asserts.
-  # Then add the job back with `environment: release` and `id-token: write`,
-  # and no `if:` -- the environment is the gate, and unlike an `if:` it is not
-  # part of the commit being tagged.
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+
+    # THE ENVIRONMENT IS THE GATE, and that is the whole design.
+    #
+    # This job previously did not exist, and before that it was gated on
+    # `if: vars.PUBLISH_TO_PYPI == 'true'`. That gate was worthless: a tag push
+    # runs the workflow definition FROM THE TAGGED COMMIT, and Trusted
+    # Publishing identifies the repository and the workflow filename rather
+    # than a commit SHA -- so anything able to push a commit and a `v*` tag
+    # could delete the `if:` in the same commit it tagged. A check the attacker
+    # edits is not a check.
+    #
+    # `environment: release` is different in kind. Its required-reviewer rule
+    # lives in repository settings, NOT in the tree being tagged, so the tagged
+    # commit cannot weaken it. The job pauses until a reviewer approves the
+    # deployment. Verified present rather than assumed: the environment exists
+    # with a `required_reviewers` protection rule, which it could not have while
+    # the repository was private on this plan -- the API answered 404 for the
+    # environment and 403 for rulesets.
+    #
+    # A `v*` tag ruleset covers the other half: release tags cannot be deleted
+    # or force-updated, so a published version cannot later point at different
+    # code.
+    environment: release
+    permissions:
+      # Trusted Publishing exchanges this for a short-lived PyPI credential.
+      # No token, no `password:`. This is the only job that gets it, and it
+      # cannot start until a human approves the deployment.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
