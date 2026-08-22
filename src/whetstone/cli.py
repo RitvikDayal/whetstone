@@ -40,7 +40,14 @@ _CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def _printable(text: str) -> str:
-    """*text* with any terminal control character rendered visible and inert."""
+    """*text* with any terminal control character rendered visible and inert.
+
+    APPLIED TO EXCEPTION TEXT TOO, not only to model output. A WhetstoneError
+    quotes the value that caused it -- `--out`, a state name, a config setting
+    -- so the argument that reaches the screen is the one somebody typed or
+    scripted, and `escape()` in front of it neutralises Rich markup and
+    nothing else.
+    """
     return _CONTROLS.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
 
 
@@ -182,7 +189,7 @@ def init_command(
     try:
         run_wizard(path.resolve(), console=console, assume_yes=yes, force=force)
     except (WhetstoneError, FileExistsError) as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
 
@@ -192,7 +199,7 @@ def doctor(path: Path = _PathOption) -> None:
     try:
         cfg, project_root, root = _load(path.resolve())
     except WhetstoneError as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
     results = run_doctor(cfg, project_root, root)
@@ -255,7 +262,7 @@ def run(
                 changed_only=not full,
             )
     except WhetstoneError as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
     files = "file" if result.file_count == 1 else "files"
@@ -327,7 +334,7 @@ def findings(
             )
             last = get_last_run(conn)
     except WhetstoneError as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
     # The same truth `report` discards: this list is drawn from whatever the
@@ -337,7 +344,9 @@ def findings(
     _warn_if_the_last_run_did_not_finish(last)
 
     if not rows:
-        console.print(f"No findings in state '{escape(state)}'.", markup=False)
+        console.print(
+            f"No findings in state '{_printable(state)}'.", markup=False
+        )
         return
 
     table = Table("id", "grade", "severity", "lens", "subject", "title")
@@ -447,7 +456,7 @@ def decide(
         # DispositionError already carries the sentence naming the argument AND
         # why it is required. Printed as-is rather than replaced with a second,
         # worse message.
-        console.print(f"[red]{escape(str(exc))}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
     console.print(
@@ -475,7 +484,7 @@ def report(
         html = render_report(rows, project_name=cfg.project.name, run=run)
         written = write_report(target, html, project_root=project_root)
     except WhetstoneError as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
 
     # soft_wrap: Rich wraps to the terminal by default, which broke the path

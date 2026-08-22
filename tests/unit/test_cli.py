@@ -546,6 +546,28 @@ def test_a_skip_carrying_terminal_escapes_cannot_drive_the_terminal(
     assert "x1b" in screen, "the control characters were dropped, not shown"
 
 
+def test_an_out_path_carrying_escapes_cannot_drive_the_terminal(tmp_path):
+    """EXCEPTION TEXT QUOTES WHAT CAUSED IT. `_report_target` puts the rejected
+    `--out` value into the ReportError, so the string reaching the screen is
+    the one somebody typed or scripted -- and `escape()` in front of it
+    neutralises Rich markup and nothing else."""
+    _write_config(tmp_path)
+    esc = chr(27)
+    hostile = f"../outside{esc}]0;OWNED{chr(7)}{esc}[2J/report.html"
+
+    result = runner.invoke(
+        app, ["report", "--path", str(tmp_path), "--out", hostile]
+    )
+
+    assert result.exit_code != 0, result.stdout
+    assert esc not in result.stdout, "an escape sequence reached the terminal"
+    assert chr(7) not in result.stdout, "a BEL reached the terminal"
+    assert "x1b" in _flattened(result.stdout), (
+        "the control characters were dropped rather than shown, so the user "
+        "cannot see what was wrong with the path they gave"
+    )
+
+
 def test_a_skip_with_unbalanced_brackets_does_not_crash_the_run(
     tmp_path, monkeypatch
 ):
