@@ -412,6 +412,10 @@ def test_a_backwards_range_is_discarded(ctx):
         ("app.py:-17", ("app.py:-17", None)),
         ("app.py:14-17-20", ("app.py:14-17-20", None)),
         ("app.py:abc", ("app.py:abc", None)),
+        # Nine digits is a line number; ten is not, and 4301 is a ValueError
+        # out of `int()` rather than a large number.
+        ("app.py:999999999", ("app.py", (999999999, 999999999))),
+        ("app.py:1234567890", ("app.py:1234567890", None)),
         # `str.isdigit()` IS TRUE FOR THESE AND `int()` IS NOT DEFINED FOR ALL
         # OF THEM. A superscript raised ValueError out of the whole hunt; an
         # Arabic-Indic digit converted silently, which is worse in a different
@@ -430,6 +434,33 @@ def test_split_subject_parses_only_what_is_actually_an_address(subject, expected
     from whetstone.lenses.code_defects.hunt import _split_subject
 
     assert _split_subject(subject) == expected
+
+
+def test_an_enormous_line_number_discards_one_finding_not_the_run(ctx):
+    """CPython refuses `int()` on a decimal string of more than 4300 digits, so
+    an unbounded ASCII suffix is the superscript crash again through another
+    door: ValueError out of `_subject_problem` and `hunt`, taking every other
+    candidate in the run with it."""
+    findings = [{**_FINDING, "subject": "app.py:" + "1" * 4301}, _FINDING]
+    provider = _FakeProvider(_ok({"findings": findings, "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert len(result.candidates) == 1, "the good finding went down with the bad one"
+    assert result.candidates[0]["subject"] == "app.py:12"
+    assert len(result.skips) == 1
+
+
+def test_a_line_addressed_subject_escaping_the_project_is_discarded(ctx):
+    """The traversal check reads the PATH half of a parsed subject, so it has
+    to survive range parsing. `../outside.py:1` must be refused before anything
+    opens it."""
+    for subject in ("../outside.py:1", "../outside.py:1-4", "../outside.py"):
+        provider = _FakeProvider(
+            _ok({"findings": [{**_FINDING, "subject": subject}], "notes": None})
+        )
+        result = hunt(ctx, provider)
+        assert result.candidates == (), subject
+        assert "inside the project" in result.skips[0], subject
 
 
 def test_a_unicode_digit_subject_discards_one_finding_not_the_run(ctx):

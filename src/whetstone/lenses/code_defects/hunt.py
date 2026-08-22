@@ -79,6 +79,15 @@ def _max_findings(ctx: RunContext) -> int:
     return value if isinstance(value, int) and value > 0 else _DEFAULT_MAX_FINDINGS
 
 
+# A line number is at most this many digits. CPython refuses `int()` on a
+# decimal string longer than 4300 digits (`sys.int_info`), so an unbounded
+# suffix is the SAME crash the ASCII check below fixes, reached by a different
+# door -- and 999,999,999 lines is already orders of magnitude past any file
+# anyone has. The bound is semantic; that it also sits far under CPython's
+# limit is what makes `int()` total here rather than merely usually fine.
+_MAX_LINE_DIGITS = 9
+
+
 def _is_line_number(text: str) -> bool:
     """Whether *text* is an ASCII decimal integer, and therefore safe for `int`.
 
@@ -95,11 +104,22 @@ def _is_line_number(text: str) -> bool:
     in numerals nothing else in the pipeline prints, and a line number is not a
     place to be liberal.
 
+    LENGTH IS PART OF THE TEST, not a tidiness check. `int()` raises
+    ValueError on a decimal string of more than 4300 digits, so `app.py:` with
+    five thousand ones satisfies every other condition here and takes the run
+    down exactly as the superscript did. `_MAX_LINE_DIGITS` is well under that,
+    so `int()` on anything this function admits cannot raise.
+
     (Codepoints named rather than written: comments and docstrings under `src/`
     are ASCII-only, and `test_comments_and_docstrings_in_src_are_ascii_only`
     enforces it.)
     """
-    return text.isascii() and text.isdecimal()
+    return (
+        bool(text)
+        and len(text) <= _MAX_LINE_DIGITS
+        and text.isascii()
+        and text.isdecimal()
+    )
 
 
 def _split_subject(subject: str) -> tuple[str, tuple[int, int] | None]:
