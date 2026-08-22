@@ -30,6 +30,17 @@ pip install whetstone-cli
 
 The command is `whetstone`; the package on PyPI is `whetstone-cli`.
 
+The browser lens is an extra, because Playwright pulls a few hundred megabytes
+of Chromium and most people never run it:
+
+```bash
+pip install 'whetstone-cli[browser]'
+playwright install chromium
+```
+
+Without it that lens reports it could not run, and says which command fixes it.
+It never silently finds nothing.
+
 From a checkout instead, which is what you want if you intend to change it:
 
 ```bash
