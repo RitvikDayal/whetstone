@@ -357,6 +357,72 @@ def test_a_line_number_past_the_end_of_the_file_is_discarded(ctx):
     assert "line 900" in result.skips[0]
 
 
+def test_a_line_range_subject_is_placed_rather_than_discarded(ctx):
+    """A RANGE USED TO BE SWALLOWED WHOLE. `app.py:11-13` failed the all-digit
+    test, so the entire string became the filename, matched nothing in scope,
+    and a real finding was thrown away -- while the message blamed the user's
+    `boundaries.include`. Nothing in the hunt prompt asks for a single line, so
+    which format the model picked decided whether the finding survived."""
+    finding = {**_FINDING, "subject": "app.py:11-13"}
+    provider = _FakeProvider(_ok({"findings": [finding], "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert len(result.candidates) == 1, result.skips
+    assert result.skips == ()
+    # VERBATIM. `dedupe_key` hashes the subject, so rewriting it to `app.py:11`
+    # here would re-point every stored rejection at a key it was never filed
+    # under. Placing a finding and keying it are different jobs.
+    assert result.candidates[0]["subject"] == "app.py:11-13"
+
+
+def test_a_range_running_past_the_end_of_the_file_is_discarded(ctx):
+    """Beginning inside the file does not buy the rest of the span. The message
+    repeats the range it was handed rather than a normalised one."""
+    finding = {**_FINDING, "subject": "app.py:12-900"}
+    provider = _FakeProvider(_ok({"findings": [finding], "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert result.candidates == ()
+    assert "lines 12-900" in result.skips[0]
+    assert "not in scope" not in result.skips[0], (
+        "the old failure blamed scope for what is an addressing problem"
+    )
+
+
+def test_a_backwards_range_is_discarded(ctx):
+    finding = {**_FINDING, "subject": "app.py:13-11"}
+    provider = _FakeProvider(_ok({"findings": [finding], "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert result.candidates == ()
+    assert "ends before it starts" in result.skips[0]
+
+
+@pytest.mark.parametrize(
+    ("subject", "expected"),
+    [
+        ("app.py", ("app.py", None)),
+        ("app.py:12", ("app.py", (12, 12))),
+        ("app.py:14-17", ("app.py", (14, 17))),
+        ("app.py:14-14", ("app.py", (14, 14))),
+        # NOT AN ADDRESS, so the whole string stays the path. A trailing hyphen,
+        # a negative, a word, or a version-like tail must not be mistaken for a
+        # span -- guessing here invents a file that was never named.
+        ("app.py:14-", ("app.py:14-", None)),
+        ("app.py:-17", ("app.py:-17", None)),
+        ("app.py:14-17-20", ("app.py:14-17-20", None)),
+        ("app.py:abc", ("app.py:abc", None)),
+        ("weird-name.py", ("weird-name.py", None)),
+        # A Windows drive letter is why this never split on the FIRST colon.
+        ("C:/x/app.py", ("C:/x/app.py", None)),
+    ],
+)
+def test_split_subject_parses_only_what_is_actually_an_address(subject, expected):
+    from whetstone.lenses.code_defects.hunt import _split_subject
+
+    assert _split_subject(subject) == expected
+
+
 def test_a_path_escaping_the_project_is_discarded(ctx):
     finding = {**_FINDING, "subject": "../../../etc/passwd"}
     provider = _FakeProvider(_ok({"findings": [finding], "notes": None}))

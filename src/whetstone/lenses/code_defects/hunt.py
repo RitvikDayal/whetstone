@@ -79,16 +79,36 @@ def _max_findings(ctx: RunContext) -> int:
     return value if isinstance(value, int) and value > 0 else _DEFAULT_MAX_FINDINGS
 
 
-def _split_subject(subject: str) -> tuple[str, int | None]:
-    """`app.py:12` -> `("app.py", 12)`; `app.py` -> `("app.py", None)`.
+def _split_subject(subject: str) -> tuple[str, tuple[int, int] | None]:
+    """`app.py:12` -> `("app.py", (12, 12))`; `app.py:14-17` -> `("app.py", (14, 17))`.
 
-    Only a trailing all-digit segment is treated as a line number. A Windows
-    path carries a colon after the drive letter, and a path may legitimately
-    contain one elsewhere, so splitting on the first colon would mangle both.
+    Only a trailing all-digit segment, or two of them joined by a hyphen, is
+    treated as an address. A Windows path carries a colon after the drive
+    letter, and a path may legitimately contain one elsewhere, so splitting on
+    the first colon would mangle both.
+
+    A RANGE USED TO BECOME PART OF THE PATH. `app.py:14-17` failed the digit
+    test, so the entire string was taken as the filename, matched nothing in
+    scope, and the finding was discarded as unplaceable -- while the message
+    told the user their `boundaries.include` was wrong. Nothing in the hunt
+    prompt asks for a single line, so whether a real finding survived depended
+    on which format the model happened to choose. That is finding loss wearing
+    the appearance of a clean run.
+
+    A single line comes back as a one-line span rather than an int, so callers
+    validate one shape instead of two. THE SUBJECT ITSELF IS NOT REWRITTEN:
+    `dedupe_key` hashes it verbatim, and normalising `:14-17` to `:14` here
+    would re-point every stored rejection at a key it was never filed under.
+    Placing a finding and keying it are different jobs; this one only places it.
     """
     head, separator, tail = subject.rpartition(":")
-    if separator and tail.isdigit():
-        return head, int(tail)
+    if not separator:
+        return subject, None
+    if tail.isdigit():
+        return head, (int(tail), int(tail))
+    start, hyphen, end = tail.partition("-")
+    if hyphen and start.isdigit() and end.isdigit():
+        return head, (int(start), int(end))
     return subject, None
 
 
@@ -105,7 +125,7 @@ def _subject_problem(ctx: RunContext, subject: object) -> str | None:
     if not isinstance(subject, str) or not subject.strip():
         return f"subject {subject!r} is not a path"
 
-    path_text, line = _split_subject(subject.strip())
+    path_text, span = _split_subject(subject.strip())
     candidate = PurePosixPath(path_text.replace("\\", "/"))
     if candidate.is_absolute() or ".." in candidate.parts:
         return f"subject {subject!r} is not a path inside the project"
@@ -123,15 +143,25 @@ def _subject_problem(ctx: RunContext, subject: object) -> str | None:
     except OSError as exc:
         return f"subject {subject!r} could not be read: {type(exc).__name__}"
 
-    if line is not None:
+    if span is not None:
+        start, end = span
         # splitlines(), not count("\n") + 1: a file ending in a newline has one
         # fewer line than that arithmetic claims, so the last real line of every
         # normally-terminated file would be off by one in the permissive
         # direction -- the check would accept an address one past the end.
         total = len(text.splitlines())
-        if line < 1 or line > total:
+        if end < start:
             return (
-                f"subject {subject!r} points at line {line} of a {total}-line "
+                f"subject {subject!r} ends before it starts, so it names no "
+                f"region of the file"
+            )
+        if start < 1 or end > total:
+            # BOTH ENDS. A range that begins inside the file and runs off the
+            # end is still an address the file does not have, and the message
+            # repeats the span it was handed rather than a normalised one.
+            where = f"line {start}" if start == end else f"lines {start}-{end}"
+            return (
+                f"subject {subject!r} points at {where} of a {total}-line "
                 f"file, so the finding does not have the address it claims"
             )
     return None
