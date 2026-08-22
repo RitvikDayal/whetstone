@@ -24,7 +24,13 @@ limitations before you rely on a grade.
 
 ## Install
 
-Not published yet. To follow along:
+```bash
+pip install whetstone-cli
+```
+
+The command is `whetstone`; the package on PyPI is `whetstone-cli`.
+
+From a checkout instead, which is what you want if you intend to change it:
 
 ```bash
 git clone https://github.com/RitvikDayal/whetstone
