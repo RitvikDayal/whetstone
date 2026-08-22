@@ -460,8 +460,23 @@ def test_run_without_full_defaults_to_changed_only(tmp_path, monkeypatch):
 # middle removed has not reached them.
 
 
+def _flattened(text: str) -> str:
+    """*text* with every run of whitespace collapsed to one space.
+
+    Rich wraps to the terminal width, so a skip message arrives on screen with
+    newlines and padding inserted at positions nobody chose. Comparing the
+    whole message means comparing what survived the render rather than the
+    fragments a test happened to name.
+    """
+    return " ".join(text.split())
+
+
 def test_a_bracketed_skip_reaches_the_user_intact(tmp_path, monkeypatch):
     _write_config(tmp_path)
+    skip = (
+        "rendered-ui [/checkout @ 1280x800]: install the browser extra: "
+        "`pip install 'whetstone-cli[browser]'`. Nothing was checked."
+    )
 
     def _fake_execute_run(conn, cfg, project_root, root, *, tier, changed_only):
         from whetstone.runner import RunResult
@@ -472,20 +487,20 @@ def test_a_bracketed_skip_reaches_the_user_intact(tmp_path, monkeypatch):
             file_count=0,
             status="complete",
             lens_count=1,
-            skips=[
-                "rendered-ui [/checkout @ 1280x800]: install the browser extra: "
-                "`pip install 'whetstone-cli[browser]'`. Nothing was checked.",
-            ],
+            skips=[skip],
         )
 
     monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)
     result = runner.invoke(app, ["run", "--path", str(tmp_path)])
     assert result.exit_code == 0, result.stdout
-    assert "[browser]" in result.stdout, (
-        "Rich ate the extra name, so the fix instruction is wrong on screen"
-    )
-    assert "[/checkout @ 1280x800]" in result.stdout, (
-        "the skip no longer says which route and viewport it is about"
+    # THE WHOLE MESSAGE, not the two brackets this test was written for.
+    # Asserting fragments let a regression drop the install command, or the
+    # "Nothing was checked" that tells the user the surface went unmeasured,
+    # while both fragment assertions stayed green.
+    assert _flattened(skip) in _flattened(result.stdout), (
+        f"the skip did not survive rendering intact. "
+        f"wanted <{_flattened(skip)}> "
+        f"but the screen had <{_flattened(result.stdout)}>"
     )
 
 
@@ -495,6 +510,7 @@ def test_a_skip_with_unbalanced_brackets_does_not_crash_the_run(
     """Model-authored text reaches this line. An unclosed tag is a MarkupError,
     which would lose a completed run at the moment it prints its results."""
     _write_config(tmp_path)
+    skip = "code-defects: subject 'a[0' could not be parsed"
 
     def _fake_execute_run(conn, cfg, project_root, root, *, tier, changed_only):
         from whetstone.runner import RunResult
@@ -505,13 +521,17 @@ def test_a_skip_with_unbalanced_brackets_does_not_crash_the_run(
             file_count=0,
             status="complete",
             lens_count=1,
-            skips=["code-defects: subject 'a[0' could not be parsed"],
+            skips=[skip],
         )
 
     monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)
     result = runner.invoke(app, ["run", "--path", str(tmp_path)])
     assert result.exit_code == 0, result.stdout
-    assert "a[0" in result.stdout
+    assert _flattened(skip) in _flattened(result.stdout), (
+        f"the skip did not survive rendering intact. "
+        f"wanted <{_flattened(skip)}> "
+        f"but the screen had <{_flattened(result.stdout)}>"
+    )
 
 
 # --- report: the invariant a stale report is worse than none is only real
