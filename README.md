@@ -201,11 +201,13 @@ Stated here rather than discovered later.
   single grade as one opinion, not a measurement.
 
   Two things that measurement does **not** establish, stated because it is easy
-  to read more into it than it holds. It is nine runs on **one** candidate, so
-  the 3-to-6 split fixes no rate: the 95% interval on it runs from about 0.12 to
-  0.65 and does not exclude a coin. And the rate that decides what any fix costs
-  — how often the falsifier wrongly refutes a **genuine** defect — has never
-  been measured at all. Tracked in
+  to read more into it than it holds. Nine of the ten runs reached the falsifier
+  — the tenth failed earlier, for an unrelated reason since fixed — so the split
+  is 3 confirmed against 6 refuted out of **nine**, on **one** candidate. That
+  fixes no rate: the 95% interval on 3-of-9 runs from about 0.12 to 0.65 and does
+  not exclude a coin. And the rate that decides what any fix costs — how often
+  the falsifier wrongly refutes a **genuine** defect — has never been measured at
+  all. Tracked in
   [#33](https://github.com/RitvikDayal/whetstone/issues/33), which now carries
   the root-cause analysis and the measurement that has to come before a fix.
 - **Reads are not sandboxed.** The container bounds the reproduction, not the
