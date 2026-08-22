@@ -100,7 +100,19 @@ class Origin:
             return False
 
     def __str__(self) -> str:
-        return f"{self.scheme}://{self.host}:{self.port}"
+        # BRACKETED WHEN IT IS IPv6. `urlparse().hostname` strips the brackets
+        # off `[::1]`, so re-emitting the bare host produced
+        # `http://::1:8000` -- not a URL at all, and `.port` on it raises.
+        #
+        # This string is not decoration. `drive` builds `f"{origin}{route}"`
+        # and hands it straight back to `admits()`, which reparses it, so an
+        # IPv6 base_url made EVERY route fail the origin check and every
+        # proposal was discarded with a reason saying the route did not
+        # resolve inside the origin -- when the origin itself was the thing
+        # that would not parse. `capture` builds the URL it navigates to the
+        # same way, and so does the replay URL stored as evidence.
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{self.scheme}://{host}:{self.port}"
 
 
 @dataclass(frozen=True)

@@ -657,6 +657,30 @@ def test_a_refused_max_checks_survives_an_early_return(tmp_path):
     )
 
 
+def test_a_check_survives_an_ipv6_origin(tmp_path):
+    """END TO END THROUGH `drive`, because that is where the damage was.
+    `_check_problem` calls `origin.admits(f"{origin}{route}")`, so an origin
+    that could not survive its own `str()` discarded EVERY proposal -- with a
+    reason saying the route did not resolve inside the origin, when the origin
+    was the half that would not parse."""
+    from whetstone.lenses.rendered_ui.browser import Origin
+
+    provider = _FakeProvider(
+        {
+            "checks": [
+                {"route": "/x", "selector_a": "#a", "selector_b": "#b", "why": "y"}
+            ],
+            "notes": None,
+        }
+    )
+    result = drive(
+        _ctx(tmp_path), provider, Origin.parse("http://[::1]:8000/"), ((1280, 800),)
+    )
+
+    assert len(result.checks) == 1, result.skips
+    assert result.checks[0].route == "/x"
+
+
 def test_a_truncated_file_list_is_reported_to_the_user(tmp_path):
     """THE MODEL WAS TOLD AND THE USER WAS NOT. The prompt summarises the
     surplus as "... and N more", so the stage knows its view is partial while

@@ -348,6 +348,44 @@ def test_a_driver_error_while_reading_becomes_a_browser_error(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("http://[::1]:8000/", "http://[::1]:8000"),
+        ("https://[2001:db8::1]/", "https://[2001:db8::1]:443"),
+        ("http://127.0.0.1:3000/", "http://127.0.0.1:3000"),
+        ("http://localhost:3000", "http://localhost:3000"),
+    ],
+    ids=["ipv6-loopback", "ipv6-documented", "ipv4", "name"],
+)
+def test_an_origin_round_trips_through_its_own_string(raw, expected):
+    """THIS STRING IS NOT DECORATION. `drive` builds `f"{origin}{route}"` and
+    hands it back to `admits()`, which reparses it -- so an origin that cannot
+    survive its own `str()` rejects every route it is given, with a reason
+    blaming the route.
+
+    `urlparse().hostname` strips the brackets off `[::1]`, so re-emitting the
+    bare host produced `http://::1:8000`, which is not a URL and whose `.port`
+    raises."""
+    origin = Origin.parse(raw)
+
+    assert str(origin) == expected
+    assert origin.admits(f"{origin}/index.html"), (
+        f"{origin} does not admit a path built from itself"
+    )
+    assert Origin.parse(str(origin)) == origin
+
+
+def test_an_ipv6_origin_still_refuses_a_foreign_one():
+    """The bracketing must not soften the pin it exists to serve."""
+    origin = Origin.parse("http://[::1]:8000/")
+
+    assert not origin.admits("http://[::2]:8000/x")
+    assert not origin.admits("http://[::1]:8001/x")
+    assert not origin.admits("https://[::1]:8000/x")
+    assert not origin.admits("http://evil.test/?next=http://[::1]:8000")
+
+
 # --- geometry is arithmetic ------------------------------------------------------------
 
 
