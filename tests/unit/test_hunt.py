@@ -412,6 +412,15 @@ def test_a_backwards_range_is_discarded(ctx):
         ("app.py:-17", ("app.py:-17", None)),
         ("app.py:14-17-20", ("app.py:14-17-20", None)),
         ("app.py:abc", ("app.py:abc", None)),
+        # `str.isdigit()` IS TRUE FOR THESE AND `int()` IS NOT DEFINED FOR ALL
+        # OF THEM. A superscript raised ValueError out of the whole hunt; an
+        # Arabic-Indic digit converted silently, which is worse in a different
+        # direction -- an address in a numeral system nothing else prints.
+        ("app.py:²", ("app.py:²", None)),
+        ("app.py:²-1", ("app.py:²-1", None)),
+        ("app.py:1-²", ("app.py:1-²", None)),
+        ("app.py:٣", ("app.py:٣", None)),
+        ("app.py:١-٣", ("app.py:١-٣", None)),
         ("weird-name.py", ("weird-name.py", None)),
         # A Windows drive letter is why this never split on the FIRST colon.
         ("C:/x/app.py", ("C:/x/app.py", None)),
@@ -421,6 +430,21 @@ def test_split_subject_parses_only_what_is_actually_an_address(subject, expected
     from whetstone.lenses.code_defects.hunt import _split_subject
 
     assert _split_subject(subject) == expected
+
+
+def test_a_unicode_digit_subject_discards_one_finding_not_the_run(ctx):
+    """`"²".isdigit()` is True and `int("²")` raises. The exception
+    escaped `_subject_problem` and `hunt`, so ONE malformed subject took down
+    every other candidate in the run with no reason recorded anywhere -- the
+    exact opposite of what this layer is for."""
+    findings = [{**_FINDING, "subject": "app.py:²-1"}, _FINDING]
+    provider = _FakeProvider(_ok({"findings": findings, "notes": None}))
+    result = hunt(ctx, provider)
+
+    assert len(result.candidates) == 1, "the good finding went down with the bad one"
+    assert result.candidates[0]["subject"] == "app.py:12"
+    assert len(result.skips) == 1
+    assert "app.py:²-1" in result.skips[0]
 
 
 def test_a_path_escaping_the_project_is_discarded(ctx):

@@ -79,6 +79,29 @@ def _max_findings(ctx: RunContext) -> int:
     return value if isinstance(value, int) and value > 0 else _DEFAULT_MAX_FINDINGS
 
 
+def _is_line_number(text: str) -> bool:
+    """Whether *text* is an ASCII decimal integer, and therefore safe for `int`.
+
+    `str.isdigit()` is not that test, and reading it as one is a crash. A
+    SUPERSCRIPT TWO (U+00B2) satisfies `isdigit()` and `int()` refuses it, so a
+    subject ending in one ended the ENTIRE hunt with an unhandled ValueError --
+    every other candidate in the run went down with it, and the one thing this
+    layer exists to guarantee is that a bad finding is discarded with a reason
+    rather than taking the run with it.
+
+    `isdecimal()` excludes the superscripts. `isascii()` excludes the
+    Arabic-Indic block (U+0660..U+0669) and the other decimal scripts, which
+    `int()` accepts happily -- those would otherwise be valid addresses written
+    in numerals nothing else in the pipeline prints, and a line number is not a
+    place to be liberal.
+
+    (Codepoints named rather than written: comments and docstrings under `src/`
+    are ASCII-only, and `test_comments_and_docstrings_in_src_are_ascii_only`
+    enforces it.)
+    """
+    return text.isascii() and text.isdecimal()
+
+
 def _split_subject(subject: str) -> tuple[str, tuple[int, int] | None]:
     """`app.py:12` -> `("app.py", (12, 12))`; `app.py:14-17` -> `("app.py", (14, 17))`.
 
@@ -104,10 +127,10 @@ def _split_subject(subject: str) -> tuple[str, tuple[int, int] | None]:
     head, separator, tail = subject.rpartition(":")
     if not separator:
         return subject, None
-    if tail.isdigit():
+    if _is_line_number(tail):
         return head, (int(tail), int(tail))
     start, hyphen, end = tail.partition("-")
-    if hyphen and start.isdigit() and end.isdigit():
+    if hyphen and _is_line_number(start) and _is_line_number(end):
         return head, (int(start), int(end))
     return subject, None
 
