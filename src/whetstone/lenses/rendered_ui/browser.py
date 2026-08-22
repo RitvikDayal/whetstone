@@ -225,7 +225,18 @@ class Page:
                 f"{self.origin}. Production browsing is opt-in per invocation "
                 "and read-only."
             )
-        self._page.goto(url, timeout=_NAVIGATION_TIMEOUT_MS)
+        try:
+            self._page.goto(url, timeout=_NAVIGATION_TIMEOUT_MS)
+        except Exception as exc:  # noqa: BLE001 - driver errors share no base
+            # A TIMEOUT, A REFUSED CONNECTION, A CRASHED TAB. `capture()`
+            # catches only BrowserError, so every one of these ended the check
+            # in a traceback while a page that merely moved off-origin got a
+            # readable skip. The URL travels in the message because "it did not
+            # load" is not actionable without saying what did not load.
+            raise BrowserError(
+                f"could not load {url!r}: {type(exc).__name__}: {exc}. "
+                f"Nothing was measured or captured."
+            ) from exc
         self._settle()
         # AFTER settling, not only before the request. A page can redirect
         # anywhere, and checking only what was asked for is a
@@ -327,7 +338,18 @@ def rendered(
         blocked = _missing_binary(play)
         if blocked is not None:
             raise BrowserError(blocked)
-        browser = play.chromium.launch(headless=True)
+        try:
+            browser = play.chromium.launch(headless=True)
+        except Exception as exc:  # noqa: BLE001 - driver errors share no base
+            # THE BINARY BEING PRESENT IS NOT THE BINARY STARTING. A runner
+            # with a sandbox it cannot use, a missing shared library, or no
+            # writable profile directory passes `_missing_binary` and fails
+            # here -- and the lens then died with a traceback rather than
+            # telling the user their environment cannot run a browser.
+            raise BrowserError(
+                f"the browser could not be started: {type(exc).__name__}: "
+                f"{exc}. Nothing was rendered."
+            ) from exc
         context = None
         try:
             context = browser.new_context(

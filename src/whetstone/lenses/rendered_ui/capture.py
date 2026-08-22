@@ -152,9 +152,18 @@ def capture(
     skips: list[str] = []
 
     for index, check in enumerate(checks):
-        for viewport in viewports:
+        for position, viewport in enumerate(viewports):
             width, height = viewport
-            stem = f"{index:02d}-{width}x{height}"
+            # THE VIEWPORT'S POSITION, not only its size. Nothing deduplicates
+            # `viewports`, so `[[1280, 800], [1280, 800]]` gave two iterations
+            # the SAME path: the first could record an Overlap citing that
+            # file, and the second could then discard for any reason and unlink
+            # it. The finding survives in the report pointing at an image that
+            # is gone, which is the exact failure the containment comment below
+            # and `_discard_shot` are both written to prevent. Position rather
+            # than deduplication, because dropping the second viewport would be
+            # declining work the user configured, and that needs its own reason.
+            stem = f"{index:02d}-{position:02d}-{width}x{height}"
             shot = shots_dir / f"{stem}.png"
             # CONTAINMENT, asserted rather than argued. Every component of this
             # name is a loop index or a viewport integer, so nothing a model or

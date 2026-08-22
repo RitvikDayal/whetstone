@@ -656,6 +656,42 @@ def test_a_screenshot_path_escaping_its_directory_is_refused(monkeypatch, tmp_pa
     assert any("escaped" in s for s in result.skips)
 
 
+def test_duplicate_viewports_do_not_share_one_screenshot_path(monkeypatch, tmp_path):
+    """A REPORTED FINDING CITING A DELETED IMAGE. Nothing deduplicates
+    `viewports`, so two identical entries used to derive the same path: the
+    first iteration records an Overlap holding that file, the second discards
+    for any reason and unlinks it, and the candidate survives in the report
+    pointing at nothing -- with no skip saying so."""
+    from whetstone.lenses.rendered_ui import capture as capture_module
+
+    # First pass over the viewport reproduces; second is sub-floor and discards.
+    check, calls, fake = _fixed([500.0, 500.0, 1.0, 1.0], tmp_path)
+
+    def writing_fake(origin, chk, viewport, shot_path):
+        # The real `measure_one` WRITES the image, and `capture()` cites the
+        # file rather than the path it asked for -- so a fake that never wrote
+        # one would have the screenshot come back None and the collision this
+        # test is about could not happen.
+        measurement = fake(origin, chk, viewport, shot_path)
+        if shot_path is not None:
+            shot_path.write_bytes(b"not really a png")
+        return measurement
+
+    monkeypatch.setattr(capture_module, "measure_one", writing_fake)
+    result = capture_module.capture(
+        _origin(), (check,), ((1280, 800), (1280, 800)), tmp_path
+    )
+
+    assert len(result.overlaps) == 1, result.skips
+    cited = result.overlaps[0].screenshot
+    assert cited is not None
+    assert cited.exists(), (
+        "the second viewport unlinked the image the first one is citing"
+    )
+    paths = {shot for _chk, _vp, shot in calls if shot is not None}
+    assert len(paths) == 2, f"both viewports wrote to the same file: {paths}"
+
+
 def test_inside_rejects_a_sibling_that_shares_the_prefix(tmp_path):
     """The stubbed test above proves `capture()` reacts to a False. It cannot
     prove `_inside` ever returns one, and this is the case it exists for:

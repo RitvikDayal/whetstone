@@ -162,6 +162,64 @@ def test_a_page_that_cannot_be_read_at_all_becomes_a_browser_error():
         )
 
 
+def test_a_navigation_failure_becomes_a_browser_error():
+    """A timeout, a refused connection, a crashed tab. `capture()` catches only
+    BrowserError, so each of these ended a check in a traceback while a page
+    that merely moved off-origin produced a readable skip."""
+
+    class _Refusing:
+        url = "http://127.0.0.1:3000/x"
+
+        def goto(self, url, timeout=None):
+            raise RuntimeError("net::ERR_CONNECTION_REFUSED")
+
+    page = Page(_Refusing(), Origin.parse("http://127.0.0.1:3000"))
+    with pytest.raises(BrowserError) as caught:
+        page.goto("http://127.0.0.1:3000/x")
+
+    assert "could not load" in str(caught.value)
+    assert "ERR_CONNECTION_REFUSED" in str(caught.value), (
+        "the driver's reason is what makes this skip actionable"
+    )
+    assert "127.0.0.1:3000/x" in str(caught.value), (
+        "'it did not load' is not actionable without saying what did not load"
+    )
+
+
+def test_a_browser_that_cannot_start_becomes_a_browser_error(monkeypatch):
+    """THE BINARY BEING PRESENT IS NOT THE BINARY STARTING. A runner with an
+    unusable sandbox, a missing shared library, or no writable profile
+    directory passes `_missing_binary` and fails at launch -- and the lens died
+    with a traceback rather than saying the environment cannot run a browser.
+    """
+    import playwright.sync_api as sync_api
+
+    from whetstone.lenses.rendered_ui import browser as browser_module
+
+    class _Chromium:
+        def launch(self, **_kw):
+            raise RuntimeError("Failed to launch: no usable sandbox")
+
+    class _Play:
+        chromium = _Chromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _Play())
+    monkeypatch.setattr(browser_module, "_missing_binary", lambda _play: None)
+
+    with pytest.raises(BrowserError) as caught:  # noqa: SIM117
+        with rendered("http://127.0.0.1:3000/x"):
+            pass
+
+    assert "could not be started" in str(caught.value)
+    assert "no usable sandbox" in str(caught.value)
+
+
 # --- geometry is arithmetic ------------------------------------------------------------
 
 
