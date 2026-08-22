@@ -55,6 +55,10 @@ class Measurement(NamedTuple):
     box_b: Box | None
     overlap_px: float
     screenshot: Path | None
+    # Why the image was withdrawn, when it was. Defaulted so a Measurement
+    # that kept its screenshot -- every ordinary one -- reads the same as it
+    # always did.
+    shot_withdrawn: str | None = None
 
     @property
     def missing(self) -> tuple[str, ...]:
@@ -99,24 +103,51 @@ def measure_one(
 ) -> Measurement:
     """Render the route once and measure both selectors.
 
-    The screenshot is taken BEFORE the boxes are read, so the image is of the
-    page the numbers came from. Reading first and capturing afterwards would let
-    a late render change the page between the evidence and the measurement, and
-    the screenshot would then show something the numbers do not describe.
+    THE SCREENSHOT IS BRACKETED BY THE GEOMETRY READS, and this used to be an
+    ordering argument instead. Capturing before reading was defended here on
+    the grounds that reading first would let a late render change the page
+    between the evidence and the measurement -- true, and the mirror of it is
+    equally true: a font landing or an animation settling AFTER the PNG is
+    written leaves an image that does not show the rectangles the numbers
+    describe. Ordering cannot close that gap from either side. Only measuring
+    it can.
+
+    So both boxes are read, the image is taken, and both are read again. If
+    either rectangle moved, the numbers still stand -- they are a real
+    measurement of a real moment -- but the image no longer evidences them, so
+    it is deleted and the reason travels with the Measurement. An image that
+    shows a different layout than the finding claims is worse than no image:
+    it looks checkable and is not.
     """
     url = f"{origin}{check.route}"
     with rendered(url, viewport=viewport) as page:
-        if shot_path is not None:
-            page.screenshot(shot_path)
         box_a = page.box(check.selector_a)
         box_b = page.box(check.selector_b)
+        if shot_path is not None:
+            page.screenshot(shot_path)
+            after_a = page.box(check.selector_a)
+            after_b = page.box(check.selector_b)
+        else:
+            after_a, after_b = box_a, box_b
+
+    withdrawn: str | None = None
+    if shot_path is not None and (after_a != box_a or after_b != box_b):
+        _discard_shot(shot_path)
+        withdrawn = (
+            f"the layout moved while {check.route} was being captured, so the "
+            f"screenshot does not show the geometry that was measured and was "
+            f"discarded. The measurement itself stands."
+        )
+        shot_path = None
 
     overlap = (
         box_a.intersection_area(box_b)
         if box_a is not None and box_b is not None
         else 0.0
     )
-    return Measurement(check, viewport, box_a, box_b, overlap, shot_path)
+    return Measurement(
+        check, viewport, box_a, box_b, overlap, shot_path, withdrawn
+    )
 
 
 def _agrees(first: float, second: float, tolerance: float) -> bool:
@@ -248,11 +279,21 @@ def capture(
             # pointing at a nonexistent image is worse than evidence with none:
             # the first looks checkable and is not.
             if not shot.exists():
+                # ONE MESSAGE, THE ACCURATE ONE. A shot withdrawn because the
+                # layout moved is a different fact from one the driver never
+                # wrote, and reporting the second when the first happened
+                # sends the reader looking for a disk problem.
                 skips.append(
-                    f"rendered-ui [{check.route} @ {width}x{height}]: the overlap "
-                    f"was measured but no screenshot reached {shot.name}, so it "
-                    f"is reported without one rather than citing an image that "
-                    f"is not there."
+                    f"rendered-ui [{check.route} @ {width}x{height}]: "
+                    + (
+                        first.shot_withdrawn
+                        if first.shot_withdrawn is not None
+                        else (
+                            f"the overlap was measured but no screenshot reached "
+                            f"{shot.name}, so it is reported without one rather "
+                            f"than citing an image that is not there."
+                        )
+                    )
                 )
                 overlaps.append(Overlap(check, viewport, first, second, None))
                 continue

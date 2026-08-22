@@ -739,6 +739,100 @@ def test_a_floor_of_zero_does_not_report_every_clean_pair(monkeypatch, tmp_path)
     assert result.skips == (), result.skips
 
 
+def _staged_page(monkeypatch, boxes):
+    """A page whose `box()` returns *boxes* in order, so a layout change during
+    capture is deterministic. A real font load or animation lands whenever it
+    lands; a test that waits for one is a coin flip about timing, not a test."""
+    from contextlib import contextmanager
+
+    from whetstone.lenses.rendered_ui import capture as capture_module
+
+    class _Page:
+        def screenshot(self, path):
+            Path(path).write_bytes(b"png bytes")
+
+        def box(self, _selector):
+            return boxes.pop(0)
+
+    @contextmanager
+    def fake_rendered(_url, viewport=None):
+        yield _Page()
+
+    monkeypatch.setattr(capture_module, "rendered", fake_rendered)
+    return capture_module
+
+
+def test_a_layout_that_moves_during_capture_withdraws_the_screenshot(
+    monkeypatch, tmp_path
+):
+    """ORDERING CANNOT CLOSE THIS GAP FROM EITHER SIDE. Capturing before the
+    reads was defended on the grounds that reading first would let a late
+    render change the page between evidence and measurement -- and the mirror
+    is equally true: a font landing after the PNG is written leaves an image
+    that does not show the rectangles the numbers describe.
+
+    Read, capture, read again. If a rectangle moved, the numbers stand and the
+    image does not."""
+    shot = tmp_path / "s.png"
+    # box_a, box_b, then after_a, after_b. The second element MOVED.
+    mod = _staged_page(
+        monkeypatch,
+        [Box(0, 0, 10, 10), Box(0, 0, 10, 10), Box(0, 0, 10, 10), Box(5, 5, 10, 10)],
+    )
+
+    m = mod.measure_one(_origin(), Check("/x", "#a", "#b", "y"), (1280, 800), shot)
+
+    assert m.shot_withdrawn is not None and "layout moved" in m.shot_withdrawn
+    assert m.screenshot is None, "a moved layout must not be cited as its evidence"
+    assert not shot.exists(), "the image of a different layout must not survive"
+    # THE MEASUREMENT STILL STANDS. It is a real reading of a real moment; only
+    # the claim that the image evidences it is withdrawn.
+    assert m.overlap_px == 100.0
+
+
+def test_a_still_layout_keeps_its_screenshot(monkeypatch, tmp_path):
+    """The withdrawal must not fire on the ordinary case, or every finding
+    loses its evidence and every run carries a false reason."""
+    shot = tmp_path / "s.png"
+    same = Box(0, 0, 10, 10)
+    mod = _staged_page(monkeypatch, [same, same, same, same])
+
+    m = mod.measure_one(_origin(), Check("/x", "#a", "#b", "y"), (1280, 800), shot)
+
+    assert m.shot_withdrawn is None
+    assert m.screenshot == shot
+    assert shot.exists()
+
+
+def test_a_screenshot_directory_that_cannot_be_made_is_reported(tmp_path, monkeypatch):
+    """The drive stage has already been PAID FOR by this point, so dying here
+    threw away work the user was billed for and recorded no reason for any of
+    it."""
+    from whetstone.lenses.rendered_ui import pack as pack_module
+    from whetstone.lenses.rendered_ui.drive import Check as DriveCheck
+    from whetstone.lenses.rendered_ui.drive import DriveResult
+
+    monkeypatch.setattr(pack_module, "availability", lambda: None)
+    monkeypatch.setattr(
+        pack_module,
+        "drive",
+        lambda *a, **k: DriveResult((DriveCheck("/x", "#a", "#b", "y"),), (), ()),
+    )
+
+    ctx = _ctx(tmp_path, base_url="http://127.0.0.1:3000")
+    # A FILE where the directory has to go. Real, rather than a patched mkdir:
+    # this is what a state root somebody put a file in actually does.
+    (ctx.state_root).mkdir(parents=True, exist_ok=True)
+    (ctx.state_root / "shots").write_text("not a directory", encoding="utf-8")
+
+    result = pack_module.RenderedUiPack(
+        provider=_FakeProvider({"checks": [], "notes": "x"})
+    )._collect(ctx)
+
+    assert result == []
+    assert any("could not be created" in s for s in ctx.skips), ctx.skips
+
+
 def test_duplicate_viewports_do_not_share_one_screenshot_path(monkeypatch, tmp_path):
     """A REPORTED FINDING CITING A DELETED IMAGE. Nothing deduplicates
     `viewports`, so two identical entries used to derive the same path: the

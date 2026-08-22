@@ -284,7 +284,19 @@ class RenderedUiPack:
             return []
 
         shots = ctx.state_root / "shots" / ctx.run_id
-        shots.mkdir(parents=True, exist_ok=True)
+        try:
+            shots.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # A read-only state root, a full disk, a path taken by a file. The
+            # drive stage has already been PAID FOR at this point, so dying
+            # here threw away work the user was billed for and recorded no
+            # reason for any of it.
+            ctx.skip(
+                f"rendered-ui: the screenshot directory {shots} could not be "
+                f"created ({type(exc).__name__}: {exc}), so nothing was "
+                f"measured. The drive stage had already run and been charged."
+            )
+            return []
 
         measured = capture(
             origin,
