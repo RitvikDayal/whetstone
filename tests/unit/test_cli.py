@@ -56,9 +56,17 @@ def test_the_declared_entry_point_resolves():
 
 
 def test_version_command():
+    """THE WHOLE LINE, not a substring of it. `re.search` for a numeric shape
+    passes on any output that merely CONTAINS one, so a command that printed a
+    banner, a warning, or two versions would have satisfied it -- and `\d`
+    accepts Unicode decimal digits besides, the same hole this file's sibling
+    carried in its own validator."""
+    from whetstone import __version__
+
     result = runner.invoke(app, ["version"])
+
     assert result.exit_code == 0
-    assert re.search(r"\d+\.\d+\.\d+", result.stdout)
+    assert _flattened(result.stdout) == f"whetstone {__version__}", result.stdout
 
 
 def test_python_dash_m_runs_the_same_app():
@@ -477,7 +485,6 @@ def test_the_reported_version_is_the_packaged_version():
     correctly labelled 0.1.0 whose `whetstone version` still reports 0.0.1
     passes every gate that exists -- which is exactly what happened when the
     bump landed in pyproject.toml alone."""
-    import re
     import tomllib
     from pathlib import Path
 
@@ -496,8 +503,9 @@ def test_the_reported_version_is_the_packaged_version():
 
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0, result.stdout
-    assert declared in result.stdout, result.stdout
-    assert re.search(r"\d+\.\d+\.\d+", result.stdout), result.stdout
+    # EXACT, for the reason `test_version_command` gives: a substring check
+    # passes on output that carries the right number among the wrong ones.
+    assert _flattened(result.stdout) == f"whetstone {declared}", result.stdout
 
 
 def test_a_bracketed_skip_reaches_the_user_intact(tmp_path, monkeypatch):
