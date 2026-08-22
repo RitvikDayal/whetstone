@@ -94,7 +94,13 @@ class ModelConfig(_Strict):
 
 
 class CeilingConfig(_Strict):
+    # ENFORCED PER LENS, not per run, despite the name. Each model-driven pack
+    # builds its own Budget from this value and knows nothing of the others, so
+    # two enabled lenses can together spend twice it. See issue #43; the fix is
+    # one Budget owned by the runner, which moves the LensPack boundary.
     usd_per_run: float | None = None
+    # ACCEPTED AND NOT ENFORCED. Whetstone keeps no cross-run accounting, so
+    # both packs report this as unenforced rather than silently dropping it.
     calls_per_day: int | None = None
 
 

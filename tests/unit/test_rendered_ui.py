@@ -657,6 +657,38 @@ def test_a_refused_max_checks_survives_an_early_return(tmp_path):
     )
 
 
+def test_a_truncated_file_list_is_reported_to_the_user(tmp_path):
+    """THE MODEL WAS TOLD AND THE USER WAS NOT. The prompt summarises the
+    surplus as "... and N more", so the stage knows its view is partial while
+    the report reads as a result about the whole declared surface."""
+    from whetstone.lenses.base import RunContext
+    from whetstone.lenses.rendered_ui.drive import _MAX_LISTED_FILES
+
+    provider = _FakeProvider({"checks": [], "notes": "nothing overlaps"})
+    ctx = RunContext(
+        project_root=tmp_path,
+        state_root=tmp_path / "state",
+        files=tuple(Path(f"p{n}.html") for n in range(_MAX_LISTED_FILES + 7)),
+        tier="deep",
+        lens_options={"options": {}},
+        run_id="run-test",
+    )
+    result = drive(ctx, provider, _origin(), ((1280, 800),))
+
+    assert any("partial view" in s for s in result.skips), result.skips
+    assert any(str(_MAX_LISTED_FILES + 7) in s for s in result.skips), (
+        "the reason must say how much of the surface was actually shown"
+    )
+
+
+def test_a_file_list_inside_the_limit_is_not_reported(tmp_path):
+    """Or every ordinary run carries a truncation reason it did not earn."""
+    provider = _FakeProvider({"checks": [], "notes": "nothing overlaps"})
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+
+    assert not any("partial view" in s for s in result.skips), result.skips
+
+
 def test_a_cap_above_the_contract_is_clamped_with_a_reason(tmp_path):
     """`max_checks: 20` asked the prompt for 20 while the schema refuses an
     answer longer than 12. The run measured less than it was configured for and
@@ -788,6 +820,48 @@ def test_a_layout_that_moves_during_capture_withdraws_the_screenshot(
     # THE MEASUREMENT STILL STANDS. It is a real reading of a real moment; only
     # the claim that the image evidences it is withdrawn.
     assert m.overlap_px == 100.0
+
+
+def test_a_withdrawn_screenshot_is_not_cited_when_the_unlink_fails(
+    monkeypatch, tmp_path
+):
+    """`_discard_shot` suppresses OSError, so an unlink that failed left the
+    image on disk -- ordinary on Windows, where a scanner or the indexer holds
+    a transient handle on the file Playwright just wrote. `shot.exists()` then
+    answered True and the finding cited a PNG of a layout it never measured,
+    with no reason anywhere. The withdrawal is a decision this code made; the
+    unlink is the filesystem's opinion about it."""
+    from whetstone.lenses.rendered_ui import capture as capture_module
+
+    # The image survives the discard, exactly as a locked file would.
+    monkeypatch.setattr(capture_module, "_discard_shot", lambda _p: None)
+
+    calls = {"n": 0}
+
+    def moving(origin, chk, viewport, shot_path):
+        from whetstone.lenses.rendered_ui.capture import Measurement
+
+        calls["n"] += 1
+        if shot_path is not None:
+            shot_path.write_bytes(b"an image of the wrong layout")
+            return Measurement(
+                chk, viewport, Box(0, 0, 30, 30), Box(0, 0, 30, 30), 900.0,
+                None, "the layout moved while /x was being captured",
+            )
+        return Measurement(
+            chk, viewport, Box(0, 0, 30, 30), Box(0, 0, 30, 30), 900.0, None
+        )
+
+    monkeypatch.setattr(capture_module, "measure_one", moving)
+    result = capture_module.capture(
+        _origin(), (Check("/x", "#a", "#b", "y"),), ((1280, 800),), tmp_path
+    )
+
+    assert len(result.overlaps) == 1, result.skips
+    assert result.overlaps[0].screenshot is None, (
+        "the surviving file was cited even though the image was withdrawn"
+    )
+    assert any("layout moved" in s for s in result.skips), result.skips
 
 
 def test_a_still_layout_keeps_its_screenshot(monkeypatch, tmp_path):

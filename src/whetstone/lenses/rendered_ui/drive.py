@@ -188,6 +188,16 @@ def drive(
     cap, cap_refused = _max_checks(ctx)
     if cap_refused is not None:
         skips.append(cap_refused)
+    if len(ctx.files) > _MAX_LISTED_FILES:
+        # THE MODEL WAS TOLD AND THE USER WAS NOT. The prompt summarises the
+        # surplus as "... and N more", so the stage knows its view is partial
+        # while the report reads as a result about the whole declared surface.
+        # A run that quietly looked at half of it reads as clean.
+        skips.append(
+            f"drive was shown {_MAX_LISTED_FILES} of {len(ctx.files)} files in "
+            f"scope, so it proposed checks from a partial view of the markup. "
+            f"Narrow `boundaries.include` if the rest mattered."
+        )
 
     request = StageRequest(
         stage="drive",

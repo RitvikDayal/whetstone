@@ -195,6 +195,11 @@ Stated here rather than discovered later.
   every stage. Point it at code you trust.
 - **No estimator.** Cost is recorded per stage after the fact; nothing predicts a
   run's spend before you start it. Set `budget.ceiling.usd_per_run`.
+- **`usd_per_run` is enforced per lens, not per run**, despite the name. Each
+  model-driven lens holds its own budget, so with both enabled a run can spend
+  twice the ceiling you set. Each still stops and reports at its own limit; it
+  is the total that is unbounded.
+  [#43](https://github.com/RitvikDayal/whetstone/issues/43).
 
 ## Licence
 

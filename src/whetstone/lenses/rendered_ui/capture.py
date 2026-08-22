@@ -278,7 +278,15 @@ def capture(
             # wrote would otherwise be cited as an artifact, and evidence
             # pointing at a nonexistent image is worse than evidence with none:
             # the first looks checkable and is not.
-            if not shot.exists():
+            # `first.shot_withdrawn` FIRST, and not through `shot.exists()`.
+            # `_discard_shot` suppresses OSError, so an unlink that failed --
+            # a scanner or the indexer holding a transient handle on the file
+            # Playwright just wrote, which is ordinary on Windows -- left the
+            # image on disk, `exists()` answered True, and the finding cited a
+            # PNG of a layout it did not measure with no reason recorded
+            # anywhere. The withdrawal is a decision this code made; whether
+            # the file went is the filesystem's opinion about it.
+            if first.shot_withdrawn is not None or not shot.exists():
                 # ONE MESSAGE, THE ACCURATE ONE. A shot withdrawn because the
                 # layout moved is a different fact from one the driver never
                 # wrote, and reporting the second when the first happened

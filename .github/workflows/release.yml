@@ -8,10 +8,12 @@
 # A tag can point at any commit, including one CI never saw, and "it was green on
 # main" is not the same claim as "it is green at the thing being published".
 #
-# NO CREDENTIAL OF ANY KIND is available to this workflow: no `id-token: write`,
-# no PyPI token, nothing beyond `contents: read`. That is deliberate and it is
-# the point -- a tag can be pushed by anything holding write access, and a tag
-# that cannot reach a credential cannot ship a release.
+# NO PUBLICATION CREDENTIAL AND NO PUBLICATION CAPABILITY. GitHub still issues
+# the read-scoped `GITHUB_TOKEN` that `contents: read` asks for -- that is a
+# credential, and saying otherwise here was wrong -- but nothing in this
+# workflow can reach PyPI: no `id-token: write`, no token, no publish step.
+# That is the point. A tag can be pushed by anything holding write access, and
+# a tag that cannot reach a publishing credential cannot ship a release.
 name: release
 
 on:
@@ -19,7 +21,8 @@ on:
     tags:
       - "v*"
 
-# Least privilege at the top; the publish job asks for the one extra it needs.
+# Least privilege, and nothing asks for more. There is no job here that needs
+# to write anything; `contents: read` is the whole grant for the workflow.
 permissions:
   contents: read
 
