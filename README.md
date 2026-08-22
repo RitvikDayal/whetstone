@@ -7,10 +7,17 @@ proposes fixes, or opens a pull request, within limits you configure per issue t
 It never merges and it never deploys.
 
 **Status: pre-release, and the honest version is below under
-[Known limitations](#known-limitations).** Three lenses work end to end, CI is
-green on Ubuntu and Windows across Python 3.11 and 3.12, and the evidence
-pipeline — hunt, reproduce in a container, falsify in a separate process, grade
-— has been run against real defects in real repositories.
+[Known limitations](#known-limitations).** The evidence pipeline — hunt,
+reproduce in a container, falsify in a separate process, grade — has been run
+against real defects in real repositories, and each of the three lenses has
+been driven end to end by hand at least once.
+
+What CI shows is narrower than that, and worth stating plainly: the suite
+passes on Ubuntu and Windows across Python 3.11 and 3.12, with the
+container-backed reproduce and writer tests running only on the Linux legs,
+where a Docker daemon exists. A green matrix is evidence that the suite passed
+with those documented skips — not that all three lenses ran end to end on every
+leg.
 
 What is not settled is how *reproducible* the falsifier's judgement is. Read the
 limitations before you rely on a grade.
@@ -25,8 +32,8 @@ cd whetstone
 uv sync --all-groups
 ```
 
-The browser lens needs an extra, because Playwright pulls a few hundred
-megabytes of Chromium and most people never run it:
+The browser lens needs an extra: Playwright pulls a few hundred megabytes of
+Chromium, and most people never run it.
 
 ```bash
 uv sync --all-groups --all-extras

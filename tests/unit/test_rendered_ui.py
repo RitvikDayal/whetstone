@@ -3,20 +3,27 @@
 WHAT IS FAKED AND WHAT IS NOT. The provider is faked, because the drive stage's
 job is to be judged rather than to be clever. The BROWSER IS REAL wherever a
 number matters: an overlap measured against a stub is a test of the stub. The
-tests that need a real Chromium are marked, and they fail rather than skip on the
-Linux CI legs, for the reason `sandbox_image` gives.
+tests that need a real Chromium are marked, and they fail rather than skip
+wherever CI is set, for the reason `sandbox_image` gives.
+
+THAT LAST SENTENCE USED TO BE FALSE HERE. This module declared its own
+`_needs_browser`, which skipped on every platform, and the fail-not-skip
+guarantee held only because `test_browser.py` raised at import time and failed
+collection for the whole session. The claim was made in one file and enforced
+in another, so moving the guard would have left the six marked tests below
+skipping silently on a green leg. Both now come from `tests/_browser.py`.
 """
 
 from __future__ import annotations
 
-import http.server
-import threading
 from pathlib import Path
 
 import pytest
 
+# `tests/` is on the path for both test directories; see `tests/conftest.py`.
+from _browser import Server, needs_browser
 from whetstone.lenses.base import EvidenceKind, LensPack, LensScope, RunContext
-from whetstone.lenses.rendered_ui.browser import Box, Origin, availability
+from whetstone.lenses.rendered_ui.browser import Box, Origin
 from whetstone.lenses.rendered_ui.capture import (
     DEFAULT_MIN_OVERLAP_PX,
     _agrees,
@@ -25,11 +32,6 @@ from whetstone.lenses.rendered_ui.capture import (
 from whetstone.lenses.rendered_ui.drive import Check, drive
 from whetstone.lenses.rendered_ui.pack import RenderedUiPack
 from whetstone.provider.base import StageResult, Usage
-
-_UNAVAILABLE = availability()
-_needs_browser = pytest.mark.skipif(
-    _UNAVAILABLE is not None, reason=_UNAVAILABLE or "browser available"
-)
 
 # Two controls that genuinely collide at 1280px: the badge is absolutely
 # positioned over the button rather than beside it.
@@ -47,30 +49,6 @@ _CLEAN_PAGE = """<!doctype html><body style="margin:0">
 <span id="badge" style="position:absolute;left:400px;top:120px;
   width:100px;height:30px;background:red">SALE</span>
 </body>"""
-
-
-class _Server:
-    def __init__(self, root: Path) -> None:
-        handler = type(
-            "H",
-            (http.server.SimpleHTTPRequestHandler,),
-            {
-                "__init__": lambda s, *a, **k: http.server.SimpleHTTPRequestHandler.__init__(  # noqa: E501
-                    s, *a, directory=str(root), **k
-                ),
-                "log_message": lambda *a, **k: None,
-            },
-        )
-        self._httpd = http.server.HTTPServer(("127.0.0.1", 0), handler)
-        self.port = self._httpd.server_address[1]
-
-    def __enter__(self) -> str:
-        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
-        return f"http://127.0.0.1:{self.port}"
-
-    def __exit__(self, *_exc) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
 
 
 class _FakeProvider:
@@ -357,13 +335,13 @@ def test_a_finding_claims_the_smaller_of_its_two_measurements(
 # --- against a real browser ---------------------------------------------------------
 
 
-@_needs_browser
+@needs_browser
 def test_a_real_overlap_is_measured_and_reported(tmp_path):
     (tmp_path / "index.html").write_text(_OVERLAPPING, encoding="utf-8")
     shots = tmp_path / "shots"
     shots.mkdir()
     check = Check("/index.html", "#buy", "#badge", "absolutely positioned")
-    with _Server(tmp_path) as base:
+    with Server(tmp_path) as base:
         result = capture(
             Origin.parse(base), (check,), ((1280, 800),), shots
         )
@@ -376,34 +354,34 @@ def test_a_real_overlap_is_measured_and_reported(tmp_path):
     assert overlap.screenshot.stat().st_size > 0
 
 
-@_needs_browser
+@needs_browser
 def test_a_clean_page_produces_nothing(tmp_path):
     """The half of the definition of done that is easy to forget."""
     (tmp_path / "index.html").write_text(_CLEAN_PAGE, encoding="utf-8")
     shots = tmp_path / "shots"
     shots.mkdir()
     check = Check("/index.html", "#buy", "#badge", "worth checking")
-    with _Server(tmp_path) as base:
+    with Server(tmp_path) as base:
         result = capture(Origin.parse(base), (check,), ((1280, 800),), shots)
     assert result.overlaps == ()
     assert result.skips == ()
 
 
-@_needs_browser
+@needs_browser
 def test_a_selector_matching_nothing_is_reported_and_is_not_a_finding(tmp_path):
     """An absent element and one collapsed to zero size are different facts."""
     (tmp_path / "index.html").write_text(_OVERLAPPING, encoding="utf-8")
     shots = tmp_path / "shots"
     shots.mkdir()
     check = Check("/index.html", "#buy", "#nope", "worth checking")
-    with _Server(tmp_path) as base:
+    with Server(tmp_path) as base:
         result = capture(Origin.parse(base), (check,), ((1280, 800),), shots)
     assert result.overlaps == ()
     assert len(result.skips) == 1
     assert "matched no element" in result.skips[0]
 
 
-@_needs_browser
+@needs_browser
 def test_an_overlap_below_the_floor_is_not_reported(tmp_path):
     """A one-pixel intersection is what a correct page produces when two
     elements abut and the layout engine rounds."""
@@ -418,7 +396,7 @@ def test_an_overlap_below_the_floor_is_not_reported(tmp_path):
     shots = tmp_path / "shots"
     shots.mkdir()
     check = Check("/index.html", "#a", "#b", "abutting")
-    with _Server(tmp_path) as base:
+    with Server(tmp_path) as base:
         result = capture(
             Origin.parse(base),
             (check,),
@@ -429,7 +407,7 @@ def test_an_overlap_below_the_floor_is_not_reported(tmp_path):
     assert result.overlaps == ()
 
 
-@_needs_browser
+@needs_browser
 def test_the_candidate_carries_capture_evidence_and_a_replayable_script(tmp_path):
     """`EvidenceKind.capture` was in the contract from M0, written before any
     browser code existed -- 'a screenshot plus replayable navigation'."""
@@ -437,7 +415,7 @@ def test_the_candidate_carries_capture_evidence_and_a_replayable_script(tmp_path
     shots = tmp_path / "shots"
     shots.mkdir()
     check = Check("/index.html", "#buy", "#badge", "absolutely positioned")
-    with _Server(tmp_path) as base:
+    with Server(tmp_path) as base:
         origin = Origin.parse(base)
         result = capture(origin, (check,), ((1280, 800),), shots)
 
@@ -571,6 +549,57 @@ def test_a_screenshot_path_escaping_its_directory_is_refused(monkeypatch, tmp_pa
     result = capture_module.capture(_origin(), (check,), ((1280, 800),), tmp_path)
     assert result.overlaps == ()
     assert any("escaped" in s for s in result.skips)
+
+
+def test_inside_rejects_a_sibling_that_shares_the_prefix(tmp_path):
+    """The stubbed test above proves `capture()` reacts to a False. It cannot
+    prove `_inside` ever returns one, and this is the case it exists for:
+    `shots-elsewhere` starts with `shots`, which is exactly the prefix-matching
+    defect the write barrier already refuses."""
+    from whetstone.lenses.rendered_ui.capture import _inside
+
+    root = tmp_path / "shots"
+    root.mkdir()
+    sibling = tmp_path / "shots-elsewhere"
+    sibling.mkdir()
+
+    assert _inside(root, root / "a.png") is True
+    assert _inside(root, root / "nested" / "a.png") is True
+    assert _inside(root, sibling / "a.png") is False
+
+
+def test_inside_rejects_a_traversal_out_of_the_root(tmp_path):
+    from whetstone.lenses.rendered_ui.capture import _inside
+
+    root = tmp_path / "shots"
+    root.mkdir()
+
+    assert _inside(root, root / ".." / "a.png") is False
+    assert _inside(root, root / "nested" / ".." / ".." / "a.png") is False
+    assert _inside(root, tmp_path / "a.png") is False
+
+
+def test_inside_follows_a_symlink_out_of_the_root(tmp_path):
+    """`resolve()` is why this helper exists rather than a string compare. A
+    link whose NAME is inside the root and whose TARGET is not must fail, or
+    containment is a claim about spelling."""
+    from whetstone.lenses.rendered_ui.capture import _inside
+
+    root = tmp_path / "shots"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    link = root / "escape"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover
+        # Windows needs Developer Mode or elevation for this. Skipped rather
+        # than silently passing: a containment test that cannot make the link
+        # has not tested containment.
+        pytest.skip(f"cannot create a directory symlink here: {exc}")
+
+    assert _inside(root, link / "a.png") is False
 
 
 def test_an_empty_provider_name_is_refused_rather_than_defaulted(tmp_path):

@@ -335,4 +335,13 @@ def rendered(
             if context is not None:
                 with contextlib.suppress(Exception):
                     context.close()
-            browser.close()
+            # SUPPRESSED FOR THE SAME REASON, and it matters more here. This
+            # runs while a BrowserError from the body is unwinding, and an
+            # exception raised in `finally` REPLACES the one in flight. The
+            # caller catches BrowserError and turns it into a skip a user can
+            # read; a TargetClosedError from teardown escapes that handler
+            # instead, so a check would end in a traceback rather than a
+            # reason. Losing the close is a leaked process, and it is already
+            # the failing path -- losing the diagnosis is losing the run.
+            with contextlib.suppress(Exception):
+                browser.close()

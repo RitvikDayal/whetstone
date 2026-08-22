@@ -22,13 +22,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - run: uv python install ${{ matrix.python }}
-      - run: uv sync --all-groups --all-extras
-      # The browser binary, on Linux only. Without it every rendered-ui test
-      # SKIPS and the leg stays green -- which is the "check that quietly does
-      # not run" defect, in the tests written to prove the browser lens works.
-      # `tests/unit/test_browser.py` fails rather than skips on this platform,
-      # so a missing install here is loud instead of invisible.
+      # --python, or the matrix is decorative. `requires-python = ">=3.11"`
+      # means uv is free to pick ANY compatible interpreter it finds, and the
+      # runner ships one of its own -- so both legs could resolve to the same
+      # version while the job names claimed otherwise. Installing 3.11 does not
+      # make `uv sync` choose it; asking for it does.
+      - run: uv sync --python ${{ matrix.python }} --all-groups --all-extras
+      # The browser binary, on EVERY leg. Without it every rendered-ui test
+      # SKIPS and the leg stays green -- the "check that quietly does not run"
+      # defect, in the tests written to prove the browser lens works. This was
+      # Linux-only, so the two Windows legs were passing with no rendered-ui
+      # coverage at all; `tests/_browser.py` now fails rather than skips
+      # wherever CI is set, which makes a missing install loud on all four.
       - if: runner.os == 'Linux'
         run: uv run playwright install --with-deps chromium
+      - if: runner.os != 'Linux'
+        run: uv run playwright install chromium
       - run: uv run ruff check src tests
       - run: uv run pytest -q

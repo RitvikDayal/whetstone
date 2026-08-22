@@ -9,19 +9,17 @@ The geometry tests need no browser at all: an intersection of two rectangles is
 arithmetic, and testing it against a real page would test the browser instead of
 the maths. The page-driving tests use a real Chromium against a `file://`-free
 local server, and skip with a reason where the binary is absent -- failing
-rather than skipping on the Linux CI legs, for the reason `sandbox_image` gives.
+rather than skipping wherever CI is set, for the reason `sandbox_image` gives.
+That guarantee and the server both live in `tests/_browser.py`, so the module
+that states the claim is the module that enforces it.
 """
 
 from __future__ import annotations
 
-import http.server
-import os
-import sys
-import threading
-from pathlib import Path
-
 import pytest
 
+# `tests/` is on the path for both test directories; see `tests/conftest.py`.
+from _browser import UNAVAILABLE, Server, browser_is_expected, needs_browser
 from whetstone.errors import WhetstoneError
 from whetstone.lenses.rendered_ui.browser import (
     Box,
@@ -32,39 +30,36 @@ from whetstone.lenses.rendered_ui.browser import (
 )
 
 
-def _browser_is_expected() -> bool:
-    """Linux CI must have a browser. Anywhere else it is optional.
-
-    The workflow installs Chromium on the Linux legs, so a missing binary there
-    is a broken pipeline rather than an environment nobody set up. Without this,
-    every test below SKIPPED on CI and the leg stayed green -- the "check that
-    quietly does not run" defect, inside the tests written to prove the browser
-    lens works. The PR description claimed these failed rather than skipped on
-    CI, which was an argued guarantee with nothing behind it.
-    """
-    return bool(sys.platform.startswith("linux") and os.environ.get("CI"))
-
-
-_UNAVAILABLE = availability()
-
-if _UNAVAILABLE and _browser_is_expected():  # pragma: no cover - CI guard
-    raise RuntimeError(
-        f"a browser is required on the Linux CI legs and is not available: "
-        f"{_UNAVAILABLE}. The workflow runs `playwright install chromium`; if "
-        "that step was removed these tests would silently skip and the leg "
-        "would still be green."
-    )
-
-_needs_browser = pytest.mark.skipif(
-    _UNAVAILABLE is not None, reason=_UNAVAILABLE or "browser available"
-)
-
-
 def test_the_browser_is_present_where_it_is_expected():
     """Loud rather than skipped. A guard that only runs as a module-level raise
     is invisible in a test report; this puts it in the results."""
-    if _browser_is_expected():
-        assert _UNAVAILABLE is None, _UNAVAILABLE
+    if browser_is_expected():
+        assert UNAVAILABLE is None, UNAVAILABLE
+
+
+def test_the_guard_fires_when_ci_has_no_browser(monkeypatch):
+    """THE GUARD ITSELF, exercised. Everything above depends on an import-time
+    raise that never runs in a healthy environment, so nothing proved it still
+    works -- a check that quietly does not run, guarding against checks that
+    quietly do not run. The module is re-executed here with CI set and the
+    browser reported missing, which is the situation it exists for.
+    """
+    import importlib
+
+    import _browser as guard
+
+    monkeypatch.setenv("CI", "1")
+    monkeypatch.setattr(
+        "whetstone.lenses.rendered_ui.browser.availability",
+        lambda: "no browser binary (simulated)",
+    )
+    with pytest.raises(RuntimeError, match="required on every CI leg"):
+        importlib.reload(guard)
+
+    # Reloaded clean, or every later importer gets the half-executed module.
+    monkeypatch.undo()
+    importlib.reload(guard)
+    assert guard.UNAVAILABLE == UNAVAILABLE
 
 
 # --- the origin pin ------------------------------------------------------------------
@@ -215,52 +210,6 @@ def test_availability_distinguishes_the_package_from_the_binary(monkeypatch):
 # --- driving a real page ----------------------------------------------------------------
 
 
-class _Server:
-    """A local HTTP server, because `file://` has no origin worth pinning.
-
-    `redirect_to` serves a real 302 from `/away`, which is what makes the
-    redirect test deterministic -- a `<meta refresh>` races the load state.
-    """
-
-    redirect_to: str | None = None
-
-    def __init__(self, root: Path, redirect_to: str | None = None) -> None:
-        self.redirect_to = redirect_to
-        outer = self
-
-        def _do_get(handler_self):
-            if outer.redirect_to and handler_self.path.rstrip("/").endswith("away"):
-                handler_self.send_response(302)
-                handler_self.send_header("Location", outer.redirect_to)
-                handler_self.end_headers()
-                return
-            http.server.SimpleHTTPRequestHandler.do_GET(handler_self)
-
-        handler = type(
-            "H",
-            (http.server.SimpleHTTPRequestHandler,),
-            {
-                "directory": str(root),
-                "log_message": lambda *a, **k: None,
-                "do_GET": _do_get,
-                "__init__": lambda self, *a, **k: http.server.SimpleHTTPRequestHandler.__init__(
-                    self, *a, directory=str(root), **k
-                ),
-            },
-        )
-        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        self.port = self._httpd.server_address[1]
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-
-    def __enter__(self) -> str:
-        self._thread.start()
-        return f"http://127.0.0.1:{self.port}"
-
-    def __exit__(self, *exc: object) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
-
-
 _OVERLAP = """<!doctype html><html><body style="margin:0">
 <button id="a" style="position:absolute;left:0;top:0;width:100px;height:40px">A</button>
 <button id="b" style="position:absolute;left:60px;top:0;width:100px;height:40px">B</button>
@@ -272,47 +221,47 @@ _CLEAN = """<!doctype html><html><body style="margin:0">
 </body></html>"""
 
 
-@_needs_browser
+@needs_browser
 def test_a_real_overlap_is_measured_from_the_dom(tmp_path):
     """The claim this lens exists to make, measured rather than described."""
     (tmp_path / "index.html").write_text(_OVERLAP, encoding="utf-8")
-    with _Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
+    with Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
         a = page.box("#a")
         b = page.box("#b")
         assert a is not None and b is not None
         assert a.intersection_area(b) > 0, "two overlapping buttons measured apart"
 
 
-@_needs_browser
+@needs_browser
 def test_a_clean_page_measures_no_overlap(tmp_path):
     """The counterweight. A measure that always finds an overlap finds nothing."""
     (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
-    with _Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
+    with Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
         assert page.box("#a").intersection_area(page.box("#b")) == 0.0
 
 
-@_needs_browser
+@needs_browser
 def test_an_absent_element_is_none_not_a_zero_box(tmp_path):
     """An element that is not there and one collapsed to nothing are different
     findings, and a zero box makes the first look like the second."""
     (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
-    with _Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
+    with Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
         assert page.box("#nonexistent") is None
 
 
-@_needs_browser
+@needs_browser
 def test_navigating_off_the_origin_is_refused(tmp_path):
     (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
     # NOT combined into one `with`, though SIM117 asks for it. Folding
     # `pytest.raises` into the same statement changes the teardown order and the
     # browser is closed while the page is still being unwound -- measured, it
     # raises TargetClosedError instead of the BrowserError under test.
-    with _Server(tmp_path) as base, rendered(f"{base}/index.html") as page:  # noqa: SIM117
+    with Server(tmp_path) as base, rendered(f"{base}/index.html") as page:  # noqa: SIM117
         with pytest.raises(BrowserError, match="pinned"):
             page.goto("http://example.test/")
 
 
-@_needs_browser
+@needs_browser
 def test_a_redirect_off_the_origin_is_caught_after_the_fact(tmp_path):
     """The check-then-navigate gap, forced deterministically.
 
@@ -323,7 +272,7 @@ def test_a_redirect_off_the_origin_is_caught_after_the_fact(tmp_path):
     surviving a mutation battery.
     """
     (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
-    server = _Server(tmp_path)
+    server = Server(tmp_path)
     # `localhost`, not `example.test`. The target has to RESOLVE: redirecting
     # somewhere that does not, Playwright fails with ERR_NAME_NOT_RESOLVED
     # before the origin check runs, and the test then proves the browser
@@ -340,16 +289,16 @@ def test_a_redirect_off_the_origin_is_caught_after_the_fact(tmp_path):
             page.goto(f"{base}/away")
 
 
-@_needs_browser
+@needs_browser
 def test_a_screenshot_lands_where_it_was_asked_to(tmp_path):
     (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
     shot = tmp_path / "shot.png"
-    with _Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
+    with Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
         page.screenshot(shot)
     assert shot.exists() and shot.stat().st_size > 0
 
 
-@_needs_browser
+@needs_browser
 def test_the_viewport_is_the_one_that_was_declared(tmp_path):
     """A geometry finding is only true AT a viewport. Measuring at the wrong one
     reports a defect nobody can see."""
@@ -358,13 +307,13 @@ def test_the_viewport_is_the_one_that_was_declared(tmp_path):
         '<div id="full" style="width:100%;height:10px"></div></body>',
         encoding="utf-8",
     )
-    with _Server(tmp_path) as base, rendered(
+    with Server(tmp_path) as base, rendered(
         f"{base}/index.html", viewport=(640, 480)
     ) as page:
         assert page.box("#full").width == pytest.approx(640, abs=1)
 
 
-@_needs_browser
+@needs_browser
 def test_rendering_a_page_starts_the_driver_exactly_once(tmp_path, monkeypatch):
     """The assertion behind the claim, in the same commit as the claim.
 
@@ -385,14 +334,14 @@ def test_rendering_a_page_starts_the_driver_exactly_once(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sync_api, "sync_playwright", _counted)
     (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
-    with _Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
+    with Server(tmp_path) as base, rendered(f"{base}/index.html") as page:
         assert page.box("#a") is not None
     assert len(starts) == 1, (
         f"one page render started {len(starts)} driver sessions, not 1"
     )
 
 
-@_needs_browser
+@needs_browser
 def test_a_page_that_navigates_itself_is_refused_before_it_is_measured(tmp_path):
     """The time-of-check gap `goto` alone leaves open.
 
@@ -402,7 +351,7 @@ def test_a_page_that_navigates_itself_is_refused_before_it_is_measured(tmp_path)
     about the app under test.
     """
     (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
-    server = _Server(tmp_path)
+    server = Server(tmp_path)
     with server as base, rendered(f"{base}/index.html") as page:
         # Move the page off-origin behind the adapter's back, exactly as a
         # delayed client-side redirect would.
