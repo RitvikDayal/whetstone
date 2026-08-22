@@ -585,7 +585,14 @@ def test_a_written_report_path_carrying_escapes_cannot_drive_the_terminal(
     _write_config(tmp_path)
     esc = chr(27)
     hostile = tmp_path / "report.html"
-    disguised = f"{hostile}{esc}]0;OWNED{chr(7)}{esc}[2J"
+    # A RICH LINK ALONGSIDE THE ESCAPES. Two different surfaces: the control
+    # characters drive the terminal, the markup addresses Rich -- which has
+    # markup ON for this call, so an unescaped path renders as a clickable
+    # hyperlink pointing wherever the path said.
+    disguised = (
+        f"{hostile}{esc}]0;OWNED{chr(7)}{esc}[2J"
+        f"[link=file:///etc/passwd]not-your-report[/link]"
+    )
 
     monkeypatch.setattr(
         "whetstone.cli.write_report", lambda *a, **k: disguised
@@ -598,6 +605,13 @@ def test_a_written_report_path_carrying_escapes_cannot_drive_the_terminal(
     screen = _flattened(result.stdout)
     assert "Wrote" in screen, screen
     assert "x1b" in screen, "the control characters were dropped rather than shown"
+    # AND THE PATH IS STILL THERE. Without this the test passes if the whole
+    # path is replaced by the word it is scanning for.
+    assert "report.html" in screen, screen
+    # The markup must survive as TEXT rather than becoming a link.
+    assert "[link=" in screen, (
+        "Rich parsed the path as markup, so it rendered as a hyperlink"
+    )
 
 
 def test_a_doctor_detail_carrying_escapes_cannot_drive_the_terminal(
@@ -624,9 +638,14 @@ def test_a_doctor_detail_carrying_escapes_cannot_drive_the_terminal(
 
     assert esc not in result.stdout, "an escape sequence reached the terminal"
     assert chr(7) not in result.stdout, "a BEL reached the terminal"
-    assert "x1b" in _flattened(result.stdout), (
-        "the control characters were dropped rather than shown"
-    )
+    screen = _flattened(result.stdout)
+    assert "x1b" in screen, "the control characters were dropped rather than shown"
+    # AND THE DIAGNOSTIC IS STILL A DIAGNOSTIC. Every assertion above passes if
+    # `detail` is replaced wholesale by the literal string this one scans for,
+    # which would leave the user a check that failed and no idea why.
+    assert result.exit_code == 1, result.stdout
+    assert "not found at /opt" in screen, screen
+    assert "/chrome" in screen, screen
 
 
 def test_a_skip_with_unbalanced_brackets_does_not_crash_the_run(

@@ -491,4 +491,11 @@ def report(
     # soft_wrap: Rich wraps to the terminal by default, which broke the path
     # across two lines mid-directory and made the one thing on this line worth
     # having -- something to copy and paste -- unusable.
-    console.print(f"[green]Wrote[/green] {_printable(str(written))}", soft_wrap=True)
+    # BOTH GUARDS. `_printable` stops the path DRIVING the terminal; `escape`
+    # stops it addressing Rich, which is a separate surface -- markup is on for
+    # this call, so `[link=file:///etc/passwd]report[/link]` in a path renders
+    # as a clickable hyperlink pointing somewhere the user did not ask for.
+    console.print(
+        f"[green]Wrote[/green] {escape(_printable(str(written)))}",
+        soft_wrap=True,
+    )
