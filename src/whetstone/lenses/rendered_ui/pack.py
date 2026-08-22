@@ -116,8 +116,21 @@ def _viewports(ctx: RunContext) -> tuple[tuple[int, int], ...]:
     return tuple(out)
 
 
-def _float_option(ctx: RunContext, key: str, fallback: float) -> float:
-    """A declared threshold, or the default -- and it says when it substitutes."""
+def _float_option(
+    ctx: RunContext, key: str, fallback: float, *, ceiling: float | None = None
+) -> float:
+    """A declared threshold, or the default -- and it says when it substitutes.
+
+    `ceiling` is for options where a large value does not mean "be generous" but
+    "stop checking". `stability_tolerance` is one: `_agrees` reads
+    `abs(first - second) / smaller <= tolerance`, so anything above 1.0 lets the
+    two passes differ by more than the whole smaller measurement and still
+    count as agreement. At 10, a pair measuring 500 square pixels and then 5
+    agrees and is reported -- which is exactly the coin flip the second pass
+    exists to catch, switched off from a config file. Clamped, not refused, and
+    the clamp is reported: the user asked for something looser than the lens
+    can honestly offer, and the run says which it used.
+    """
     if key not in ctx.options:
         return fallback
     value = ctx.options[key]
@@ -138,6 +151,13 @@ def _float_option(ctx: RunContext, key: str, fallback: float) -> float:
             f"non-negative number, so {fallback} was used instead."
         )
         return fallback
+    if ceiling is not None and value > ceiling:
+        ctx.skip(
+            f"rendered-ui: `options.{key}` is {value!r}, above the {ceiling} "
+            f"ceiling this lens can honour, so {ceiling} was used instead. "
+            f"Above it the second pass stops being a check."
+        )
+        return float(ceiling)
     return float(value)
 
 
@@ -257,8 +277,14 @@ class RenderedUiPack:
             viewports,
             shots,
             min_overlap_px=_float_option(ctx, "min_overlap_px", DEFAULT_MIN_OVERLAP_PX),
+            # CEILING 1.0. Above that the two passes may differ by more than
+            # the whole smaller measurement and still "agree", so the stability
+            # guarantee the second render exists to provide is gone.
             tolerance=_float_option(
-                ctx, "stability_tolerance", DEFAULT_STABILITY_TOLERANCE
+                ctx,
+                "stability_tolerance",
+                DEFAULT_STABILITY_TOLERANCE,
+                ceiling=1.0,
             ),
         )
         for reason in measured.skips:

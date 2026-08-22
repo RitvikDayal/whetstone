@@ -1,21 +1,17 @@
-# Publish to PyPI on a tag, and only on a tag.
+# Verify and build on a tag. This workflow does NOT publish -- see the note
+# where the publish job used to be, at the bottom.
 #
-# NOTHING HERE RUNS UNTIL SOMEBODY PUSHES `v*`. That is the whole safety
-# property: a merge to `main` cannot publish, and neither can a workflow_dispatch,
-# because there is not one.
+# NOTHING HERE RUNS UNTIL SOMEBODY PUSHES `v*`. A merge to `main` cannot start
+# it, and neither can a workflow_dispatch, because there is not one.
 #
 # THE TESTS RUN AGAIN HERE rather than trusting the CI run on the merge commit.
 # A tag can point at any commit, including one CI never saw, and "it was green on
 # main" is not the same claim as "it is green at the thing being published".
 #
-# TRUSTED PUBLISHING, no API token in a secret. PyPI verifies the workflow
-# identity through OIDC, which is why `id-token: write` is here and why there is
-# no `password:`. The publisher has to be configured on PyPI for this repository
-# and this workflow filename before the first release will go through.
-#
-# A TAG IS NOT SUFFICIENT TO PUBLISH -- see the `publish` job. `environment:
-# release` reads like a gate and is not one on this repository, so the gate is
-# written down here instead of assumed.
+# NO CREDENTIAL OF ANY KIND is available to this workflow: no `id-token: write`,
+# no PyPI token, nothing beyond `contents: read`. That is deliberate and it is
+# the point -- a tag can be pushed by anything holding write access, and a tag
+# that cannot reach a credential cannot ship a release.
 name: release
 
 on:
@@ -87,42 +83,34 @@ jobs:
           name: dist
           path: dist/
 
-  publish:
-    name: publish to PyPI
-    needs: build
-    runs-on: ubuntu-latest
-
-    # THE TAG IS NOT THE GATE, THIS LINE IS.
-    #
-    # `environment: release` below looks like an approval gate and is not one
-    # here. Checked against the API on 2026-08-22: the `release` environment
-    # does not exist (404), and this repository cannot create a protected one --
-    # deployment protection rules and tag rulesets on a PRIVATE repo need a paid
-    # plan, and the rulesets API answers 403 "Upgrade to GitHub Pro or make this
-    # repository public". GitHub would have created the environment unprotected
-    # on first use and published unattended, which is the opposite of what
-    # naming it implied.
-    #
-    # So publication takes a second deliberate act that lives outside the tag:
-    # the repository variable PUBLISH_TO_PYPI must read `true`, set by hand
-    # before the tag and unset after. A tag pushed by anything else -- a script,
-    # a mistake, a compromised token that can write refs -- builds and verifies
-    # and stops here.
-    #
-    # WHEN THE REPO IS PUBLIC, or on a plan that can protect the environment:
-    # delete this `if:`, configure required reviewers on `release` and a tag
-    # ruleset on `v*`. Those are the controls this line is standing in for, and
-    # they are better because they cannot be flipped by the same person in the
-    # same breath as the tag.
-    if: vars.PUBLISH_TO_PYPI == 'true'
-    environment: release
-    permissions:
-      # Trusted Publishing exchanges this for a short-lived PyPI credential.
-      # Nothing else in the job needs it, and the top-level grant stays read.
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+  # THERE IS NO PUBLISH JOB, AND THAT IS THE CONTROL.
+  #
+  # There was one, gated on a repository variable. That gate does not hold: a
+  # tag push runs the workflow definition FROM THE TAGGED COMMIT, and PyPI
+  # Trusted Publishing identifies the repository and the workflow filename --
+  # never a commit SHA. So anything able to push a commit and a `v*` tag can
+  # delete the gate in the same commit it tags, and publish with
+  # `id-token: write`. A check the attacker edits is not a check.
+  #
+  # `environment: release` did not help either. Verified against the API on
+  # 2026-08-22: the environment does not exist (404), and this repository
+  # cannot create a protected one -- deployment protection rules and tag
+  # rulesets on a PRIVATE repo need a paid plan, and the rulesets API answers
+  # 403 "Upgrade to GitHub Pro or make this repository public". GitHub would
+  # have created it unprotected on first use and published unattended.
+  #
+  # With no enforceable control available on this plan, the honest shape is to
+  # not have the capability at all. A tag still verifies on four legs, checks
+  # that the tag and the built version agree, runs the wheel from a clean venv,
+  # and uploads `dist/` as an artifact. Publication is then a deliberate manual
+  # act against a build somebody has looked at.
+  #
+  # TO BRING IT BACK, all three, not any one of them:
+  #   1. The repo is public, or on a plan with deployment protection rules.
+  #   2. `release` exists as an environment with required reviewers, and a
+  #      ruleset restricts who may push `v*`.
+  #   3. Trusted Publishing is configured on PyPI for this repo and for THIS
+  #      filename -- renaming the file silently breaks the identity it asserts.
+  # Then add the job back with `environment: release` and `id-token: write`,
+  # and no `if:` -- the environment is the gate, and unlike an `if:` it is not
+  # part of the commit being tagged.

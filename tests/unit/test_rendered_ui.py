@@ -17,6 +17,7 @@ skipping silently on a green leg. Both now come from `tests/_browser.py`.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -758,9 +759,17 @@ def test_inside_follows_a_symlink_out_of_the_root(tmp_path):
     try:
         link.symlink_to(outside, target_is_directory=True)
     except (OSError, NotImplementedError) as exc:  # pragma: no cover
-        # Windows needs Developer Mode or elevation for this. Skipped rather
-        # than silently passing: a containment test that cannot make the link
-        # has not tested containment.
+        # A SKIP THAT COULD BECOME PERMANENT ON A LEG IS NOT A PASS. Windows
+        # needs Developer Mode or elevation to create one, so on a developer
+        # box this is a legitimate skip -- but on CI a silent skip means the
+        # two Windows legs carry no symlink containment coverage at all and
+        # stay green, which is the defect `tests/_browser.py` exists to stop
+        # for the browser binary. Same rule here: loud where it is expected.
+        if os.environ.get("CI"):
+            raise AssertionError(
+                f"a directory symlink could not be created on CI, so symlink "
+                f"containment went unchecked on this leg: {exc}"
+            ) from exc
         pytest.skip(f"cannot create a directory symlink here: {exc}")
 
     assert _inside(root, link / "a.png") is False
@@ -822,6 +831,71 @@ def test_a_non_finite_threshold_is_refused(tmp_path, declared):
     ctx = _ctx(tmp_path, min_overlap_px=declared)
     assert _float_option(ctx, "min_overlap_px", 4.0) == 4.0
     assert any("min_overlap_px" in s for s in ctx.skips), ctx.skips
+
+
+def test_a_tolerance_above_one_is_clamped_with_a_reason(tmp_path):
+    """`_agrees` reads `abs(first - second) / smaller <= tolerance`, so anything
+    above 1.0 lets the two passes differ by MORE than the whole smaller
+    measurement and still count as agreement. At 10, a pair measuring 500
+    square pixels and then 5 agrees and gets reported -- the exact coin flip
+    the second render exists to catch, switched off from a config file."""
+    from whetstone.lenses.rendered_ui.pack import _float_option
+
+    ctx = _ctx(tmp_path, stability_tolerance=10)
+    assert _float_option(ctx, "stability_tolerance", 0.25, ceiling=1.0) == 1.0
+    assert any("ceiling" in s for s in ctx.skips), ctx.skips
+
+
+def test_a_tolerance_at_the_ceiling_is_not_a_complaint(tmp_path):
+    """The boundary belongs to the caller, or every run at 1.0 carries a false
+    reason."""
+    from whetstone.lenses.rendered_ui.pack import _float_option
+
+    ctx = _ctx(tmp_path, stability_tolerance=1.0)
+    assert _float_option(ctx, "stability_tolerance", 0.25, ceiling=1.0) == 1.0
+    assert not ctx.skips, ctx.skips
+
+
+def test_the_clamped_tolerance_is_what_capture_actually_receives(
+    monkeypatch, tmp_path
+):
+    """THE CLAMP HAS TO REACH `capture()`. Clamping inside a helper whose
+    result nobody passes on is the defect `max_checks` had two rounds ago: a
+    bound the caller believes it set and nothing enforces. Asserted on the
+    argument `capture` is actually called with, not on the source text."""
+    from whetstone.lenses.rendered_ui import pack as pack_module
+
+    seen = {}
+
+    def spy(*args, **kwargs):
+        from whetstone.lenses.rendered_ui.capture import CaptureResult
+
+        seen.update(kwargs)
+        return CaptureResult((), ())
+
+    monkeypatch.setattr(pack_module, "capture", spy)
+    pack = RenderedUiPack(
+        provider=_FakeProvider(
+            {
+                "checks": [
+                    {
+                        "route": "/x",
+                        "selector_a": "#a",
+                        "selector_b": "#b",
+                        "why": "y",
+                    }
+                ],
+                "notes": None,
+            }
+        )
+    )
+    ctx = _ctx(tmp_path, base_url="http://127.0.0.1:3000", stability_tolerance=10)
+    pack._collect(ctx)
+
+    assert seen, "capture() was never reached, so this asserts nothing"
+    assert seen["tolerance"] == 1.0, (
+        f"capture() was handed an unclamped tolerance: {seen.get('tolerance')!r}"
+    )
 
 
 def test_a_declared_threshold_is_used_without_complaint(tmp_path):
