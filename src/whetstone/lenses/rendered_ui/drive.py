@@ -163,6 +163,14 @@ def _check_problem(origin: Origin, raw: object) -> str | None:
         value = raw.get(key)
         if not isinstance(value, str) or not value.strip():
             return f"{key} {value!r} is not a selector"
+    why = raw.get("why")
+    if not isinstance(why, str) or not why.strip():
+        # THE CONTRACT REQUIRES IT and the contract is the model's side of the
+        # claim. `str(raw.get("why") or "")` turned a null into "" and a dict
+        # into its repr, so a Check reached the report carrying either no
+        # reason to measure the pair or a fragment of Python -- and `why` is
+        # what a reader uses to judge whether the proposal was sensible at all.
+        return f"why {why!r} is not a reason to measure this pair"
     if raw["selector_a"].strip() == raw["selector_b"].strip():
         return (
             f"selector_a and selector_b are both {raw['selector_a']!r}. An "
@@ -317,7 +325,9 @@ def drive(
                 route=raw["route"],
                 selector_a=raw["selector_a"].strip(),
                 selector_b=raw["selector_b"].strip(),
-                why=str(raw.get("why") or "").strip(),
+                # Validated by `_check_problem`, so this is a str with
+                # content; no `or ""` fallback to hide a contract breach.
+                why=raw["why"].strip(),
             )
         )
     if not raw_checks and not notes:

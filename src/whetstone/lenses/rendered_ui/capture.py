@@ -237,6 +237,24 @@ def capture(
                 )
                 continue
 
+            # THE SECOND PASS TOO, and it needs its own branch rather than
+            # riding on `_agrees`. A selector the second render could not find
+            # scores 0.0, and where the FIRST pass also measured 0.0 the two
+            # "agree" -- so a pair that was never measured twice fell through
+            # to the zero branch below and was discarded as a clean page with
+            # nothing said. A real overlap in the first pass is caught by
+            # `_agrees` already, because 500 against 0 is a disagreement; this
+            # is the case where zero hides a failure to look.
+            if second.missing:
+                _discard_shot(shot)
+                skips.append(
+                    f"rendered-ui [{check.route} @ {width}x{height}]: "
+                    f"{', '.join(repr(s) for s in second.missing)} matched no "
+                    f"element on the second render, so the pair was measured "
+                    f"once rather than twice and nothing here reproduced."
+                )
+                continue
+
             if not _agrees(first.overlap_px, second.overlap_px, tolerance):
                 _discard_shot(shot)
                 skips.append(

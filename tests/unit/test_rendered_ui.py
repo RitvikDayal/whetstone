@@ -864,6 +864,82 @@ def test_a_withdrawn_screenshot_is_not_cited_when_the_unlink_fails(
     assert any("layout moved" in s for s in result.skips), result.skips
 
 
+def test_a_selector_missing_on_the_second_render_is_reported(monkeypatch, tmp_path):
+    """ZERO HID A FAILURE TO LOOK. A selector the second render cannot find
+    scores 0.0, and where the first pass also measured 0.0 the two "agree" --
+    so a pair that was never measured twice fell through the zero branch and
+    was discarded as a clean page with nothing said. A real overlap in the
+    first pass is already caught, because 500 against 0 is a disagreement."""
+    from whetstone.lenses.rendered_ui import capture as capture_module
+    from whetstone.lenses.rendered_ui.capture import Measurement
+
+    check = Check("/x", "#a", "#b", "y")
+
+    def half_blind(origin, chk, viewport, shot_path):
+        if shot_path is not None:
+            shot_path.write_bytes(b"png")
+            # Both found, genuinely apart: a clean measurement.
+            return Measurement(
+                chk, viewport, Box(0, 0, 10, 10), Box(90, 0, 10, 10), 0.0, shot_path
+            )
+        # Second render: `#b` is gone. Scores 0.0 for a different reason.
+        return Measurement(chk, viewport, Box(0, 0, 10, 10), None, 0.0, None)
+
+    monkeypatch.setattr(capture_module, "measure_one", half_blind)
+    result = capture_module.capture(
+        _origin(), (check,), ((1280, 800),), tmp_path
+    )
+
+    assert result.overlaps == ()
+    assert any("second render" in s for s in result.skips), result.skips
+    assert any("'#b'" in s for s in result.skips), result.skips
+
+
+def test_both_renders_finding_both_selectors_stays_silent(monkeypatch, tmp_path):
+    """The new branch must not fire on the ordinary clean page, or every
+    correct interface reports a skip."""
+    from whetstone.lenses.rendered_ui import capture as capture_module
+    from whetstone.lenses.rendered_ui.capture import Measurement
+
+    check = Check("/x", "#a", "#b", "y")
+
+    def apart(origin, chk, viewport, shot_path):
+        if shot_path is not None:
+            shot_path.write_bytes(b"png")
+        return Measurement(
+            chk, viewport, Box(0, 0, 10, 10), Box(90, 0, 10, 10), 0.0, shot_path
+        )
+
+    monkeypatch.setattr(capture_module, "measure_one", apart)
+    result = capture_module.capture(_origin(), (check,), ((1280, 800),), tmp_path)
+
+    assert result.overlaps == ()
+    assert result.skips == (), result.skips
+
+
+@pytest.mark.parametrize(
+    "why", [None, "", "   ", 3, {"reason": "x"}, []],
+    ids=["null", "empty", "blank", "int", "object", "list"],
+)
+def test_a_check_without_a_real_why_is_discarded(tmp_path, why):
+    """`str(raw.get("why") or "")` turned a null into "" and a dict into its
+    repr, so a Check reached the report carrying either no reason to measure
+    the pair or a fragment of Python. `why` is what a reader uses to judge
+    whether the proposal was sensible at all."""
+    provider = _FakeProvider(
+        {
+            "checks": [
+                {"route": "/x", "selector_a": "#a", "selector_b": "#b", "why": why}
+            ],
+            "notes": None,
+        }
+    )
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+
+    assert result.checks == ()
+    assert any("is not a reason to measure" in s for s in result.skips), result.skips
+
+
 def test_a_still_layout_keeps_its_screenshot(monkeypatch, tmp_path):
     """The withdrawal must not fire on the ordinary case, or every finding
     loses its evidence and every run carries a false reason."""
