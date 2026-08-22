@@ -63,6 +63,19 @@ class DriveResult(NamedTuple):
     notes: tuple[str, ...]
 
 
+def _schema_ceiling() -> int | None:
+    """The most checks the drive contract permits in one answer, or None.
+
+    READ FROM THE SCHEMA, not restated here. Two numbers that must agree and
+    live in different files do not stay agreed, and the failure is silent: the
+    prompt asks for a cap the model is structurally unable to deliver. None
+    means the contract sets no ceiling, which is a reason not to clamp rather
+    than a reason to fall back to the default.
+    """
+    ceiling = load_schema("drive").get("properties", {}).get("checks", {}).get("maxItems")
+    return ceiling if isinstance(ceiling, int) and ceiling > 0 else None
+
+
 def _max_checks(ctx: RunContext) -> tuple[int, str | None]:
     """The cap to enforce, and why a configured value was refused.
 
@@ -83,6 +96,18 @@ def _max_checks(ctx: RunContext) -> tuple[int, str | None]:
             f"`options.max_checks` is {value!r}, which is not a positive whole "
             f"number. The cap fell back to {_DEFAULT_MAX_CHECKS}, so this run "
             f"measured less than you configured."
+        )
+    ceiling = _schema_ceiling()
+    if ceiling is not None and value > ceiling:
+        # ABOVE THE CONTRACT IS ALSO DECLINING TO DO WORK. `max_checks: 20`
+        # put 20 in the prompt while the schema refuses an answer longer than
+        # 12, so the run measured less than it was configured for and the
+        # truncation branch never fired to say so -- the cap was never reached
+        # because it could not be.
+        return ceiling, (
+            f"`options.max_checks` is {value}, above the {ceiling} the drive "
+            f"contract allows in one answer. The cap is {ceiling}; a larger "
+            f"one could not have been filled."
         )
     return value, None
 

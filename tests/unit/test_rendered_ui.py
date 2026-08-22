@@ -405,6 +405,16 @@ def test_an_overlap_below_the_floor_is_not_reported(tmp_path):
             min_overlap_px=DEFAULT_MIN_OVERLAP_PX,
         )
     assert result.overlaps == ()
+    # THE SKIP, not only the absence. `overlaps == ()` is equally true when the
+    # intersection is exactly zero, and that is a different fact reached by a
+    # different branch -- `capture()` records a reason only while
+    # `0 < smaller < floor`. Were a layout engine to round 99.5px up to 100px
+    # the overlap would be zero, this assertion alone would still pass, and
+    # nothing about the floor would have been tested. Asserting the reason
+    # means that day shows up as a red test rather than as silence.
+    assert len(result.skips) == 1, result.skips
+    assert "below the" in result.skips[0], result.skips[0]
+    assert "floor and was not reported" in result.skips[0], result.skips[0]
 
 
 @needs_browser
@@ -526,6 +536,42 @@ def test_a_refused_max_checks_survives_an_early_return(tmp_path):
     assert any("max_checks" in s for s in result.skips), (
         "the denial discarded the reason the cap was refused"
     )
+
+
+def test_a_cap_above_the_contract_is_clamped_with_a_reason(tmp_path):
+    """`max_checks: 20` asked the prompt for 20 while the schema refuses an
+    answer longer than 12. The run measured less than it was configured for and
+    the truncation branch could never fire to say so, because a cap that cannot
+    be filled is never reached."""
+    provider = _FakeProvider({"checks": [], "notes": None})
+    result = drive(_ctx(tmp_path, max_checks=20), provider, _origin(), ((1280, 800),))
+
+    assert any("above the 12" in s for s in result.skips), result.skips
+    assert "Return at most 12 checks" in provider.requests[0].prompt
+
+
+def test_the_clamp_reads_the_ceiling_rather_than_restating_it(tmp_path, monkeypatch):
+    """A hardcoded 12 passes the test above and fails this one. Two numbers
+    that must agree and live in different files do not stay agreed."""
+    from whetstone.lenses.rendered_ui import drive as drive_module
+
+    monkeypatch.setattr(
+        drive_module,
+        "load_schema",
+        lambda name: {"properties": {"checks": {"maxItems": 4}}},
+    )
+    cap, reason = drive_module._max_checks(_ctx(tmp_path, max_checks=9))
+
+    assert cap == 4
+    assert reason is not None and "above the 4" in reason
+
+
+def test_a_cap_at_the_ceiling_is_not_a_refusal(tmp_path):
+    """The boundary belongs to the caller. Clamping 12 to 12 and reporting it
+    as declined work would put a false reason in every report."""
+    from whetstone.lenses.rendered_ui.drive import _max_checks
+
+    assert _max_checks(_ctx(tmp_path, max_checks=12)) == (12, None)
 
 
 def test_the_prompt_asks_for_the_cap_that_is_actually_enforced(tmp_path):
