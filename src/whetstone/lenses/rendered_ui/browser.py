@@ -258,7 +258,19 @@ class Page:
         document and report it as evidence about the app under test. Checked
         before every read rather than only at navigation.
         """
-        landed = self._page.url
+        try:
+            landed = self._page.url
+        except Exception as exc:  # noqa: BLE001 - driver errors have no shared base
+            # A CLOSED OR CRASHED PAGE RAISES HERE, and `capture()` catches
+            # only BrowserError -- so a driver error escaped as a traceback
+            # while the same failure one line later became a readable skip.
+            # Converted rather than suppressed: refusing to read is exactly
+            # what this method is for, and "the page is gone" is a reason.
+            raise BrowserError(
+                f"refusing to {what}: the page could not be read at all "
+                f"({type(exc).__name__}: {exc}). Nothing was measured or "
+                f"captured."
+            ) from exc
         if not self.origin.admits(landed):
             # Deliberately says WHERE it is and not WHEN it moved. The same
             # guard serves a redirect during load and a script navigating the

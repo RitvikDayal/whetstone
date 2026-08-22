@@ -235,6 +235,16 @@ def drive(
         )
         return DriveResult((), tuple(skips), tuple(notes))
 
+    if not isinstance(result.data, dict):
+        # `.get()` ON A LIST IS AN AttributeError, and the schema forbidding it
+        # is the model's side of the claim rather than a guarantee. The stage
+        # that dies here takes the lens run with it and records nothing.
+        skips.append(
+            f"drive returned {type(result.data).__name__} as its whole payload "
+            f"rather than an object, so there was nothing to read."
+        )
+        return DriveResult((), tuple(skips), tuple(notes))
+
     # TYPE-GUARDED, though the schema already forbids anything else. This layer
     # exists to recompute what a model claims rather than believe it, and
     # `"notes": 3` reaching `.strip()` ends the lens run with an unhandled
@@ -251,8 +261,18 @@ def drive(
 
     raw_checks = result.data.get("checks")
     if raw_checks is None:
-        raw_checks = []
-    elif not isinstance(raw_checks, list):
+        # ABSENT IS NOT EMPTY. `{}` and `{"checks": null}` used to become a
+        # clean run with no checks, no skips and no notes -- indistinguishable
+        # from a stage that looked at the interface and found it sound, which
+        # is the one thing this pipeline may never be unable to tell apart.
+        # `checks` is required by the contract; its absence is a broken answer.
+        skips.append(
+            "drive returned no `checks` field at all. That is not an empty "
+            "proposal, it is an answer that does not fit the contract, so "
+            "nothing was measured."
+        )
+        return DriveResult((), tuple(skips), tuple(notes))
+    if not isinstance(raw_checks, list):
         # `skips`, not a fresh tuple. Building a new one here discarded the
         # reason recorded two lines above when BOTH fields were malformed -- a
         # path that declines to do work and then drops its own explanation on
@@ -289,5 +309,17 @@ def drive(
                 selector_b=raw["selector_b"].strip(),
                 why=str(raw.get("why") or "").strip(),
             )
+        )
+    if not checks and not notes and not skips:
+        # THE CONTRACT REQUIRES A NOTE WHEN THERE ARE NO CHECKS, and the schema
+        # is the model's side of that. An empty list with a blank note is
+        # indistinguishable from a stage that declined, could not read the
+        # templates, or ran out of budget -- all of which read as a clean
+        # interface. `DriveResult` says an empty proposal is a real answer; an
+        # empty proposal that says nothing is not one.
+        skips.append(
+            "drive proposed nothing and gave no reason. An empty proposal with "
+            "no note cannot be told apart from a stage that declined, so it is "
+            "not being read as a clean interface."
         )
     return DriveResult(tuple(checks), tuple(skips), tuple(notes))

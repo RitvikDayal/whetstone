@@ -16,6 +16,8 @@ that states the claim is the module that enforces it.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 # `tests/` is on the path for both test directories; see `tests/conftest.py`.
@@ -25,6 +27,7 @@ from whetstone.lenses.rendered_ui.browser import (
     Box,
     BrowserError,
     Origin,
+    Page,
     availability,
     rendered,
 )
@@ -127,6 +130,36 @@ def test_browser_error_is_a_whetstone_error():
     """The CLI catches WhetstoneError; anything else reaches a user as a bare
     traceback."""
     assert issubclass(BrowserError, WhetstoneError)
+
+
+def test_a_page_that_cannot_be_read_at_all_becomes_a_browser_error():
+    """`_require_origin` reads `page.url`, and a closed or crashed page raises
+    from that attribute. `capture()` catches only BrowserError, so the driver's
+    exception escaped as a traceback while the identical failure one line later
+    -- a page that moved off-origin -- became a skip reason the user reads.
+
+    No browser needed: the failure is the driver raising, and a stub raises the
+    same way a dead page does.
+    """
+
+    class _Dead:
+        @property
+        def url(self) -> str:
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    page = Page(_Dead(), Origin.parse("http://127.0.0.1:3000"))
+
+    for call, what in (
+        (lambda: page.box("#a"), "measure an element"),
+        (lambda: page.screenshot(Path("shot.png")), "capture a screenshot"),
+    ):
+        with pytest.raises(BrowserError) as caught:
+            call()
+        assert what in str(caught.value)
+        assert "could not be read at all" in str(caught.value)
+        assert "RuntimeError" in str(caught.value), (
+            "the reason the page could not be read is what makes this skip usable"
+        )
 
 
 # --- geometry is arithmetic ------------------------------------------------------------
@@ -273,13 +306,23 @@ def test_a_redirect_off_the_origin_is_caught_after_the_fact(tmp_path):
     """
     (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
     server = Server(tmp_path)
-    # `localhost`, not `example.test`. The target has to RESOLVE: redirecting
-    # somewhere that does not, Playwright fails with ERR_NAME_NOT_RESOLVED
-    # before the origin check runs, and the test then proves the browser
-    # refuses bad DNS rather than that the adapter refuses a foreign origin.
-    # Same port, different host string -- a different origin by the triple,
-    # served by the very same process.
-    server.redirect_to = f"http://localhost:{server.port}/index.html"
+    # A SECOND SERVER, not `localhost` on the same port. The target has to
+    # RESOLVE -- redirect somewhere that does not and Playwright fails with
+    # ERR_NAME_NOT_RESOLVED before the origin check runs, and the test then
+    # proves the browser refuses bad DNS rather than that the adapter refuses a
+    # foreign origin. `localhost` was that reachable target until the Windows
+    # legs started running these: `Server` binds IPv4 only, and where
+    # `localhost` resolves to `::1` first the connection is refused before
+    # anything under test executes. A second listener on a different port is a
+    # different origin by the triple, needs no name resolution at all, and
+    # cannot depend on which family the host prefers.
+    other = Server(tmp_path)
+    with other as other_base:
+        server.redirect_to = f"{other_base}/index.html"
+        _assert_refuses_the_redirect(server, tmp_path)
+
+
+def _assert_refuses_the_redirect(server, tmp_path) -> None:
     with server as base, rendered(f"{base}/index.html") as page:  # noqa: SIM117
         # Matches the phrase naming WHICH guard fired, not a generic word. The
         # post-navigation check and the pre-read checks share one message now,
@@ -352,10 +395,12 @@ def test_a_page_that_navigates_itself_is_refused_before_it_is_measured(tmp_path)
     """
     (tmp_path / "index.html").write_text(_CLEAN, encoding="utf-8")
     server = Server(tmp_path)
-    with server as base, rendered(f"{base}/index.html") as page:
+    other = Server(tmp_path)
+    with other as other_base, server as base, rendered(f"{base}/index.html") as page:
         # Move the page off-origin behind the adapter's back, exactly as a
-        # delayed client-side redirect would.
-        page._page.goto(f"http://localhost:{server.port}/index.html")
+        # delayed client-side redirect would. A second listener rather than
+        # `localhost` on this port, for the reason the redirect test gives.
+        page._page.goto(f"{other_base}/index.html")
         with pytest.raises(BrowserError, match="refusing to measure an element"):
             page.box("#a")
         with pytest.raises(BrowserError, match="refusing to capture a screenshot"):

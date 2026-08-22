@@ -16,6 +16,7 @@ skipping silently on a green leg. Both now come from `tests/_browser.py`.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -264,9 +265,15 @@ def _fixed(overlaps, tmp_path):
 
         area = overlaps[len(calls)]
         calls.append((chk, viewport, shot_path))
-        return Measurement(
-            chk, viewport, Box(0, 0, 10, 10), Box(0, 0, 10, 10), area, shot_path
-        )
+        # BOXES DERIVED FROM THE AREA, not two 10x10 squares alongside an area
+        # of 500. Two identical 10x10 boxes intersect over 100 square pixels at
+        # most, so that Measurement was one no page can produce. Nothing reads
+        # the boxes today, which is exactly how a fictional fixture survives
+        # until the day `capture()` recomputes the area from them and these
+        # tests stay green on data the real system never emits.
+        side = math.sqrt(area) if area > 0 else 0.0
+        box = Box(0, 0, side, side)
+        return Measurement(chk, viewport, box, box, area, shot_path)
 
     return check, calls, fake
 
@@ -477,6 +484,58 @@ def test_a_non_string_notes_value_is_reported_not_raised(tmp_path):
     assert any("rather than text" in s for s in result.skips)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"checks": None}, {"checks": None, "notes": "looked fine"}],
+    ids=["empty-object", "null-checks", "null-checks-with-note"],
+)
+def test_a_payload_without_checks_is_not_a_clean_interface(tmp_path, payload):
+    """ABSENT IS NOT EMPTY. These returned no checks, no skips and no notes --
+    identical to a stage that looked at the interface and found it sound, which
+    is the one pair of outcomes this pipeline may never be unable to tell
+    apart. `checks` is required by the contract; its absence is a broken
+    answer, not a quiet one."""
+    provider = _FakeProvider(payload)
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+
+    assert result.checks == ()
+    assert any("no `checks` field" in s for s in result.skips), result.skips
+
+
+@pytest.mark.parametrize("payload", [[], "checks", 3], ids=["list", "str", "int"])
+def test_a_payload_that_is_not_an_object_is_reported_not_raised(tmp_path, payload):
+    """`.get()` on a list is an AttributeError that takes the lens run with it
+    and records nothing. The schema forbidding this is the model's side of the
+    claim, not a guarantee."""
+    provider = _FakeProvider(payload)
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+
+    assert result.checks == ()
+    assert any("whole payload" in s for s in result.skips), result.skips
+
+
+def test_an_empty_proposal_with_no_note_is_not_read_as_a_clean_interface(tmp_path):
+    """`DriveResult` says an empty proposal is a real answer. An empty proposal
+    that says nothing is not one -- it cannot be told apart from a stage that
+    declined, could not read its templates, or ran out of budget."""
+    provider = _FakeProvider({"checks": [], "notes": "   "})
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+
+    assert result.checks == ()
+    assert any("gave no reason" in s for s in result.skips), result.skips
+
+
+def test_an_empty_proposal_with_a_real_note_is_left_alone(tmp_path):
+    """The complaint above must not fire on the legitimate case, or every
+    sound interface reports a skip."""
+    provider = _FakeProvider({"checks": [], "notes": "nothing overlaps here"})
+    result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
+
+    assert result.checks == ()
+    assert result.skips == (), result.skips
+    assert any("nothing overlaps" in n for n in result.notes)
+
+
 def test_a_non_list_checks_value_is_reported_not_raised(tmp_path):
     provider = _FakeProvider({"checks": {"route": "/"}, "notes": None})
     result = drive(_ctx(tmp_path), provider, _origin(), ((1280, 800),))
@@ -654,8 +713,13 @@ def test_an_empty_provider_name_is_refused_rather_than_defaulted(tmp_path):
     from whetstone.errors import WhetstoneError
 
     pack = RenderedUiPack(provider_name="")
-    with pytest.raises(WhetstoneError):
+    with pytest.raises(WhetstoneError, match=r"no provider named ''"):
         pack._resolve_provider()
+
+    # AND A NAME THAT MUST WORK. A bare `raises(WhetstoneError)` passes just as
+    # well if `_resolve_provider` has started refusing every provider there is,
+    # which would skip the whole lens on every run.
+    assert RenderedUiPack(provider_name="claude-cli")._resolve_provider() is not None
 
 
 @pytest.mark.parametrize(
@@ -683,6 +747,22 @@ def test_an_unusable_threshold_is_never_silently_substituted(tmp_path):
     ctx = _ctx(tmp_path, min_overlap_px=True)
     assert _float_option(ctx, "min_overlap_px", 4.0) == 4.0
     assert any("min_overlap_px" in s for s in ctx.skips)
+
+
+@pytest.mark.parametrize(
+    "declared", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"]
+)
+def test_a_non_finite_threshold_is_refused(tmp_path, declared):
+    """NaN is the dangerous one, and it fails in the INVENTING direction.
+    Every comparison against it is False, so `smaller < min_overlap_px` never
+    holds, the floor stops existing, and a zero-area measurement is reported as
+    an overlap. `inf` fails the other way and suppresses every real finding.
+    Both are floats, and `inf >= 0`, so nothing else here caught them."""
+    from whetstone.lenses.rendered_ui.pack import _float_option
+
+    ctx = _ctx(tmp_path, min_overlap_px=declared)
+    assert _float_option(ctx, "min_overlap_px", 4.0) == 4.0
+    assert any("min_overlap_px" in s for s in ctx.skips), ctx.skips
 
 
 def test_a_declared_threshold_is_used_without_complaint(tmp_path):

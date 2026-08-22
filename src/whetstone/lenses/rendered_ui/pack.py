@@ -25,6 +25,7 @@ see the milestone's verdict.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
@@ -120,7 +121,18 @@ def _float_option(ctx: RunContext, key: str, fallback: float) -> float:
     if key not in ctx.options:
         return fallback
     value = ctx.options[key]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    # `math.isfinite` FIRST, and it is not tidiness. Every comparison against
+    # NaN is False, so `min_overlap_px: nan` makes `smaller < min_overlap_px`
+    # false for every measurement and a ZERO-AREA result is reported as an
+    # overlap -- the lens inventing findings rather than missing them. `inf`
+    # fails the other way and silently suppresses all of them. Both satisfy
+    # `isinstance(value, float)` and `value >= 0`.
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
         ctx.skip(
             f"rendered-ui: `options.{key}` is {value!r}, which is not a "
             f"non-negative number, so {fallback} was used instead."
