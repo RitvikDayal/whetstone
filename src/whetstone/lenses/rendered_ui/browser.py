@@ -301,17 +301,39 @@ class Page:
         the first look like the second.
         """
         self._require_origin("measure an element")
-        element = self._page.query_selector(selector)
-        if element is None:
-            return None
-        raw = element.bounding_box()
+        try:
+            element = self._page.query_selector(selector)
+            if element is None:
+                return None
+            raw = element.bounding_box()
+        except Exception as exc:  # noqa: BLE001 - driver errors share no base
+            # THE SELECTOR CAME FROM A MODEL. `check.selector_a` is drive-stage
+            # payload, so `div[` or `:has(` reaches Playwright's parser and
+            # raises from there -- and the page can also close between the
+            # origin check above and this call, a window that check cannot
+            # shut. `capture()` catches only BrowserError, so both ended the
+            # run in a traceback while a page that moved off-origin one line
+            # earlier produced a readable skip. The selector travels: which of
+            # the two it was is the whole diagnosis.
+            raise BrowserError(
+                f"could not measure {selector!r}: {type(exc).__name__}: {exc}"
+            ) from exc
         if raw is None:
             return None
         return Box(raw["x"], raw["y"], raw["width"], raw["height"])
 
     def screenshot(self, path: Path) -> None:
         self._require_origin("capture a screenshot")
-        self._page.screenshot(path=str(path))
+        try:
+            self._page.screenshot(path=str(path))
+        except Exception as exc:  # noqa: BLE001 - driver errors share no base
+            # A FULL OR READ-ONLY DISK, or a page that died mid-write. The
+            # image is the evidence, so failing to write it is exactly the
+            # thing a reader must be told rather than left to infer.
+            raise BrowserError(
+                f"could not capture a screenshot to {path}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
 
 @contextmanager

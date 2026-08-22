@@ -220,6 +220,38 @@ def test_a_browser_that_cannot_start_becomes_a_browser_error(monkeypatch):
     assert "no usable sandbox" in str(caught.value)
 
 
+def test_a_driver_error_while_reading_becomes_a_browser_error(tmp_path):
+    """THE SELECTOR CAME FROM A MODEL. `check.selector_a` is drive-stage
+    payload, so a malformed one reaches Playwright's parser and raises there.
+    The page can also die between the origin check and the read, a window that
+    check cannot shut. `capture()` catches only BrowserError."""
+
+    class _Breaking:
+        url = "http://127.0.0.1:3000/x"
+
+        def query_selector(self, selector):
+            raise RuntimeError(f"Unexpected token while parsing {selector!r}")
+
+        def screenshot(self, path=None):
+            raise OSError(28, "No space left on device")
+
+    page = Page(_Breaking(), Origin.parse("http://127.0.0.1:3000"))
+
+    with pytest.raises(BrowserError) as caught:
+        page.box("div[")
+    assert "could not measure" in str(caught.value)
+    assert "div[" in str(caught.value), (
+        "which selector failed is the whole diagnosis, and a model wrote it"
+    )
+
+    shot = tmp_path / "shot.png"
+    with pytest.raises(BrowserError) as caught:
+        page.screenshot(shot)
+    assert "could not capture a screenshot" in str(caught.value)
+    assert "No space left on device" in str(caught.value)
+    assert not shot.exists()
+
+
 # --- geometry is arithmetic ------------------------------------------------------------
 
 
