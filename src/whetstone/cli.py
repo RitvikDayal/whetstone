@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from pathlib import Path
 
 import typer
@@ -24,6 +25,24 @@ from .report.html import render_report, write_report
 from .runner import RunResult, _now, execute_run, get_last_run
 from .store.db import connect
 from .store.findings import FindingState, list_findings
+
+# Terminal control characters, shown rather than executed. NEITHER
+# `markup=False` NOR `escape()` touches these -- both deal with Rich's own
+# markup, and Rich's sanitiser drops a small set of control characters while
+# letting ESC through. Every string this is applied to is written by a model
+# or read out of the repository under analysis, so `\x1b]0;...` in a
+# subject retitles the reader's window and `\x1b[2J` clears their
+# scrollback -- from a tool they ran to look at someone else's code.
+#
+# Escaped rather than deleted: a subject that silently loses characters is a
+# subject the reader cannot match against their own file.
+_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _printable(text: str) -> str:
+    """*text* with any terminal control character rendered visible and inert."""
+    return _CONTROLS.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
 
 app = typer.Typer(
     add_completion=False,
@@ -253,7 +272,7 @@ def run(
             # moment it prints its results; `[browser]` is silently dropped,
             # turning the one instruction that fixes the problem into a
             # wrong one. Found by running the built wheel.
-            console.print(f"  - {skip}", markup=False)
+            console.print(f"  - {_printable(skip)}", markup=False)
 
     if result.lens_count == 0:
         raise typer.Exit(code=1)
@@ -330,8 +349,8 @@ def findings(
             _grade_cell(row.grade),
             row.severity,
             row.lens,
-            escape(row.subject),
-            escape(row.title[:70]),
+            escape(_printable(row.subject)),
+            escape(_printable(row.title[:70])),
         )
     console.print(table)
 
@@ -367,7 +386,8 @@ def _resolve_finding_id(conn, given: str) -> str:
         )
     if len(matches) > 1:
         listed = "\n".join(
-            f"  {row.id[:_ID_PREFIX]}  {row.subject}  {row.title[:50]}"
+            f"  {row.id[:_ID_PREFIX]}  {_printable(row.subject)}  "
+            f"{_printable(row.title[:50])}"
             for row in matches[:10]
         )
         raise WhetstoneError(
@@ -401,8 +421,8 @@ def decide(
             # Shown before it happens, not after. The id was probably a prefix,
             # so the user has not necessarily seen which finding this is.
             console.print(
-                f"{disposition}: [bold]{escape(row.subject)}[/bold] - "
-                f"{escape(row.title[:70])}"
+                f"{disposition}: [bold]{escape(_printable(row.subject))}"
+                f"[/bold] - {escape(_printable(row.title[:70]))}"
             )
             # Only reject. A prompt on all six is a prompt nobody reads, and
             # the other five are recoverable by deciding again.
@@ -431,7 +451,7 @@ def decide(
         raise typer.Exit(code=1) from exc
 
     console.print(
-        f"[green]{escape(row.subject)} is now {new_state}.[/green]"
+        f"[green]{escape(_printable(row.subject))} is now {new_state}.[/green]"
     )
 
 

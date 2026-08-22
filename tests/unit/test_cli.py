@@ -504,6 +504,48 @@ def test_a_bracketed_skip_reaches_the_user_intact(tmp_path, monkeypatch):
     )
 
 
+def test_a_skip_carrying_terminal_escapes_cannot_drive_the_terminal(
+    tmp_path, monkeypatch
+):
+    """MODEL TEXT REACHES A TERMINAL. Neither `markup=False` nor `escape()`
+    touches ESC -- both deal with Rich's own markup, and Rich's sanitiser drops
+    a small set of control characters while letting ESC through. An OSC
+    sequence in a subject retitles the reader's window; `ESC[2J` clears their
+    scrollback. From a tool they ran to look at somebody else's code."""
+    _write_config(tmp_path)
+    esc = chr(27)
+    hostile = (
+        f"code-defects: subject 'orders.py{esc}]0;OWNED{chr(7)}"
+        f"{esc}[2J' could not be parsed"
+    )
+
+    def _fake_execute_run(conn, cfg, project_root, root, *, tier, changed_only):
+        from whetstone.runner import RunResult
+
+        return RunResult(
+            run_id="run-1",
+            tier=tier,
+            file_count=0,
+            status="complete",
+            lens_count=1,
+            skips=[hostile],
+        )
+
+    monkeypatch.setattr("whetstone.cli.execute_run", _fake_execute_run)
+    result = runner.invoke(app, ["run", "--path", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert esc not in result.stdout, "an escape sequence reached the terminal"
+    assert chr(7) not in result.stdout, "a BEL reached the terminal"
+    # AND THE REASON IS STILL LEGIBLE. Deleting the characters would leave a
+    # subject the reader cannot match against their own file, so they are shown
+    # rather than dropped.
+    screen = _flattened(result.stdout)
+    assert "orders.py" in screen
+    assert "could not be parsed" in screen, screen
+    assert "x1b" in screen, "the control characters were dropped, not shown"
+
+
 def test_a_skip_with_unbalanced_brackets_does_not_crash_the_run(
     tmp_path, monkeypatch
 ):

@@ -1207,6 +1207,19 @@ def test_the_clamped_tolerance_is_what_capture_actually_receives(
     )
 
 
+@pytest.mark.parametrize("declared", [10**400, -(10**400)], ids=["huge", "huge-neg"])
+def test_an_integer_too_large_for_a_float_is_refused_not_raised(tmp_path, declared):
+    """`math.isfinite(10**400)` raises OverflowError -- an int too large to
+    convert never reaches the finiteness test it was supposed to fail, so an
+    option that should have been refused with a reason took the run down
+    instead. One line of YAML can carry an integer that large."""
+    from whetstone.lenses.rendered_ui.pack import _float_option
+
+    ctx = _ctx(tmp_path, min_overlap_px=declared)
+    assert _float_option(ctx, "min_overlap_px", 4.0) == 4.0
+    assert any("min_overlap_px" in s for s in ctx.skips), ctx.skips
+
+
 def test_a_declared_threshold_is_used_without_complaint(tmp_path):
     """The counterweight. A check that fires on the good case teaches people to
     ignore it."""

@@ -140,25 +140,34 @@ def _float_option(
     # overlap -- the lens inventing findings rather than missing them. `inf`
     # fails the other way and silently suppresses all of them. Both satisfy
     # `isinstance(value, float)` and `value >= 0`.
+    try:
+        # CONVERTED FIRST, AND INSIDE THE GUARD. `math.isfinite(10**400)`
+        # raises OverflowError -- an int too large for a float never reaches
+        # the finiteness test it was supposed to fail, so the option that
+        # should have been refused with a reason took the run down instead.
+        # A YAML file can carry an integer that large in one line.
+        number = float(value) if not isinstance(value, bool) else None
+    except (OverflowError, TypeError, ValueError):
+        number = None
     if (
-        isinstance(value, bool)
+        number is None
         or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value < 0
+        or not math.isfinite(number)
+        or number < 0
     ):
         ctx.skip(
             f"rendered-ui: `options.{key}` is {value!r}, which is not a "
             f"non-negative number, so {fallback} was used instead."
         )
         return fallback
-    if ceiling is not None and value > ceiling:
+    if ceiling is not None and number > ceiling:
         ctx.skip(
             f"rendered-ui: `options.{key}` is {value!r}, above the {ceiling} "
             f"ceiling this lens can honour, so {ceiling} was used instead. "
             f"Above it the second pass stops being a check."
         )
         return float(ceiling)
-    return float(value)
+    return number
 
 
 class RenderedUiPack:
@@ -277,9 +286,11 @@ class RenderedUiPack:
         stop = budget.reason()
         if stop is not None:
             ctx.skip(
-                f"rendered-ui: the run-level ceiling stopped this lens before "
-                f"anything was rendered ({stop}). "
-                f"{len(proposal.checks)} proposed checks were not measured."
+                f"rendered-ui: THIS LENS's ceiling stopped it before anything "
+                f"was rendered ({stop}). {len(proposal.checks)} proposed checks "
+                f"were not measured. The ceiling is per lens, not per run -- "
+                f"another model-driven lens can still run and spend. See "
+                f"issue #43."
             )
             return []
 
