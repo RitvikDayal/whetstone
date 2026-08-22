@@ -361,7 +361,21 @@ def rendered(
     # Before the session: a malformed URL should not pay for a driver start.
     origin = Origin.parse(url)
     width, height = viewport
-    with sync_playwright() as play:
+    with contextlib.ExitStack() as stack:
+        try:
+            # STARTING THE DRIVER CAN FAIL ON ITS OWN, and `availability()`
+            # already proves it -- that function wraps this identical call in
+            # `except Exception` and turns the failure into a reason. The probe
+            # `pack._collect` runs happens ONCE per run, while a crawl enters a
+            # new session per render, so a session that dies later was covered
+            # by nothing. ExitStack rather than a bare `with`, so the entry is
+            # inside the guard and teardown still happens on every path.
+            play = stack.enter_context(sync_playwright())
+        except Exception as exc:  # noqa: BLE001 - driver errors share no base
+            raise BrowserError(
+                f"the browser driver could not be started: "
+                f"{type(exc).__name__}: {exc}. Nothing was rendered."
+            ) from exc
         # The binary half, inside the one session this function opens. Calling
         # `availability()` here instead would open a second one per page.
         blocked = _missing_binary(play)
@@ -387,7 +401,7 @@ def rendered(
                 )
                 page = context.new_page()
             except Exception as exc:  # noqa: BLE001 - driver errors share no base
-                # The last two raw driver calls in this function. A browser
+                # A browser
                 # that dies between launch and here, or a driver that rejects
                 # the context options, raised past the boundary every other
                 # call in this module now respects.

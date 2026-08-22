@@ -229,6 +229,49 @@ def test_a_browser_that_cannot_open_a_page_becomes_a_browser_error(monkeypatch):
     assert closed, "a browser that opened no page must still be closed"
 
 
+def test_a_driver_that_cannot_start_becomes_a_browser_error(monkeypatch):
+    """STARTING THE SESSION CAN FAIL ON ITS OWN, and `availability()` already
+    proves it -- that function wraps this identical call in `except Exception`
+    and turns the failure into a reason. The probe `pack._collect` runs happens
+    once per RUN, while a crawl enters a new session per render, so a session
+    that dies later was covered by nothing."""
+    import playwright.sync_api as sync_api
+
+    def _refuses():
+        raise RuntimeError("Driver executable not found")
+
+    monkeypatch.setattr(sync_api, "sync_playwright", _refuses)
+
+    with pytest.raises(BrowserError) as caught:  # noqa: SIM117
+        with rendered("http://127.0.0.1:3000/x"):
+            pass
+
+    assert "driver could not be started" in str(caught.value)
+    assert "Driver executable not found" in str(caught.value)
+
+
+def test_a_driver_that_fails_on_entry_becomes_a_browser_error(monkeypatch):
+    """The call can succeed and the context entry still fail -- which is why
+    the guard has to cover `__enter__` rather than only the construction."""
+    import playwright.sync_api as sync_api
+
+    class _FailsOnEntry:
+        def __enter__(self):
+            raise RuntimeError("connection to the driver was refused")
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _FailsOnEntry())
+
+    with pytest.raises(BrowserError) as caught:  # noqa: SIM117
+        with rendered("http://127.0.0.1:3000/x"):
+            pass
+
+    assert "driver could not be started" in str(caught.value)
+    assert "connection to the driver was refused" in str(caught.value)
+
+
 def test_a_browser_that_cannot_start_becomes_a_browser_error(monkeypatch):
     """THE BINARY BEING PRESENT IS NOT THE BINARY STARTING. A runner with an
     unusable sandbox, a missing shared library, or no writable profile
