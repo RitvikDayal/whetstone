@@ -35,11 +35,10 @@ The estimator is fit to this after Task 10. The predecessor's estimates were
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
-from ...budget import Budget, BudgetedProvider
+from ...budget import Budget, BudgetedProvider, write_cost_record
 from ...errors import LensError, WhetstoneError
 from ...severity import Severity
 from ..base import (
@@ -181,7 +180,14 @@ class CodeDefectsPack:
         try:
             return self._pipeline(ctx, budgeted, budget)
         finally:
-            self._write_cost_record(ctx, budget)
+            write_cost_record(
+                state_root=ctx.state_root,
+                run_id=ctx.run_id,
+                lens=self.name,
+                tier=ctx.tier,
+                budget=budget,
+                on_skip=ctx.skip,
+            )
 
     def _pipeline(
         self, ctx: RunContext, budgeted: BudgetedProvider, budget: Budget
@@ -443,45 +449,6 @@ class CodeDefectsPack:
                 f"({exc})"
             )
             return None
-
-    def _write_cost_record(self, ctx: RunContext, budget: Budget) -> None:
-        """Per-stage cost against this run, for the estimator to be fit to.
-
-        A file under the state directory rather than a table: the store has no
-        migration path yet, so a new table would refuse every database written
-        by an earlier build. Skipped entirely when nothing was spent -- an empty
-        record would read as a run that cost nothing rather than one that never
-        called a model.
-        """
-        if not budget.ledger:
-            return
-        record = {
-            "run_id": ctx.run_id,
-            "lens": self.name,
-            "tier": ctx.tier,
-            "ceiling_usd": budget.ceiling_usd,
-            "spent_usd": budget.spent_usd,
-            "tokens": budget.tokens,
-            "calls": budget.calls,
-            "unmeasured_calls": budget.unmeasured_calls,
-            "stages": [entry.as_dict() for entry in budget.ledger],
-        }
-        path = ctx.state_root / "costs" / f"{ctx.run_id}.json"
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(record, indent=2), encoding="utf-8")
-        except OSError as exc:
-            ctx.skip(
-                f"code-defects: this run's per-stage cost could not be written to "
-                f"{path.name} ({exc}), so ${budget.spent_usd:.4f} across "
-                f"{budget.calls} model call(s) was spent and not recorded."
-            )
-        if budget.unmeasured_calls:
-            ctx.skip(
-                f"code-defects: {budget.unmeasured_calls} of {budget.calls} model "
-                f"call(s) reported no cost at all, so the ceiling was enforced "
-                f"against a total known to be short."
-            )
 
     # -- odds and ends -----------------------------------------------------------
 

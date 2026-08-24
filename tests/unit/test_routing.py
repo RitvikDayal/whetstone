@@ -183,7 +183,19 @@ def test_only_the_spine_reads_earned_level():
         for p in files
         if "earned_level" in p.read_text(encoding="utf-8")
     }
-    allowed = {"queue/autonomy.py", "queue/routing.py", "cli.py"}
+    # `readmodel.py` is spine, and it is a DISPLAY path -- the same reason
+    # `cli.py` is on this list. The rule forbids a LENS from reading its own
+    # earned level, because a lens that can read it can act on it; it has never
+    # forbidden the spine from showing it to a human. The read model is where
+    # every surface now gets it, so the alternative to this entry is each
+    # surface calling `earned_level` for itself, which is more readers, not
+    # fewer. The `lenses/` assertion below is the half that actually binds.
+    allowed = {
+        "queue/autonomy.py",
+        "queue/routing.py",
+        "cli.py",
+        "readmodel.py",
+    }
     assert readers <= allowed, readers - allowed
     assert not any(r.startswith("lenses/") for r in readers), (
         "a lens can read its own earned level, and a lens that can read it can "

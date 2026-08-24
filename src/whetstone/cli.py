@@ -21,8 +21,9 @@ from .initialize.wizard import run_wizard
 from .paths import state_root
 from .queue.dispositions import Disposition
 from .queue.dispositions import apply as apply_disposition
+from .readmodel import findings_view, run_view
 from .report.html import render_report, write_report
-from .runner import RunResult, _now, execute_run, get_last_run
+from .runner import _now, execute_run
 from .store.db import connect
 from .store.findings import FindingState, list_findings
 
@@ -153,7 +154,7 @@ def _report_target(project_root: Path, out: Path) -> Path:
     return target
 
 
-def _warn_if_the_last_run_did_not_finish(run: RunResult | None) -> None:
+def _warn_if_the_last_run_did_not_finish(run: dict | None) -> None:
     """Say so when the state being listed came from a run that never finished.
 
     ASCII only -- see the module header.
@@ -164,10 +165,10 @@ def _warn_if_the_last_run_did_not_finish(run: RunResult | None) -> None:
             "been checked; run `whetstone run` first.[/yellow]"
         )
         return
-    if not run.finished:
+    if not run["finished"]:
         console.print(
             f"[yellow]Warning: the most recent run did not finish (status "
-            f"'{_printable(run.status)}'). What follows is a partial record of "
+            f"'{_printable(run['status'])}'). What follows is a partial record of "
             f"a partial "
             "run - an absent finding may simply never have been looked "
             "for.[/yellow]"
@@ -327,13 +328,18 @@ def findings(
     try:
         cfg, _, root = _load(path.resolve())
         with contextlib.closing(connect(root)) as conn:
-            rows = list_findings(
+            # THROUGH THE READ MODEL, not `list_findings` directly. Every
+            # surface renders this list, and `killed` in particular is a
+            # derived fact that used to be re-derived per surface -- which is
+            # how a grade D came to render identically to a grade A here. See
+            # `readmodel.py`; `tests/unit/test_surface_parity.py` measures it.
+            rows = findings_view(
                 conn,
                 state=str(state),
                 grade=None if grade is None else str(grade),
                 lens=lens,
             )
-            last = get_last_run(conn)
+            last = run_view(conn)
     except WhetstoneError as exc:
         console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
         raise typer.Exit(code=1) from exc
@@ -352,22 +358,26 @@ def findings(
 
     table = Table("id", "grade", "severity", "lens", "subject", "title")
     for row in rows:
-        # The PREFIX, not the id. A 32-character uuid4 in every row is noise
-        # nobody reads and nobody can retype, and `decide` accepts the prefix.
+        # `short_id`, computed once in the read model. A 32-character uuid4 in
+        # every row is noise nobody reads and nobody can retype, and `decide`
+        # accepts the prefix -- so the length of that prefix is a fact two
+        # surfaces have to agree on rather than each slice for itself.
         table.add_row(
-            row.id[:_ID_PREFIX],
-            _grade_cell(row.grade),
-            row.severity,
-            _printable(row.lens),
-            escape(_printable(row.subject)),
-            escape(_printable(row.title[:70])),
+            row["short_id"],
+            _grade_cell(row["grade"]),
+            row["severity"],
+            _printable(row["lens"]),
+            escape(_printable(row["subject"])),
+            escape(_printable(row["title"][:70])),
         )
     console.print(table)
 
     # Said once, under the table, rather than by hiding the killed rows. A
     # falsified finding is not noise -- it is the falsifier's work made visible,
     # and hiding it by default hides the evidence that the tool discriminates.
-    if any(row.grade == "D" for row in rows):
+    # `killed`, not a second `== "D"`. The read model decides what killed
+    # means; a surface that re-derives it is a surface that can disagree.
+    if any(row["killed"] for row in rows):
         console.print(
             "[dim]Rows marked killed were refuted by the falsifier. They are "
             "shown, and sorted last, because a tool that quietly drops what it "
@@ -474,13 +484,16 @@ def report(
     try:
         cfg, project_root, root = _load(path.resolve())
         with contextlib.closing(connect(root)) as conn:
-            rows = list_findings(conn, state="queued")
+            # The read model, same as `findings` -- see render_report's
+            # docstring for why this report is no longer allowed its own
+            # opinion about what a grade D means.
+            rows = findings_view(conn, state="queued")
             # The most recent run's skips, not None: a report standing in for
             # a run that examined less than it claimed must say so, and it
             # can only say so if the run that produced this state actually
             # reaches the template. See runner.get_last_run for why "most
             # recent" includes a failed run rather than filtering it out.
-            run = get_last_run(conn)
+            run = run_view(conn)
         target = _report_target(project_root, out)
         html = render_report(rows, project_name=cfg.project.name, run=run)
         written = write_report(target, html, project_root=project_root)

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from whetstone.errors import ReportError
+from whetstone.readmodel import finding_view, run_result_view
 from whetstone.report.html import render_report, write_report
 from whetstone.runner import RunResult
 from whetstone.store.findings import Finding
@@ -36,11 +37,28 @@ def _graded(grade: str, reason: str, **overrides) -> Finding:
     return Finding(**{**FINDING.__dict__, "grade": grade, "grade_reason": reason, **overrides})
 
 
+
+def _render(findings, *, project_name, run):
+    """Render through the read model, which is the only way a surface renders.
+
+    `render_report` takes the read model's projection now, not `Finding` and
+    `RunResult` objects -- see its docstring. Wrapping here rather than
+    rewriting every fixture means these assertions keep testing what they
+    always tested, and additionally pin that the projection carries the fields
+    the template needs. A field the read model drops fails here, loudly.
+    """
+    return render_report(
+        [finding_view(f) for f in findings],
+        project_name=project_name,
+        run=run_result_view(run),
+    )
+
+
 RUN = RunResult(run_id="run-1", tier="quick", file_count=3, status="complete")
 
 
 def test_report_is_self_contained(assert_self_contained):
-    assert_self_contained(render_report([FINDING], project_name="demo", run=RUN))
+    assert_self_contained(_render([FINDING], project_name="demo", run=RUN))
 
 
 # --- the grade reaches the report, and a killed finding looks killed ----------
@@ -64,7 +82,7 @@ def test_the_grade_and_its_reason_reach_the_report():
     so the falsifier's verdict -- the one thing that separates this tool from a
     linter -- was absent from the artifact people share.
     """
-    html = render_report(
+    html = _render(
         [_graded("A", "graded A: reproduced, survived falsification.")],
         project_name="demo",
         run=RUN,
@@ -75,7 +93,7 @@ def test_the_grade_and_its_reason_reach_the_report():
 
 
 def test_a_killed_finding_is_marked_killed_in_the_report():
-    html = render_report(
+    html = _render(
         [_graded("D", "graded D: the falsifier did not confirm it.")],
         project_name="demo",
         run=RUN,
@@ -94,7 +112,7 @@ def test_an_ungraded_finding_claims_no_grade_in_the_report():
     `<span class="grade grade-">` -- a labelled, styled, empty verdict on a
     finding nobody graded, which is a claim rather than a rendering bug.
     """
-    body = _body(render_report([FINDING], project_name="demo", run=RUN))
+    body = _body(_render([FINDING], project_name="demo", run=RUN))
     assert "grade-D" not in body
     assert "killed" not in body.lower()
     assert 'class="grade' not in body
@@ -103,7 +121,7 @@ def test_an_ungraded_finding_claims_no_grade_in_the_report():
 def test_the_grade_reason_is_escaped_like_every_other_model_string():
     """`grade_reason` comes from `grade.py` today and from a lens pack
     tomorrow. Every other model-authored field in this template is escaped."""
-    html = render_report(
+    html = _render(
         [_graded("D", "<img src=x onerror=alert(1)>")], project_name="demo", run=RUN
     )
     body = _body(html)
@@ -172,7 +190,7 @@ _REGRESSIONS = [
 def test_the_self_containment_guard_catches_every_way_out(
     marker, injection, self_containment_offences
 ):
-    html = render_report([FINDING], project_name="demo", run=RUN)
+    html = _render([FINDING], project_name="demo", run=RUN)
     assert marker in html, f"template no longer contains {marker!r}"
     broken = html.replace(marker, injection + marker, 1)
 
@@ -186,7 +204,7 @@ def test_the_self_containment_guard_catches_every_way_out(
 def test_the_mutation_harness_is_not_just_always_failing(self_containment_offences):
     """The counterweight: an injection that stays inside the document must
     NOT offend, or every case above would pass for the wrong reason."""
-    html = render_report([FINDING], project_name="demo", run=RUN)
+    html = _render([FINDING], project_name="demo", run=RUN)
     benign = html.replace(
         "</main>",
         '<img src="data:image/gif;base64,R0lGOD"><a href="#top">top</a></main>',
@@ -196,7 +214,7 @@ def test_the_mutation_harness_is_not_just_always_failing(self_containment_offenc
 
 
 def test_report_includes_finding_content():
-    html = render_report([FINDING], project_name="demo", run=None)
+    html = _render([FINDING], project_name="demo", run=None)
     assert "requests 2.19.0 has advisory GHSA-x" in html
     assert "Header injection." in html
 
@@ -209,7 +227,7 @@ def test_report_shows_skips_prominently():
         status="complete",
         skips=["hygiene/deps: pip-audit is not installed"],
     )
-    html = render_report([FINDING], project_name="demo", run=run)
+    html = _render([FINDING], project_name="demo", run=run)
     assert "pip-audit is not installed" in html
 
 
@@ -221,7 +239,7 @@ def test_empty_report_does_not_claim_clean_when_work_was_skipped():
         status="complete",
         skips=["hygiene/deps: skipped"],
     )
-    html = render_report([], project_name="demo", run=run)
+    html = _render([], project_name="demo", run=run)
     assert "Not everything was checked" in html
 
 
@@ -239,7 +257,7 @@ def test_an_unfinished_run_is_not_rendered_as_a_clean_report(status):
     An interrupt records NO skip, so the skip banner cannot stand in for this.
     """
     run = RunResult(run_id="run-1", tier="quick", file_count=1, status=status)
-    html = render_report([], project_name="demo", run=run)
+    html = _render([], project_name="demo", run=run)
     assert "did not finish" in html
     assert status in html
     assert "No open findings.</p>" not in html
@@ -248,7 +266,7 @@ def test_an_unfinished_run_is_not_rendered_as_a_clean_report(status):
 def test_a_finished_run_with_nothing_to_report_still_says_so_plainly():
     """The counterweight: the warning must not fire on every clean report, or
     it becomes the line nobody reads."""
-    html = render_report([], project_name="demo", run=RUN)
+    html = _render([], project_name="demo", run=RUN)
     assert "No open findings." in html
     assert "did not finish" not in html
 
@@ -258,7 +276,7 @@ def test_a_report_with_no_run_at_all_does_not_read_as_clean():
     its docstring says callers must be able to tell that apart from a run
     with no skips 'rather than rendering both as silence'. The template
     rendered both as silence."""
-    html = render_report([], project_name="demo", run=None)
+    html = _render([], project_name="demo", run=None)
     assert "No run has been recorded" in html
     assert "No open findings.</p>" not in html
 
@@ -281,7 +299,7 @@ def test_long_unbroken_detail_text_can_wrap():
     is the one carrying the wrapping declaration; a later edit that moves
     the declaration to `.meta` while leaving `.detail` untouched fails this.
     """
-    css = render_report([FINDING], project_name="demo", run=RUN).split("</style>")[0]
+    css = _render([FINDING], project_name="demo", run=RUN).split("</style>")[0]
     rules = re.findall(r"([^{}]+)\{([^{}]*)\}", css)
     wrapping = [selector for selector, body in rules if "overflow-wrap: anywhere" in body]
     detail_selector = re.compile(r"(?<![\w-])\.detail(?![\w-])")
@@ -290,7 +308,7 @@ def test_long_unbroken_detail_text_can_wrap():
 
 def test_html_is_escaped():
     hostile = Finding(**{**FINDING.__dict__, "title": "<img src=x onerror=alert(1)>"})
-    html = render_report([hostile], project_name="demo", run=None)
+    html = _render([hostile], project_name="demo", run=None)
     body = _body(html)
     assert "<img src=x" not in body
     assert "&lt;img" in body

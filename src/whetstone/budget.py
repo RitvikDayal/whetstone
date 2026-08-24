@@ -29,7 +29,12 @@ turns into a skip naming the reason.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .provider.base import Provider, StageRequest, StageResult, Usage
@@ -188,3 +193,99 @@ class BudgetedProvider:
         result = self._inner.run_stage(request)
         self.budget.spend(result.usage, stage=request.stage, subject=self.subject)
         return result
+
+
+# Characters a lens name may contribute to a filename. Everything else is
+# replaced, because the lens name reaches this path from the registry and M5
+# opens the registry to third parties -- a name containing a separator would
+# otherwise write the cost record somewhere other than the costs directory.
+_SAFE_LENS_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _cost_filename(run_id: str, lens: str) -> str:
+    """`<run_id>.<lens>.json`, with the lens name made safe for a filename.
+
+    KEYED BY LENS AS WELL AS RUN, which the first version was not. It wrote
+    `<run_id>.json` while carrying a `"lens"` field inside -- a record whose
+    own contents say more than one lens was expected, in a filename that can
+    only hold one. Nothing exposed it because exactly one lens wrote a record;
+    the second one to do so would have silently overwritten the first, and the
+    lost half is money that was spent.
+
+    A sanitised name is disambiguated with a short digest of the original, so
+    two lenses that sanitise to the same string still get two files rather than
+    quietly becoming one.
+    """
+    safe = _SAFE_LENS_NAME.sub("_", lens)
+    if safe != lens:
+        safe = f"{safe}-{hashlib.sha256(lens.encode('utf-8')).hexdigest()[:8]}"
+    return f"{run_id}.{safe}.json"
+
+
+def write_cost_record(
+    *,
+    state_root: Path,
+    run_id: str,
+    lens: str,
+    tier: str,
+    budget: Budget,
+    on_skip: Callable[[str], None],
+) -> None:
+    """Per-stage cost against this run, for the estimator to be fit to.
+
+    ONE WRITER, and that is why this lives here rather than on a lens pack.
+    `code-defects` had this as a private method and `rendered-ui` -- which
+    builds a `Budget`, wraps its provider in a `BudgetedProvider` and spends
+    real money through it -- had no equivalent at all. Its entire spend was
+    unrecorded, so the cost surface under-reported by one whole lens without
+    saying anything, which is the same silent under-count `Budget.spend`
+    already guards against one level down.
+
+    A FILE UNDER THE STATE DIRECTORY RATHER THAN A TABLE. `store/db.py` refuses
+    to open a database stamped with a different `user_version` and states there
+    is no migration path, so a new table would refuse every database written by
+    an earlier build.
+
+    WRITTEN EVEN WHEN NOTHING WAS SPENT, and the earlier version's reasoning
+    for skipping it was exactly backwards. It said "an empty record would read
+    as a run that cost nothing rather than one that never called a model" --
+    but a record carrying `calls: 0` and `stages: []` says precisely "this lens
+    ran and made no billable call", which is a fact. ABSENCE is the ambiguous
+    thing: it collapses "the lens was not configured", "the lens declined
+    before it built a budget" and "the lens ran and spent nothing" into one
+    silence, and a cost surface then cannot tell $0.00 from unmeasured. Writing
+    it always makes absence mean one checkable thing -- no budget was ever
+    constructed -- and every path that ends that way already reports a skip.
+
+    `on_skip` rather than a `RunContext`: the only thing this needs is the
+    channel a lens has to the user, and taking the whole context would make
+    the one function that must work from every pack depend on the shape of the
+    caller's.
+    """
+    record = {
+        "run_id": run_id,
+        "lens": lens,
+        "tier": tier,
+        "ceiling_usd": budget.ceiling_usd,
+        "spent_usd": budget.spent_usd,
+        "tokens": budget.tokens,
+        "calls": budget.calls,
+        "unmeasured_calls": budget.unmeasured_calls,
+        "stages": [entry.as_dict() for entry in budget.ledger],
+    }
+    path = state_root / "costs" / _cost_filename(run_id, lens)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    except OSError as exc:
+        on_skip(
+            f"{lens}: this run's per-stage cost could not be written to "
+            f"{path.name} ({exc}), so ${budget.spent_usd:.4f} across "
+            f"{budget.calls} model call(s) was spent and not recorded."
+        )
+    if budget.unmeasured_calls:
+        on_skip(
+            f"{lens}: {budget.unmeasured_calls} of {budget.calls} model "
+            f"call(s) reported no cost at all, so the ceiling was enforced "
+            f"against a total known to be short."
+        )

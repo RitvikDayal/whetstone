@@ -308,3 +308,62 @@ def test_dev_command_is_not_executed(tmp_path, monkeypatch):
 def test_state_path_check_is_present(tmp_path):
     results = run_doctor(_cfg(), tmp_path, tmp_path)
     assert any(r.name == "state path" for r in results)
+
+
+# --- execute_commands=False: the surface that must not run the project ------
+
+
+def _marker(tmp_path):
+    """A command whose only job is to prove whether it ran."""
+    proof = tmp_path / "it-ran.txt"
+    return proof, f'"{sys.executable}" -c "open(r\'{proof}\',\'w\').write(\'x\')"'
+
+
+def test_execute_commands_false_does_not_execute_the_command(tmp_path):
+    """MEASURED BY A SIDE EFFECT, not by reading the returned text.
+
+    A test that only checks the wording passes against an implementation that
+    runs the command and then reports "not run", which is the worst of both.
+    The command writes a file; the file must not exist.
+    """
+    proof, command = _marker(tmp_path)
+
+    results = run_doctor(
+        _cfg(test=command), tmp_path, tmp_path, execute_commands=False
+    )
+
+    assert not proof.exists(), "the command was executed by a surface that must not"
+    (row,) = [r for r in results if r.name == "command: test"]
+    assert row.skipped is True
+
+
+def test_the_default_still_executes(tmp_path):
+    """The CLI is unchanged. Without this the guard above could be vacuous --
+    an implementation that never runs anything passes it trivially."""
+    proof, command = _marker(tmp_path)
+
+    run_doctor(_cfg(test=command), tmp_path, tmp_path)
+
+    assert proof.exists(), "the default must still verify by execution"
+
+
+def test_a_check_that_was_not_run_says_so_and_says_where_to_run_it(tmp_path):
+    """A skip that does not name its remedy is the check quietly not running."""
+    results = run_doctor(
+        _cfg(test="pytest -q"), tmp_path, tmp_path, execute_commands=False
+    )
+
+    (row,) = [r for r in results if r.name == "command: test"]
+    assert "NOT RUN" in row.detail
+    assert "pytest -q" in row.detail
+    assert "whetstone doctor" in row.detail
+
+
+def test_the_checks_that_execute_nothing_still_run(tmp_path):
+    """git and the state path are reads. Dropping them would leave the setup
+    surface with nothing at all to say."""
+    names = {
+        r.name
+        for r in run_doctor(_cfg(), tmp_path, tmp_path, execute_commands=False)
+    }
+    assert {"git", "state path"} <= names

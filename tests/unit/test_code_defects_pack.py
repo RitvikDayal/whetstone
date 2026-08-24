@@ -484,7 +484,7 @@ def test_every_stage_cost_is_recorded_against_the_run(ctx):
     were 4-17x low because only a total survived."""
     _run(_pack(_provider()), ctx)
 
-    record = ctx.state_root / "costs" / "run-abc123.json"
+    record = ctx.state_root / "costs" / "run-abc123.code-defects.json"
     assert record.exists()
     written = json.loads(record.read_text(encoding="utf-8"))
     assert written["run_id"] == "run-abc123"
@@ -505,7 +505,7 @@ def test_the_cost_record_survives_a_run_that_found_nothing(ctx):
     )
     _run(_pack(provider), ctx)
 
-    record = ctx.state_root / "costs" / "run-abc123.json"
+    record = ctx.state_root / "costs" / "run-abc123.code-defects.json"
     assert record.exists()
     assert json.loads(record.read_text(encoding="utf-8"))["spent_usd"] > 0
 

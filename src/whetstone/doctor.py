@@ -127,8 +127,30 @@ def run_command(label: str, command: str, cwd: Path, timeout: int) -> CheckResul
 
 
 def run_doctor(
-    cfg: WhetstoneConfig, project_root: Path, state_root: Path
+    cfg: WhetstoneConfig,
+    project_root: Path,
+    state_root: Path,
+    *,
+    execute_commands: bool = True,
 ) -> list[CheckResult]:
+    """Every check. With `execute_commands=False`, every check that is safe.
+
+    WHO ASKS FOR FALSE, AND WHY. The control plane. Everything this module
+    executes runs through `run_shell` with `shell=True` and `cwd=project_root`,
+    and the module docstring above records the measured consequence: a `git.bat`
+    in the repository beats `git.EXE` on PATH. `install` and `build` also WRITE
+    into the project -- node_modules, lockfiles, virtualenvs, build output.
+    Reaching that down an HTTP route makes a single credential the only thing
+    between any page in the user's browser and code execution in their
+    repository, and the control plane's own invariant says it does not write
+    into the project.
+
+    THE SKIPPED CHECKS SAY SO LOUDLY, which is the difference between this and
+    the defect this project keeps paying for. A check that quietly does not run
+    is a green tick over nothing; these report `skipped` and name `whetstone
+    doctor` as the thing that would actually verify them. The CLI still passes
+    True and still executes everything -- the command surface is unchanged.
+    """
     results: list[CheckResult] = [
         _check_git(project_root),
         _check_state_path(state_root),
@@ -140,6 +162,20 @@ def run_doctor(
             results.append(
                 CheckResult(
                     f"command: {label}", True, "not declared; nothing to verify.", True
+                )
+            )
+            continue
+        if not execute_commands:
+            results.append(
+                CheckResult(
+                    f"command: {label}",
+                    True,
+                    (
+                        f"declared as `{command}`; NOT RUN here. Verifying it "
+                        "means executing it in the project, which this surface "
+                        "does not do. Run `whetstone doctor` to verify it."
+                    ),
+                    True,
                 )
             )
             continue
