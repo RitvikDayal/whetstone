@@ -97,8 +97,14 @@ those, and neither substitutes for the other.
 The token is printed only if you ask for it with `--print-url`. Read
 [docs/control-plane.md](docs/control-plane.md) before exposing it to anything.
 
-The list is read-only in this release; use `whetstone decide` to act on a
-finding.
+Four tabs: **findings** (with deciding), **run** (with live progress),
+**trust** and **cost**. Deciding here is the same act as `whetstone decide` --
+one projection feeds both surfaces and the API delegates to the same function,
+so the two cannot disagree about what a decision means.
+
+Runs are one at a time per project, enforced by an OS lock rather than in
+process: a run started in a terminal blocks the button, and the button blocks
+that terminal.
 
 ### Exit codes
 

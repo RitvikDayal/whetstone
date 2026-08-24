@@ -23,6 +23,7 @@ from .queue.dispositions import Disposition
 from .queue.dispositions import apply as apply_disposition
 from .readmodel import findings_view, run_view
 from .report.html import render_report, write_report
+from .runlock import run_lock
 from .runner import _now, execute_run
 from .store.db import connect
 from .store.findings import FindingState, list_findings
@@ -254,7 +255,13 @@ def run(
     """
     try:
         cfg, project_root, root = _load(path.resolve())
-        with contextlib.closing(connect(root)) as conn:
+        # THE SAME LOCK THE CONTROL PLANE TAKES, and taking it here is the
+        # whole point of it being an OS lock rather than one held inside a
+        # process. Two runs against one project write the same findings
+        # database through `upsert`, whose existence-check and insert are two
+        # statements and can interleave -- and the second writer is a person in
+        # another terminal, or a browser, which no in-process lock can see.
+        with run_lock(root), contextlib.closing(connect(root)) as conn:
             result = execute_run(
                 conn,
                 cfg,

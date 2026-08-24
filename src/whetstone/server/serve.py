@@ -113,8 +113,15 @@ def serve(
 
         announce(f"Whetstone control plane on http://{BIND_HOST}:{bound_port}/")
         if show_url:
+            # TWO CALLS, not one string with a newline in it. The CLI passes
+            # every announced line through `_printable`, which renders control
+            # characters visible so a model-authored or repo-read string cannot
+            # drive the terminal -- and it does not make an exception for a
+            # newline this module put there itself. Measured: the URL printed
+            # with a trailing literal `\\x0a`, which is both ugly and a
+            # character a user copying the line would take with them.
+            announce(f"  {full_url}")
             announce(
-                f"  {full_url}\n"
                 "  Anyone who reads that line can act on this project. It is "
                 "printed because --print-url was given."
             )

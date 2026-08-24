@@ -1,123 +1,45 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import Cost from './screens/Cost'
+import Findings from './screens/Findings'
+import Run from './screens/Run'
+import Trust from './screens/Trust'
 import { ApiError, apiGet, readToken } from './session'
-import type { Finding, FindingsResponse, RunView } from './types'
+import type { CostView, FindingsResponse, TrustRow } from './types'
 
-// EVERY STRING RENDERED HERE IS UNTRUSTED. Finding titles, details, grade
-// reasons and skip text are model output derived from the contents of a
-// repository the user did not necessarily write -- `doctor.py` records the
-// same fact about `whetstone init`. React escapes text children by default and
-// that is what is relied on: there is no `dangerouslySetInnerHTML` anywhere in
-// this app, no markdown renderer, and a test greps for both.
-
-function Banner({ run }: { run: RunView | null }) {
-  // NO RUN AT ALL is not the same as a clean run, and rendering both as
-  // silence is how a project nobody has checked reads as a project with no
-  // problems. `readmodel.run_view` returns null for the first case precisely so
-  // this distinction survives to a screen.
-  if (run === null) {
-    return (
-      <div className="banner banner-quiet">
-        No run has been recorded for this project. Nothing has been checked yet
-        &mdash; run <code>whetstone run</code>.
-      </div>
-    )
-  }
-  return (
-    <>
-      {!run.finished && (
-        <div className="banner banner-alarm">
-          <strong>This run did not finish</strong> &mdash; status{' '}
-          <code>{run.status}</code>. What follows is a partial record of a
-          partial run: a finding that is absent may simply never have been
-          looked for.
-        </div>
-      )}
-      {run.skips.length > 0 && (
-        <div className="banner banner-warn">
-          <strong>Not everything was checked.</strong>
-          <ul>
-            {run.skips.map((skip, i) => (
-              <li key={i}>{skip}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </>
-  )
-}
-
-function Verdict({ finding }: { finding: Finding }) {
-  // THE WORD, not the letter. A grade D rendered as a bare "D" is a
-  // distinction a skimming reader does not make, and this exact failure --
-  // a killed finding looking identical to a confirmed one -- is why
-  // `readmodel` carries `killed` as a boolean rather than leaving each surface
-  // to compare against a string.
-  if (!finding.graded) {
-    return (
-      <span className="verdict verdict-none" title="This lens does not grade.">
-        not graded
-      </span>
-    )
-  }
-  if (finding.killed) {
-    return <span className="verdict verdict-killed">D &mdash; killed</span>
-  }
-  return <span className={`verdict verdict-${finding.grade}`}>{finding.grade}</span>
-}
-
-function Row({ finding }: { finding: Finding }) {
-  const [open, setOpen] = useState(false)
-  return (
-    <li className={finding.killed ? 'finding killed' : 'finding'}>
-      <button
-        className="finding-head"
-        aria-expanded={open}
-        onClick={() => setOpen(!open)}
-      >
-        <Verdict finding={finding} />
-        <span className={`sev sev-${finding.severity}`}>{finding.severity}</span>
-        <span className="subject">{finding.subject}</span>
-        <span className="title">{finding.title}</span>
-      </button>
-      {open && (
-        <div className="finding-body">
-          <p className="detail">{finding.detail}</p>
-          {finding.grade_reason && (
-            <p className="why">
-              <strong>Why this grade:</strong> {finding.grade_reason}
-            </p>
-          )}
-          <dl className="meta">
-            <dt>id</dt>
-            <dd>
-              <code>{finding.short_id}</code>
-            </dd>
-            <dt>lens</dt>
-            <dd>{finding.lens}</dd>
-            <dt>rule</dt>
-            <dd>{finding.rule_id}</dd>
-            <dt>state</dt>
-            <dd>{finding.state}</dd>
-          </dl>
-        </div>
-      )}
-    </li>
-  )
-}
+const TABS = ['findings', 'run', 'trust', 'cost'] as const
+type Tab = (typeof TABS)[number]
 
 export default function App() {
   const [token] = useState(readToken)
-  const [data, setData] = useState<FindingsResponse | null>(null)
+  const [tab, setTab] = useState<Tab>('findings')
+  const [queue, setQueue] = useState<FindingsResponse | null>(null)
+  const [trust, setTrust] = useState<TrustRow[] | null>(null)
+  const [cost, setCost] = useState<CostView | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
+  // ONE REFRESH FOR EVERY SURFACE, called after any mutation. A decision
+  // changes the queue AND the acceptance rate the trust screen reads, and
+  // updating one of them locally while leaving the other stale is how two views
+  // of one store come to disagree inside a single page.
+  const refresh = useCallback(() => {
     if (!token) return
-    apiGet<FindingsResponse>('api/findings', token)
-      .then(setData)
+    setError(null)
+    Promise.all([
+      apiGet<FindingsResponse>('api/findings', token),
+      apiGet<TrustRow[]>('api/trust', token),
+      apiGet<CostView>('api/costs', token),
+    ])
+      .then(([findings, trustRows, costView]) => {
+        setQueue(findings)
+        setTrust(trustRows)
+        setCost(costView)
+      })
       .catch((exc: unknown) =>
         setError(exc instanceof ApiError ? exc.message : String(exc)),
       )
   }, [token])
+
+  useEffect(refresh, [refresh])
 
   if (!token) {
     return (
@@ -125,74 +47,56 @@ export default function App() {
         <h1>Whetstone</h1>
         <div className="banner banner-alarm">
           <strong>No session token.</strong> This page was opened without one,
-          or the tab it was opened in has been closed. Start the control plane
-          again with <code>whetstone ui</code> and use the link it prints.
+          or in a tab that never had one. Start the control plane again with{' '}
+          <code>whetstone ui</code> and use the link it opens &mdash; the token
+          is different every time, and it is deliberately not printed.
         </div>
-      </main>
-    )
-  }
-
-  if (error) {
-    return (
-      <main>
-        <h1>Whetstone</h1>
-        <div className="banner banner-alarm">{error}</div>
-      </main>
-    )
-  }
-
-  if (!data) {
-    return (
-      <main>
-        <h1>Whetstone</h1>
-        <p className="muted">Reading the queue&hellip;</p>
       </main>
     )
   }
 
   return (
     <main>
-      <h1>Whetstone</h1>
-      <p className="sub">
-        {data.findings.length} open finding
-        {data.findings.length === 1 ? '' : 's'}
-        {data.run && (
-          <>
-            {' '}
-            &middot; tier {data.run.tier} &middot; {data.run.file_count} file
-            {data.run.file_count === 1 ? '' : 's'} in scope
-          </>
-        )}
-      </p>
-
-      <Banner run={data.run} />
-
-      {data.findings.length === 0 ? (
-        <p className="muted">
-          {data.run && data.run.skips.length > 0
-            ? 'No open findings — but see above: this run did not check everything.'
-            : 'No open findings.'}
-        </p>
-      ) : (
-        <ul className="findings">
-          {/* NOT re-sorted. `store/findings.py` orders by grade first and puts
-              an ABSENT grade between B and C, so a measured CVE is neither
-              buried under something the falsifier refuted nor ranked above a
-              proven crash. Sorting by severity here because that column looks
-              more important would silently invert that. */}
-          {data.findings.map((f) => (
-            <Row key={f.id} finding={f} />
+      <header>
+        <h1>Whetstone</h1>
+        <nav>
+          {TABS.map((name) => (
+            <button
+              key={name}
+              className={name === tab ? 'tab active' : 'tab'}
+              aria-current={name === tab}
+              onClick={() => setTab(name)}
+            >
+              {name}
+              {name === 'findings' && queue && queue.findings.length > 0 && (
+                <span className="count">{queue.findings.length}</span>
+              )}
+            </button>
           ))}
-        </ul>
-      )}
+        </nav>
+      </header>
 
-      {data.findings.some((f) => f.killed) && (
-        <p className="footnote">
-          Rows marked <em>killed</em> were refuted by the falsifier. They are
-          shown, and sorted last, because a tool that quietly drops what it
-          refuted cannot be checked.
-        </p>
-      )}
+      {error && <div className="banner banner-alarm">{error}</div>}
+
+      {tab === 'findings' &&
+        (queue ? (
+          <Findings
+            findings={queue.findings}
+            run={queue.run}
+            token={token}
+            onDecided={refresh}
+          />
+        ) : (
+          <p className="muted">Reading the queue&hellip;</p>
+        ))}
+
+      {tab === 'run' && <Run token={token} onFinished={refresh} />}
+
+      {tab === 'trust' &&
+        (trust ? <Trust rows={trust} /> : <p className="muted">Reading&hellip;</p>)}
+
+      {tab === 'cost' &&
+        (cost ? <Cost view={cost} /> : <p className="muted">Reading&hellip;</p>)}
     </main>
   )
 }

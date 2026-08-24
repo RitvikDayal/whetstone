@@ -494,3 +494,71 @@ def test_the_cli_reports_a_missing_extra_as_an_error_not_a_traceback(
     assert result.exit_code == 1
     assert "whetstone-cli[ui]" in result.output
     assert "Traceback" not in result.output
+
+
+# --- what the terminal actually prints ----------------------------------------
+
+
+def test_no_announced_line_contains_a_control_character():
+    """MEASURED, and the escaping that caused it is correct.
+
+    `cli.py` passes every announced line through `_printable`, which renders
+    control characters visible so a model-authored or repo-read string cannot
+    retitle the reader's window. It does not make an exception for a newline
+    this module put there itself, so a multi-line announce string printed the
+    URL with a trailing literal `\x0a` -- ugly, and a character a user copying
+    the line would take with them into their address bar.
+
+    The fix is one call per line. This asserts the shape rather than the fix,
+    so re-embedding a newline anywhere in `serve()` fails here.
+    """
+    lines: list[str] = []
+    with pytest.raises(_Stop):
+        serve_module.serve(
+            config=_bare_config(),
+            project_root=Path("."),
+            state_root=Path("."),
+            open_browser=False,
+            show_url=True,
+            announce=lambda line: lines.append(line) or _raise_when_done(lines),
+        )
+
+    assert lines, "serve() announced nothing"
+    for line in lines:
+        assert "\n" not in line, repr(line)
+        assert "\r" not in line, repr(line)
+
+
+class _Stop(Exception):
+    """Ends `serve()` before it blocks on uvicorn."""
+
+
+def _raise_when_done(lines: list[str]) -> None:
+    # Three lines is everything `serve()` says before it starts serving.
+    if len(lines) >= 3:
+        raise _Stop
+
+
+def _bare_config():
+    from whetstone.config.model import ProjectConfig, WhetstoneConfig
+
+    return WhetstoneConfig(project=ProjectConfig(name="announce"))
+
+
+def test_the_token_is_absent_from_the_terminal_unless_asked_for():
+    """A terminal is not a private surface -- scrollback is screen-shared,
+    piped through `tee`, and pasted into chat windows."""
+    lines: list[str] = []
+    with pytest.raises(_Stop):
+        serve_module.serve(
+            config=_bare_config(),
+            project_root=Path("."),
+            state_root=Path("."),
+            open_browser=False,
+            show_url=False,
+            announce=lambda line: lines.append(line) or _raise_when_done(lines),
+        )
+
+    assert lines
+    assert not any("#t=" in line for line in lines), lines
+    assert any("--print-url" in line for line in lines)

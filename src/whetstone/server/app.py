@@ -18,14 +18,21 @@ costs microseconds against a file that is already in the page cache.
 from __future__ import annotations
 
 import contextlib
+import json
 from pathlib import Path
 from typing import Any
 
 from ..config.model import WhetstoneConfig
 from ..errors import WhetstoneError
+from ..queue.dispositions import Disposition
+from ..queue.dispositions import apply as apply_disposition
 from ..readmodel import cost_view, findings_view, run_view, trust_view
+from ..runlock import RunInProgressError
+from ..runner import _now as now
 from ..store.db import connect
 from .assets import assets_root
+from .runs import events_path, tail
+from .runs import start as start_background_run
 from .security import HostGuard, ResponseHeaders, TokenGuard
 
 
@@ -52,11 +59,11 @@ def missing_ui_extra() -> WhetstoneError:
 def _require_web_dependencies():
     try:
         from fastapi import FastAPI
-        from fastapi.responses import JSONResponse
+        from fastapi.responses import JSONResponse, StreamingResponse
         from starlette.staticfiles import StaticFiles
     except ImportError as exc:
         raise missing_ui_extra() from exc
-    return FastAPI, JSONResponse, StaticFiles
+    return FastAPI, JSONResponse, StreamingResponse, StaticFiles
 
 
 def create_app(
@@ -74,7 +81,7 @@ def create_app(
     second caller ships an unguarded server -- and the test suite would be the
     first such caller.
     """
-    FastAPI, JSONResponse, StaticFiles = _require_web_dependencies()
+    FastAPI, JSONResponse, StreamingResponse, StaticFiles = _require_web_dependencies()
 
     # Assets are resolved BEFORE the server binds, so a missing bundle is a
     # sentence in the terminal the user is already looking at rather than a
@@ -177,6 +184,107 @@ def create_app(
             ],
             "project_root": str(project_root),
         }
+
+    # -- mutations ------------------------------------------------------------
+
+    @app.post("/api/findings/{finding_id}/decide")
+    def decide(finding_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Record a decision. The argument rules are NOT restated here.
+
+        `queue/dispositions.py` already writes a sentence naming the missing
+        argument and why it is required -- "reject needs a reason, because the
+        decision ledger is what calibrates the lens" -- and that sentence is
+        returned verbatim by the WhetstoneError handler above. A second copy of
+        those rules in this module is a second copy that will drift, which is
+        the lesson `autonomy.py` records about its own duplicated
+        classification: a promise to keep two things in step is not a
+        mechanism.
+
+        `confirm` MIRRORS THE CLI'S PROMPT. `reject` is the one disposition a
+        later run cannot undo, and the CLI asks before applying it. A browser
+        has no prompt, so the caller has to have decided already; without the
+        flag this refuses rather than assuming.
+        """
+        if not isinstance(body, dict):
+            raise WhetstoneError("the request body must be a JSON object.")
+        try:
+            disposition = Disposition(str(body.get("disposition", "")))
+        except ValueError as exc:
+            raise WhetstoneError(
+                f"{body.get('disposition')!r} is not a disposition. Valid: "
+                f"{', '.join(d.value for d in Disposition)}."
+            ) from exc
+
+        if disposition is Disposition.reject and body.get("confirm") is not True:
+            raise WhetstoneError(
+                "rejecting is permanent -- it suppresses this finding on every "
+                "future run, and no later run undoes it. Send "
+                '`"confirm": true` to record it.'
+            )
+
+        with _store() as conn:
+            new_state = apply_disposition(
+                conn,
+                finding_id,
+                disposition,
+                reason=body.get("reason"),
+                wake=body.get("wake"),
+                assignee=body.get("assignee"),
+                now=now(),
+            )
+            return {"id": finding_id, "state": new_state}
+
+    @app.post("/api/runs")
+    def start_run(body: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Start a run. 409 when one is already in progress.
+
+        THE CEILING IS NOT RE-CHECKED HERE. It is enforced in
+        `BudgetedProvider`, where it already sits between every stage and the
+        model, and a second check in this layer would be a number that agrees
+        with the real one until the day it does not.
+        """
+        options = body or {}
+        try:
+            ticket = start_background_run(
+                config=config,
+                project_root=project_root,
+                state_root=state_root,
+                tier=str(options.get("tier") or config.budget.tier),
+                changed_only=not options.get("full", False),
+            )
+        except RunInProgressError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        return {"ticket": ticket}
+
+    @app.get("/api/runs/{ticket}/events")
+    def run_events(ticket: str):
+        """Server-sent events for one run.
+
+        CONSUMED WITH `fetch`, NOT `EventSource`. EventSource cannot set a
+        request header, so it would force the session token into a query string
+        -- which lands in access logs -- or into a cookie, which is ambient
+        authority and undoes the entire reason the token lives in a custom
+        header. The client reads this with a streaming `fetch` instead; the
+        only thing lost is automatic reconnect, and reconnect here is a re-GET
+        because the file is replayed from the start.
+        """
+        path = events_path(state_root, ticket)
+
+        def stream():
+            # A blank line terminates an SSE frame. `json.dumps` never emits a
+            # raw newline, so one event is always exactly one `data:` line and
+            # no re-escaping is needed.
+            for event in tail(path):
+                yield "data: " + json.dumps(event) + "\n\n"
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            # `no-store` is stamped by the middleware; `X-Accel-Buffering` is
+            # for the proxy nobody should be putting in front of this, and
+            # costs nothing if there is not one.
+            headers={"X-Accel-Buffering": "no"},
+        )
 
     # The shell, LAST and unauthenticated. See `security.py`: the token arrives
     # in the URL fragment, which is never sent to a server, so a token-gated

@@ -111,9 +111,41 @@ Three things the screen is careful about:
 - **A run that did not check everything says so**, above the list, before you
   read a single row.
 
-The list is **read-only in this release.** Deciding on findings, starting runs,
-and the trust and cost screens land next; until then `whetstone decide` and
-`whetstone run` are the way to act.
+### Four tabs
+
+**Findings** is the queue. Expanding a row shows the detail, the grade's reason,
+and a decision form. Recording a decision here is the same act as `whetstone
+decide` &mdash; same store, same rules, same error messages, because the API
+delegates to the same function rather than restating what it does.
+
+`reject` asks twice: once in the browser and once at the API, which refuses
+without an explicit confirmation. It is the one decision no later run undoes.
+
+**Run** shows what a run would be held to *before* the button: the tier, the
+ceiling, and &mdash; more importantly &mdash; what that ceiling does **not**
+bound. `usd_per_run` is enforced per lens rather than per run (issue #43),
+`calls_per_day` is accepted and not enforced at all, and nothing limits how
+many runs you start. A CLI user typing `whetstone run` has friction that bounds
+the last one in practice; a button does not, so the screen says so.
+
+Progress streams live. The stream is a convenience: every event restates
+something already in the store, so a closed tab, a missed event or a reload
+costs you liveness and no information.
+
+**One run at a time per project, enforced by the operating system.** A run
+started in a terminal blocks this button, and this button blocks that terminal
+&mdash; because two runs against one SQLite database interleave inside `upsert`.
+The lock is released by the kernel when the holding process dies, including if
+it is killed, so a crashed run cannot wedge the project.
+
+**Trust** shows what each lens has earned, and the *sentence* explaining it. The
+number without its reason is still a feeling, which is what the earned-autonomy
+design exists to replace.
+
+**Cost** shows recorded spend per run and per stage &mdash; and counts calls
+whose cost the provider could not measure. Those are not free, they are
+unknown, so the total is short by an unknown amount and the screen says that
+rather than showing a confident number.
 
 ### `whetstone.yaml` is never edited from the browser
 

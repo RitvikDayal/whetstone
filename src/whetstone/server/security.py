@@ -89,6 +89,28 @@ def allowed_hosts(port: int) -> frozenset[str]:
     return frozenset({f"127.0.0.1:{port}", f"localhost:{port}"})
 
 
+# How much of an unauthenticated request body to read before answering. Bounded
+# on purpose: draining without a limit lets an unauthenticated caller hold a
+# worker open by streaming forever, which trades a cosmetic reset for a denial
+# of service. Past the cap the response goes out anyway and the client may see
+# a reset -- the right trade, because at that point the caller is not a browser
+# sending a decision.
+_DRAIN_LIMIT_BYTES = 1 << 20
+_DRAIN_LIMIT_MESSAGES = 64
+
+
+async def _drain(receive: Receive) -> None:
+    """Consume the request body so the client can finish writing it."""
+    read = 0
+    for _ in range(_DRAIN_LIMIT_MESSAGES):
+        message = await receive()
+        if message["type"] != "http.request":
+            return
+        read += len(message.get("body", b""))
+        if not message.get("more_body", False) or read >= _DRAIN_LIMIT_BYTES:
+            return
+
+
 class HostGuard:
     """Reject any request whose `Host` is not exactly one of ours.
 
@@ -124,6 +146,11 @@ class HostGuard:
             if key == b"host"
         ]
         if len(found) != 1 or found[0].lower() not in self.allowed:
+            # Drained for the same reason the token guard drains -- see there.
+            # A refused POST whose body was never read reaches the client as a
+            # connection reset rather than as the 403 that was sent.
+            if scope["type"] == "http":
+                await _drain(receive)
             response = PlainTextResponse(
                 "This server answers only to 127.0.0.1 and localhost on its own "
                 "port. A request arriving under any other name is either "
@@ -163,6 +190,13 @@ class TokenGuard:
         request = Request(scope)
         presented = request.headers.get(TOKEN_HEADER, "")
         if not hmac.compare_digest(presented, self.token):
+            # DRAIN FIRST. Answering a POST without consuming its body leaves
+            # the client still writing into a socket the server is closing, and
+            # the client sees ConnectionResetError instead of the 401 that was
+            # actually sent. Measured on Windows against this exact route: the
+            # SPA would have rendered "network error" for a plain expired
+            # token, which is the least actionable message available.
+            await _drain(receive)
             response = JSONResponse(
                 {
                     "error": (

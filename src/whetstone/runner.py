@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from .config.model import BoundariesConfig, LensConfig, WhetstoneConfig
 from .errors import WhetstoneError
@@ -22,6 +25,10 @@ from .lenses.registry import get_lens
 from .scope.resolver import resolve_files
 from .severity import severity_at_least
 from .store.findings import upsert
+
+# A progress sink. Takes one JSON-safe dict per event; returns nothing and
+# is never consulted about what to do next -- see `_emit`.
+EventSink = Callable[[dict[str, Any]], None]
 
 
 @dataclass
@@ -224,6 +231,25 @@ def _report_unsupported_sinks(cfg: WhetstoneConfig, result: RunResult) -> None:
             )
 
 
+def _emit(on_event: EventSink | None, **event: Any) -> None:
+    """Hand one progress event to *on_event*, and never let it end the run.
+
+    A run that dies because the thing WATCHING it raised has been destroyed by
+    its own instrumentation. The callback belongs to a surface -- today the
+    control plane's SSE stream -- and a surface is not allowed to be load
+    bearing: every event here also lands in the store or in `result.skips`, so
+    a sink that raises loses liveness and no information.
+    """
+    if on_event is None:
+        return
+    # `Exception`, not `BaseException`: a Ctrl-C raised while the sink is
+    # running is the user ending the run, and swallowing it here would make the
+    # run unstoppable from the one place a user can reach it. Same distinction
+    # the lens loop below already draws.
+    with contextlib.suppress(Exception):
+        on_event(event)
+
+
 def execute_run(
     conn: sqlite3.Connection,
     cfg: WhetstoneConfig,
@@ -232,7 +258,20 @@ def execute_run(
     *,
     tier: str,
     changed_only: bool,
+    on_event: EventSink | None = None,
 ) -> RunResult:
+    """Run every enabled lens. `on_event` is optional live progress.
+
+    ON_EVENT IS LENS-AGNOSTIC, and that is what keeps the M2 abstraction gate
+    green. A progress event is about a RUN -- which lens started, what it
+    found, what it skipped -- and runs are the spine's own concern. Nothing
+    here learns what a lens does, only that one is running.
+
+    THE STREAM IS A CONVENIENCE, NEVER THE RECORD. Every event below restates
+    something that is also written to the `runs` or `findings` tables or to
+    `result.skips`. A client that misses every event and refreshes sees the
+    same state, because the state was never only in the stream.
+    """
     run_id = f"run-{uuid.uuid4().hex[:10]}"
     started = _now()
 
@@ -443,6 +482,19 @@ def execute_run(
         ),
     )
 
+    # AFTER the row exists. An event announcing a run that no surface can then
+    # look up is a promise the store cannot keep.
+    _emit(
+        on_event,
+        kind="run_started",
+        run_id=run_id,
+        tier=tier,
+        file_count=len(files),
+        lens_count=len(plan),
+        lenses=[name for name, _, _ in plan],
+        skips=list(skips),
+    )
+
     # Once the `runs` row exists, every exit path -- including a lens raising
     # mid-iteration -- must close it out with finished_at and a terminal
     # status. A row stuck at status='running' forever is its own kind of
@@ -489,6 +541,8 @@ def execute_run(
             # the same silence in a nicer costume.
             floor = lens_cfg.severity_floor
             suppressed = 0
+            _emit(on_event, kind="lens_started", run_id=run_id, lens=name)
+            before_new, before_seen = result.new, result.seen
             try:
                 for candidate in pack.run(ctx):
                     if floor is not None and not severity_at_least(
@@ -508,6 +562,20 @@ def execute_run(
                         f"{suppressed} candidate(s) below that floor; they were "
                         "found but NOT recorded."
                     )
+                # In the `finally`, alongside the skip merge and for the same
+                # reason: a lens that yields two candidates and then raises has
+                # done work worth announcing, and a surface waiting on a
+                # `lens_finished` that never arrives shows it as still running
+                # forever.
+                _emit(
+                    on_event,
+                    kind="lens_finished",
+                    run_id=run_id,
+                    lens=name,
+                    new=result.new - before_new,
+                    seen=result.seen - before_seen,
+                    skips=list(ctx.skips),
+                )
 
         _report_unsupported_sinks(cfg, result)
         result.status = "complete"
@@ -516,6 +584,19 @@ def execute_run(
             "UPDATE runs SET finished_at = ?, status = ?, skipped_json = ? "
             "WHERE id = ?",
             (_now(), result.status, json.dumps(result.skips), run_id),
+        )
+        # LAST, and inside the same `finally` that writes the terminal status,
+        # so the event and the stored row cannot disagree about how the run
+        # ended. A consumer treats this as the end of the stream, so emitting
+        # it only on the success path would hang every watcher of a failed run.
+        _emit(
+            on_event,
+            kind="run_finished",
+            run_id=run_id,
+            status=result.status,
+            new=result.new,
+            seen=result.seen,
+            skips=list(result.skips),
         )
 
     return result
