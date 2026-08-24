@@ -18,6 +18,7 @@ blank page and a green unit suite.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import urllib.request
@@ -38,11 +39,10 @@ pytest.importorskip("fastapi", reason="the ui extra is not installed")
 
 from _browser import needs_browser  # noqa: E402
 
-_DIST = Path(serve_module.__file__).resolve().parent.parent / "ui" / "dist"
-needs_bundle = pytest.mark.skipif(
-    not (_DIST / "index.html").is_file(),
-    reason="the UI bundle is not built; `npm --prefix src/whetstone/ui run build`",
-)
+# FAILS rather than skips wherever CI is set -- see `tests/_bundle.py`. A local
+# `skipif` would let a forgotten `npm run build` turn every test in this file
+# into a skip on a green leg, covering none of the control plane.
+from _bundle import needs_bundle  # noqa: E402
 
 _SEEDS = [
     ("app/pay.py", "divide by zero on an empty basket", "critical", "A"),
@@ -65,33 +65,39 @@ def served(tmp_path: Path):
         encoding="utf-8",
     )
     state = tmp_path / ".state"
-    conn = connect(state)
-    conn.execute(
-        "INSERT INTO runs (id, tier, scope_mode, file_count, started_at, "
-        "status, skipped_json) VALUES ('run-0000000001','deep','full',5,"
-        "'2026-08-24T10:00:00+00:00','complete',?)",
-        ('["hygiene/deps: pip-audit is not installed"]',),
-    )
-    for index, (subject, title, severity, grade) in enumerate(_SEEDS):
-        upsert(
-            conn,
-            Candidate(
-                lens="code-defects",
-                rule_id=f"r{index}",
-                subject=subject,
-                title=title,
-                detail=f"Detail for {title}.",
-                severity=Severity(severity),
-                evidence=Evidence(
-                    kind=EvidenceKind.metric, summary="seeded", data={}
-                ),
-                grade=None if grade is None else Grade(grade),
-                grade_reason=None if grade is None else f"graded {grade}",
-            ),
-            "run-0000000001",
-            "2026-08-24T10:00:00+00:00",
+    # `closing`, not a bare `connect`: a seeding failure between here and the
+    # close left the connection -- and on Windows the file handle -- open for
+    # the rest of the session.
+    with contextlib.closing(connect(state)) as conn:
+        conn.execute(
+            "INSERT INTO runs (id, tier, scope_mode, file_count, started_at, "
+            "status, skipped_json) VALUES ('run-0000000001','deep','full',5,"
+            "'2020-01-01T00:00:00+00:00','complete',?)",
+            ('["hygiene/deps: pip-audit is not installed"]',),
         )
-    conn.close()
+        for index, (subject, title, severity, grade) in enumerate(_SEEDS):
+            upsert(
+                conn,
+                Candidate(
+                    lens="code-defects",
+                    rule_id=f"r{index}",
+                    subject=subject,
+                    title=title,
+                    detail=f"Detail for {title}.",
+                    severity=Severity(severity),
+                    evidence=Evidence(
+                        kind=EvidenceKind.metric, summary="seeded", data={}
+                    ),
+                    grade=None if grade is None else Grade(grade),
+                    grade_reason=None if grade is None else f"graded {grade}",
+                ),
+                "run-0000000001",
+                # PAST, unambiguously. `get_last_run` orders by `started_at`,
+                # so a fixture stamped with today's date at 10:00 outranks a
+                # run started live before 10:00 UTC -- a fixture claiming to
+                # have happened in the future.
+                "2020-01-01T00:00:00+00:00",
+            )
 
     token = serve_module.mint_token()
     sock = serve_module.bind()
@@ -155,7 +161,16 @@ def page(served):
                 lambda msg: problems.append(msg.text) if msg.type == "error" else None,
             )
             page.on("pageerror", lambda exc: problems.append(str(exc)))
-            page.goto(f"{base}/#t={token}", wait_until="networkidle")
+            # `domcontentloaded` plus an explicit wait, NOT `networkidle`.
+            # This page holds an event stream open on the Run tab, and
+            # `networkidle` waits for 500ms of no network activity -- so it is
+            # a heuristic that this app can legitimately never satisfy. It
+            # timed out once during end-to-end verification for exactly that
+            # reason. Waiting for the element that proves React mounted is the
+            # thing actually being asserted.
+            page.goto(f"{base}/#t={token}", wait_until="domcontentloaded")
+            page.wait_for_selector("h1", timeout=60_000)
+            page.wait_for_selector("nav button", timeout=60_000)
             yield page, problems, base, token
         finally:
             browser.close()

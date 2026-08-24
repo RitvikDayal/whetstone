@@ -24,6 +24,23 @@ is a single point of failure for rebinding. Neither substitutes for the other,
 and there is no third thing to fall back on. Do not exempt a route from the
 token because "there are other controls" -- there are not.
 
+WHY THIS IS PLAIN HTTP, WHICH IS A DECISION AND NOT AN OVERSIGHT. The token
+travels in a header over `http://127.0.0.1`, unencrypted. Reading that traffic
+requires either code execution on this machine -- at which point the attacker
+can read the token out of this process's memory and the transport is irrelevant
+-- or, on Windows, an administrator-installed capture driver, which is the same
+bar. The two attacks this file actually defends against are both browser
+mediated and neither is helped by TLS.
+
+The alternatives are worse, concretely. A self-signed certificate puts a
+browser interstitial in front of the tool every time it starts, which teaches
+the user to click through certificate warnings -- a habit with a far larger
+blast radius than the risk it buys off. A locally-trusted CA means installing a
+root certificate on the user's machine, which is permanent, machine-wide, and a
+genuinely larger exposure than an unencrypted loopback socket. Browsers treat
+`http://127.0.0.1` as a SECURE CONTEXT for exactly this reason: the platform has
+already made this trade.
+
 WHAT IS DELIBERATELY NOT BEHIND THE TOKEN. The static bundle. It has to be,
 and the reasoning is not a compromise: the token reaches the app through the
 URL fragment, fragments are never sent to a server, so the very first request

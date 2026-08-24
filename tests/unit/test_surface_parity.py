@@ -305,9 +305,16 @@ def test_a_malformed_stored_severity_cannot_break_or_style_the_listing(seeded):
 
     # It printed at all -- the MarkupError half.
     assert "divide by zero" in output
-    # And the markup is visible rather than applied -- the styling half.
-    assert "[/checkout" in output or "checkout" in output
     assert len(_ids_in(output)) == len(_SEEDS)
+
+    # And the markup is VISIBLE rather than applied -- the styling half,
+    # asserted as literal text. The previous form was
+    # `"[/checkout" in output or "checkout" in output`, and the second arm made
+    # it nearly vacuous: "checkout" appears whether the brackets were escaped
+    # or silently swallowed by Rich, which are the two outcomes being told
+    # apart.
+    assert "[/checkout @ 1280x800]" in output
+    assert "[red]bogus[/red]" in output
 
 
 # --- the cost view, which must not read damage as zero -----------------------

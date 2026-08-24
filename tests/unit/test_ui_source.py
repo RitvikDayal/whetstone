@@ -15,7 +15,24 @@ from pathlib import Path
 import pytest
 
 UI = Path(__file__).resolve().parents[2] / "src" / "whetstone" / "ui"
-SOURCES = sorted(UI.glob("src/*.ts")) + sorted(UI.glob("src/*.tsx"))
+
+# RECURSIVE, under `ui/src` only. The first version globbed `src/*.ts` and
+# `src/*.tsx` -- one level -- and was written when every module sat directly in
+# `src/`. The moment the app grew a `src/screens/` directory, four files
+# rendering untrusted model output stopped being scanned and every test here
+# stayed green. That is the defect this file exists to catch, committed by this
+# file.
+#
+# `ui/node_modules` is excluded rather than left to a glob: a bare `rglob`
+# under `ui/` pulls in thirty TypeScript files from `@babel` and `@jridgewell`,
+# and a scan that reports on somebody else's dependencies is a scan people
+# learn to ignore.
+SOURCES = sorted(
+    path
+    for pattern in ("**/*.ts", "**/*.tsx")
+    for path in (UI / "src").rglob(pattern)
+    if "node_modules" not in path.parts
+)
 
 
 def _code_only(source: str) -> str:
@@ -43,6 +60,28 @@ def test_the_scan_is_reaching_the_front_end():
     """Without this, a moved or renamed directory makes every test below pass
     by matching nothing -- which is how a static scan goes quietly vacuous."""
     assert len(SOURCES) >= 4, [p.name for p in SOURCES]
+
+
+def test_the_scan_reaches_every_module_the_bundle_imports():
+    """Not a count -- the actual set, compared against what is on disk.
+
+    A count is satisfied by any four files, so it stayed green when a new
+    subdirectory of four MORE files went unscanned. This asserts nothing under
+    `ui/src` is missing from `SOURCES`, so adding a directory either extends the
+    scan or fails here.
+    """
+    on_disk = {
+        path.relative_to(UI).as_posix()
+        for path in (UI / "src").rglob("*")
+        if path.suffix in (".ts", ".tsx") and "node_modules" not in path.parts
+    }
+    scanned = {path.relative_to(UI).as_posix() for path in SOURCES}
+    assert on_disk == scanned, on_disk ^ scanned
+
+
+def test_the_scan_does_not_wander_into_dependencies():
+    """A scan that reports on `@babel`'s source is one people stop reading."""
+    assert not any("node_modules" in path.parts for path in SOURCES)
 
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
@@ -98,7 +137,9 @@ def test_the_bundle_is_built_without_an_inline_module_preload_polyfill():
     """Vite injects that polyfill as an INLINE script, and the server's CSP
     carries no `'unsafe-inline'`. Leaving it on means either a blank page or a
     CSP relaxed on the one page that renders model-authored strings."""
-    config = (UI / "vite.config.ts").read_text(encoding="utf-8")
+    # Through `_code_only` like every other scan here: a comment mentioning
+    # the setting would otherwise satisfy an assertion about the setting.
+    config = _code_only((UI / "vite.config.ts").read_text(encoding="utf-8"))
     assert "modulePreload" in config
     assert "polyfill: false" in config
 

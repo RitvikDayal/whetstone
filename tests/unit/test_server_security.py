@@ -29,11 +29,10 @@ from whetstone.store.db import connect
 
 pytest.importorskip("fastapi", reason="the ui extra is not installed")
 
-_UI_DIST = Path(serve_module.__file__).resolve().parent.parent / "ui" / "dist"
-needs_assets = pytest.mark.skipif(
-    not (_UI_DIST / "index.html").is_file(),
-    reason="the UI bundle is not built; run npm --prefix src/whetstone/ui run build",
-)
+# The shared guard, which FAILS rather than skips wherever CI is set.
+# A local `skipif` let a forgotten `npm run build` turn these into skips
+# on a green leg -- see `tests/_bundle.py`.
+from _bundle import needs_bundle as needs_assets  # noqa: E402
 
 
 @pytest.fixture
@@ -331,25 +330,69 @@ def test_the_unauthenticated_shell_contains_no_store_data(live, project):
 # --- the bind address --------------------------------------------------------
 
 
-def test_the_socket_is_bound_to_loopback(live):
+def test_the_socket_reports_a_loopback_address(live):
     """Read off a socket that is actually listening.
 
     NOT a grep for "0.0.0.0". That passes on `"0.0.0." + "0"`, on the empty
-    string (which uvicorn treats as all interfaces), and on any variable, so it
-    reads as a second guard while guarding nothing.
+    string (which uvicorn treats as all interfaces), and on any variable -- it
+    reads as a guard while guarding nothing.
+    """
+    del live
+    import socket as socket_module
+
+    sock = serve_module.bind()
+    try:
+        host, _port = sock.getsockname()
+        assert host == "127.0.0.1"
+        assert socket_module.inet_aton(host)[0] == 127
+    finally:
+        sock.close()
+
+
+def test_the_running_server_does_not_answer_on_a_routable_interface(live):
+    """The measurement the name above only implies.
+
+    A previous version of this test created a probe socket, did nothing with
+    it, and asserted `BIND_HOST == "127.0.0.1"` -- which is a restatement of a
+    constant the AST test below already pins, dressed as a runtime check.
+
+    This connects to the SAME PORT on this machine's routable address. Bound to
+    loopback, that is refused; bound to 0.0.0.0, it would be accepted and the
+    control plane would be reachable from the network.
     """
     _base, _token, port = live
     import socket as socket_module
 
+    routable = _routable_address()
+    if routable is None:  # pragma: no cover - a host with no non-loopback IPv4
+        pytest.skip("this machine has no routable IPv4 address to probe")
+
     probe = socket_module.socket()
+    probe.settimeout(5)
     try:
-        # If the server were bound to 0.0.0.0, binding this port on a specific
-        # non-loopback interface would fail. Instead assert directly: the
-        # module's bind host is the loopback literal, and the running server
-        # answers on it.
-        assert serve_module.BIND_HOST == "127.0.0.1"
+        with pytest.raises(OSError):
+            probe.connect((routable, port))
     finally:
         probe.close()
+
+
+def _routable_address() -> str | None:
+    """This machine's non-loopback IPv4, without sending anything.
+
+    A connected UDP socket picks a source address from the routing table and
+    transmits nothing, so this works offline and touches no network.
+    """
+    import socket as socket_module
+
+    probe = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_DGRAM)
+    try:
+        probe.connect(("203.0.113.1", 9))  # TEST-NET-3, reserved, unroutable
+        host = probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+    return None if host.startswith("127.") else host
 
 
 def test_the_bind_host_is_a_literal_with_no_configuration_path():
@@ -422,7 +465,16 @@ def test_the_config_route_reports_the_ceiling_caveats(live):
 
 
 def test_short_ids_use_the_same_prefix_length_as_the_cli():
-    assert ID_PREFIX == 8
+    """PARITY, not a restatement of the constant.
+
+    The previous body asserted `ID_PREFIX == 8`, which the name does not claim
+    and which stays green while the CLI uses a different length. `decide`
+    accepts the prefix `findings` prints, so the two have to agree or a user
+    retypes an id the resolver will not match.
+    """
+    from whetstone import cli as cli_module
+
+    assert cli_module._ID_PREFIX == ID_PREFIX
 
 
 # --- the extra being ABSENT, which CI otherwise never exercises ---------------
