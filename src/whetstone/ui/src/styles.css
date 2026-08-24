@@ -1,0 +1,252 @@
+/* Same palette and the same constraints as report/html.py: no web fonts, no
+   remote images, nothing that leaves the document. The control plane is served
+   from loopback and must render identically on a machine with no network. */
+
+:root {
+  --bg: #ffffff;
+  --fg: #17181c;
+  --muted: #61646b;
+  --line: #e3e5e9;
+  --card: #f7f8fa;
+  --low: #6b7280;
+  --medium: #b45309;
+  --high: #b91c1c;
+  --critical: #7f1d1d;
+  --killed: #b91c1c;
+  --ok: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --fg: #e8eaee;
+    --muted: #9aa0a8;
+    --line: #2a2e35;
+    --card: #1b1e23;
+    --low: #9aa0a8;
+    --medium: #f0b429;
+    --high: #f87171;
+    --critical: #fca5a5;
+    --killed: #f87171;
+    --ok: #4ade80;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 2rem 1.25rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+}
+
+main {
+  max-width: 62rem;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0 0 0.25rem;
+}
+
+.sub,
+.muted {
+  color: var(--muted);
+}
+
+.sub {
+  margin: 0 0 1.5rem;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+}
+
+/* --- banners ------------------------------------------------------------ */
+
+.banner {
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  background: var(--card);
+  padding: 0.85rem 1rem;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+}
+
+.banner ul {
+  margin: 0.4rem 0 0;
+  padding-left: 1.1rem;
+  color: var(--muted);
+}
+
+.banner-quiet {
+  border-left-color: var(--muted);
+}
+
+.banner-warn {
+  border-left-color: var(--medium);
+}
+
+/* Louder than the skip list on purpose: a skip says part of the work was not
+   done, this says the whole page may be a partial record of a partial run. */
+.banner-alarm {
+  border-color: var(--high);
+  border-left-color: var(--high);
+  color: var(--high);
+}
+
+/* --- findings ----------------------------------------------------------- */
+
+.findings {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.finding {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  margin-bottom: 0.6rem;
+  overflow: hidden;
+}
+
+.finding.killed {
+  opacity: 0.72;
+}
+
+.finding-head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  padding: 0.8rem 1rem;
+  cursor: pointer;
+}
+
+.finding-head:hover {
+  background: rgba(127, 127, 127, 0.07);
+}
+
+.finding-head:focus-visible {
+  outline: 2px solid var(--medium);
+  outline-offset: -2px;
+}
+
+.verdict {
+  flex: 0 0 auto;
+  font-weight: 600;
+  font-size: 0.74rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  min-width: 6.5rem;
+}
+
+.verdict-A {
+  color: var(--ok);
+}
+
+.verdict-B,
+.verdict-C {
+  color: var(--medium);
+}
+
+.verdict-killed {
+  color: var(--killed);
+}
+
+.verdict-none {
+  color: var(--muted);
+}
+
+.sev {
+  flex: 0 0 auto;
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  min-width: 4.5rem;
+}
+
+.sev-low {
+  color: var(--low);
+}
+.sev-medium {
+  color: var(--medium);
+}
+.sev-high {
+  color: var(--high);
+}
+.sev-critical {
+  color: var(--critical);
+}
+
+.subject {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.title {
+  flex: 1 1 auto;
+}
+
+.finding-body {
+  padding: 0 1rem 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.detail {
+  white-space: pre-wrap;
+  margin: 0.8rem 0 0;
+}
+
+.why {
+  color: var(--muted);
+  margin: 0.6rem 0 0;
+}
+
+.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.9rem;
+  margin: 0.9rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.meta dt {
+  font-weight: 600;
+}
+
+.meta dd {
+  margin: 0;
+}
+
+/* Model output and advisory text carry URLs and package specifiers, neither of
+   which has a break opportunity -- the same measurement report/html.py records.
+   `anywhere` rather than `break-word` because only `anywhere` also stops an
+   oversized token setting the element's min-content width. */
+.detail,
+.why,
+.subject,
+.title,
+.banner li {
+  overflow-wrap: anywhere;
+}
+
+.footnote {
+  color: var(--muted);
+  font-size: 0.88rem;
+  margin-top: 1.2rem;
+}

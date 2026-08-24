@@ -41,6 +41,13 @@ playwright install chromium
 Without it that lens reports it could not run, and says which command fixes it.
 It never silently finds nothing.
 
+The local control plane is an extra for the same reason -- installing Whetstone
+to run `hygiene` in CI should not also install a web server.
+
+```bash
+pip install 'whetstone-cli[ui]'
+```
+
 From a checkout instead, which is what you want if you intend to change it:
 
 ```bash
@@ -62,7 +69,7 @@ It never silently finds nothing.
 
 ## Commands
 
-All seven are real.
+All eight are real.
 
 ```bash
 whetstone init      # interactive setup; verifies every answer by running it
@@ -71,8 +78,27 @@ whetstone run       # find issues
 whetstone findings  # list what it found
 whetstone decide    # accept, reject, defer, hand off - the decision survives re-runs
 whetstone report    # write a shareable HTML report
+whetstone ui        # the same queue, in a browser  (needs the `ui` extra)
 whetstone version   # print the installed version
 ```
+
+### `whetstone ui`
+
+A local page showing the same queue `whetstone findings` prints, in the same
+order, with the same verdicts -- one projection feeds both, and a test drives a
+real browser to check the terminal and the DOM agree.
+
+It binds `127.0.0.1` and requires a per-session token on every API call.
+**Localhost is not a security boundary:** any page in your browser can reach a
+local server, and an attacker's domain can re-resolve to `127.0.0.1` and become
+same-origin with it. The token and a `Host` check are the two things that stop
+those, and neither substitutes for the other.
+
+The token is printed only if you ask for it with `--print-url`. Read
+[docs/control-plane.md](docs/control-plane.md) before exposing it to anything.
+
+The list is read-only in this release; use `whetstone decide` to act on a
+finding.
 
 ### Exit codes
 

@@ -21,6 +21,21 @@ jobs:
       # this replaces was node20, which Actions has deprecated.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # BEFORE `uv sync`, and the order is load-bearing. `uv sync`
+      # editable-installs the project, which invokes the build backend, which
+      # runs `hatch_build.py`. With no bundle present and no Node on PATH that
+      # hook can only warn -- so the front-end has to exist before Python is
+      # touched, or the wheel test below is measuring a bundle CI built by
+      # accident rather than one it built on purpose.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: src/whetstone/ui/package-lock.json
+      - run: npm ci
+        working-directory: src/whetstone/ui
+      - run: npm run build
+        working-directory: src/whetstone/ui
       - run: uv python install ${{ matrix.python }}
       # --python, or the matrix is decorative. `requires-python = ">=3.11"`
       # means uv is free to pick ANY compatible interpreter it finds, and the
@@ -40,3 +55,36 @@ jobs:
         run: uv run playwright install chromium
       - run: uv run ruff check src tests
       - run: uv run pytest -q
+
+  # A WHEEL IS BUILT AND READ, on one leg only because the artifact is
+  # platform-independent and building it four times proves nothing four times.
+  #
+  # This exists because `tests/unit/test_package.py` opens a built wheel and
+  # asserts the control plane is inside it, and until now nothing in CI ever
+  # built one -- `uv build` appears only in release.yml. A packaging gate that
+  # runs for the first time during a release is a gate that fails during a
+  # release.
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: src/whetstone/ui/package-lock.json
+      - run: npm ci
+        working-directory: src/whetstone/ui
+      - run: npm run build
+        working-directory: src/whetstone/ui
+      - run: uv sync --all-groups --all-extras
+      - run: uv run pytest tests/unit/test_package.py -q
+      # And the wheel actually installs and runs, from a clean environment
+      # that has never seen this source tree. `--no-cache` so a stale build
+      # cannot stand in for the one just produced.
+      - run: uv build --wheel
+      - run: |
+          uv venv /tmp/clean
+          uv pip install --python /tmp/clean/bin/python --no-cache dist/*.whl
+          /tmp/clean/bin/whetstone version

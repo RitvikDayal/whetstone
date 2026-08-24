@@ -1,9 +1,13 @@
 import re
+import zipfile
+from pathlib import Path
 
 import pytest
 
 import whetstone
 from whetstone.errors import ConfigError, LiteralSecretError, WhetstoneError
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # The versions this project ships, and nothing else.
 #
@@ -74,3 +78,80 @@ def test_version_is_exposed():
 def test_every_error_descends_from_base():
     assert issubclass(ConfigError, WhetstoneError)
     assert issubclass(LiteralSecretError, ConfigError)
+
+
+# --- the built wheel actually contains the control plane ---------------------
+#
+# THIS IS THE GATE, not `hatch_build.py`. The hook is a convenience that does
+# not even run on the main install path (`pip install` from a wheel never
+# invokes a build backend). What stops a wheel shipping an empty UI is reading
+# the wheel.
+#
+# Measured, twice, and both measurements changed the packaging:
+#   1. `.gitignore` carries an unanchored `dist/`, and hatchling's file
+#      selection is VCS-ignore-aware, so the built bundle was excluded from
+#      both wheel and sdist. Fixed with `[tool.hatch.build] artifacts`.
+#   2. With that fixed, the wheel then carried the entire `node_modules` tree --
+#      over three thousand entries. Fixed with an explicit `exclude`.
+# Neither was predicted. Both were found by opening the zip.
+
+
+@pytest.fixture(scope="module")
+def wheel_names(tmp_path_factory) -> list[str]:
+    """The entry names of a REAL wheel, built once for this module.
+
+    NO SKIP BRANCH. A test that skips when it cannot find a wheel is exactly
+    the "check that quietly does not run" defect, and this one guards a
+    silently-empty release artifact. `build` and `hatchling` are dev
+    dependencies so this always has what it needs.
+
+    `WHETSTONE_SKIP_UI_BUILD` is deliberately NOT set: the point is to exercise
+    the real path including the build hook. If the bundle is already built the
+    hook returns immediately; if it is not and npm is present, it builds it.
+
+    Module-scoped because a wheel build is seconds, not milliseconds, and both
+    assertions below read the same artifact.
+    """
+    import build
+
+    into = tmp_path_factory.mktemp("wheel")
+    wheel = Path(build.ProjectBuilder(str(_REPO_ROOT)).build("wheel", str(into)))
+    with zipfile.ZipFile(wheel) as archive:
+        return archive.namelist()
+
+
+def test_the_built_wheel_contains_the_control_plane(wheel_names):
+    names = wheel_names
+
+    assert "whetstone/ui/dist/index.html" in names, (
+        "the wheel shipped without the control plane's entry point. Every "
+        "`whetstone ui` from this wheel would refuse to start."
+    )
+    hashed = [
+        n
+        for n in names
+        if n.startswith("whetstone/ui/dist/assets/") and n.endswith(".js")
+    ]
+    assert hashed, (
+        f"index.html shipped with no JavaScript beside it: {names[:20]}. A "
+        "shell with no bundle renders an empty page and looks like a routing "
+        "bug."
+    )
+
+
+def test_the_wheel_does_not_ship_node_modules_or_front_end_source(wheel_names):
+    """A wheel is not a development checkout.
+
+    The first build with `artifacts` declared carried `node_modules` in full --
+    `.bin` shims, a nested lockfile, every transitive package. Nothing under
+    `ui/` except `dist/` is importable, installable, or useful at runtime.
+    """
+    names = wheel_names
+
+    stowaways = [
+        n
+        for n in names
+        if n.startswith("whetstone/ui/") and not n.startswith("whetstone/ui/dist/")
+    ]
+    assert stowaways == [], f"the wheel carries front-end files it does not need: {stowaways[:15]}"
+    assert not any("node_modules" in n for n in names)

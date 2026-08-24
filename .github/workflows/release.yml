@@ -39,6 +39,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # The front-end, BEFORE uv touches Python. `uv sync` and `uv build` both
+      # invoke the build backend, and `hatch_build.py` can only warn when there
+      # is no bundle and no Node -- so a release built without these steps would
+      # publish a wheel with no control plane in it. `test_package.py` would
+      # catch it, which is the point of ordering rather than hoping.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: src/whetstone/ui/package-lock.json
+      - run: npm ci
+        working-directory: src/whetstone/ui
+      - run: npm run build
+        working-directory: src/whetstone/ui
       - run: uv python install ${{ matrix.python }}
       # --python for the same reason ci.yml gives: without it the matrix does
       # not bind, and a release could be verified twice on one interpreter.
@@ -56,6 +70,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # The front-end, BEFORE uv touches Python. `uv sync` and `uv build` both
+      # invoke the build backend, and `hatch_build.py` can only warn when there
+      # is no bundle and no Node -- so a release built without these steps would
+      # publish a wheel with no control plane in it. `test_package.py` would
+      # catch it, which is the point of ordering rather than hoping.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: src/whetstone/ui/package-lock.json
+      - run: npm ci
+        working-directory: src/whetstone/ui
+      - run: npm run build
+        working-directory: src/whetstone/ui
       - run: uv build
 
       # THE TAG MUST MATCH THE VERSION IN THE WHEEL. Without this, `v0.2.0`

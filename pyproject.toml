@@ -28,6 +28,13 @@ dependencies = [
 # missing pip-audit. It never silently skips.
 browser = ["playwright>=1.47"]
 
+# The control plane. Same argument as `browser` one line up: installing
+# Whetstone to run `hygiene` in CI should not also install a web server. The
+# BUILT ASSETS ship in the base wheel regardless -- they are a few hundred
+# kilobytes, and splitting them from the extra would give the extra two
+# different failure modes instead of one.
+ui = ["fastapi>=0.115", "uvicorn>=0.30"]
+
 [project.scripts]
 whetstone = "whetstone.cli:app"
 
@@ -41,11 +48,71 @@ Source = "https://github.com/RitvikDayal/whetstone"
 # says so when there is none. It is pinned here because the regression tests for
 # the ambient-environment defect run the real tool, and a test that silently
 # never runs is how that defect survived three review passes.
-dev = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.5", "pip-audit>=2.9", "playwright>=1.47"]
+# `build` and `hatchling` are here so `tests/unit/test_package.py` can build a
+# real wheel and read its zip. Without them that test would have to skip when
+# no wheel happened to be lying around -- and the thing it guards is a wheel
+# that silently ships without its front-end, so a skip is the failure mode.
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "pip-audit>=2.9",
+    "playwright>=1.47",
+    "build>=1.2",
+    "hatchling>=1.25",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Builds the control plane's front-end when there is one to build. Read
+# `hatch_build.py`'s docstring before changing it -- the hook is a convenience
+# and `tests/unit/test_package.py` is the gate, and which is which was measured
+# rather than assumed.
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+# THE BUILT UI, STATED EXPLICITLY, and this is not belt-and-braces -- without
+# it the control plane ships in nothing. Hatchling's default file selection is
+# VCS-ignore-aware, and `.gitignore` carries an unanchored `dist/` for the
+# Python build directory, which also matches `src/whetstone/ui/dist/`.
+# Measured: `git check-ignore -v src/whetstone/ui/dist/index.html` resolves to
+# `.gitignore:6`, and a wheel built without this stanza contained zero entries
+# under `whetstone/ui/` while every other non-Python data file -- prompts,
+# schemas -- was present.
+#
+# That is precisely the failure this milestone was most afraid of, a wheel
+# that silently ships an empty UI, arriving through a door nobody checked.
+# `artifacts` is exempt from `exclude` and from the VCS ignore rules, which is
+# why it is the right instrument. Declared at `[tool.hatch.build]` rather than
+# per target so the sdist carries them too -- that is what lets an sdist
+# install work on a machine with no Node.
+#
+# `tests/unit/test_package.py` reads the built wheel's zip and fails if these
+# are missing. That test, not this stanza, is the enforcing mechanism.
+[tool.hatch.build]
+artifacts = ["src/whetstone/ui/dist/**"]
+
+# ...and everything else under `ui/` stays OUT. `artifacts` re-includes the
+# built bundle; without these excludes the wheel also carried the front-end
+# SOURCE and the whole of `node_modules` -- measured at over three thousand
+# entries, including `.bin` shims and a nested lockfile. A wheel is not a
+# development checkout, and nothing here is importable Python.
+#
+# `node_modules/` is named explicitly rather than left to `ui/.gitignore`:
+# relying on a nested ignore file to keep tens of megabytes out of a published
+# artifact is a promise, and the measurement above is what it is worth.
+exclude = [
+  "src/whetstone/ui/node_modules/**",
+  "src/whetstone/ui/src/**",
+  "src/whetstone/ui/index.html",
+  "src/whetstone/ui/package.json",
+  "src/whetstone/ui/package-lock.json",
+  "src/whetstone/ui/tsconfig.json",
+  "src/whetstone/ui/vite.config.ts",
+  "src/whetstone/ui/.gitignore",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/whetstone"]

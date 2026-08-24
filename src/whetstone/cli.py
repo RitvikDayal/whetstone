@@ -309,7 +309,10 @@ def _grade_cell(grade: str | None) -> str:
         return "[green]A[/green]"
     if grade == "C":
         return "[yellow]C[/yellow]"
-    return grade
+    # An UNKNOWN grade, escaped. The three above are literals this module
+    # wrote; this branch renders whatever the column happens to hold, which is
+    # unconstrained TEXT -- see the `severity` cell for the same argument.
+    return escape(_printable(grade))
 
 
 @app.command()
@@ -365,7 +368,15 @@ def findings(
         table.add_row(
             row["short_id"],
             _grade_cell(row["grade"]),
-            row["severity"],
+            # ESCAPED, like every other stored string in this row. `Candidate`
+            # validates severity and grade at construction, but the SQLite
+            # schema constrains neither -- they are plain TEXT columns, and a
+            # database written by a different build, hand-edited, or restored
+            # from a partial file can hold anything. An unescaped `[red]` in a
+            # severity is silently swallowed by Rich; an unescaped `[/x]`
+            # raises MarkupError and loses the whole listing at the moment it
+            # prints. Both already happened once, to `run`'s skip lines.
+            escape(_printable(row["severity"])),
             _printable(row["lens"]),
             escape(_printable(row["subject"])),
             escape(_printable(row["title"][:70])),
@@ -512,3 +523,55 @@ def report(
         f"[green]Wrote[/green] {escape(_printable(str(written)))}",
         soft_wrap=True,
     )
+
+
+_NoOpenOption = typer.Option(
+    False, "--no-open", help="Do not open a browser. Prints the address only."
+)
+_PrintUrlOption = typer.Option(
+    False,
+    "--print-url",
+    help="Print the full address INCLUDING the session token. Anyone who "
+    "reads that line can act on this project.",
+)
+_PortOption = typer.Option(
+    0, "--port", help="Port to listen on. 0 lets the OS pick a free one."
+)
+
+
+@app.command(name="ui")
+def ui_command(
+    path: Path = _PathOption,
+    port: int = _PortOption,
+    no_open: bool = _NoOpenOption,
+    print_url: bool = _PrintUrlOption,
+) -> None:
+    """Open the local control plane in a browser.
+
+    Binds 127.0.0.1 only and requires a per-session token on every API call --
+    localhost is not a security boundary, and any page in your browser can
+    reach a local server. See docs/control-plane.md.
+    """
+    try:
+        cfg, project_root, root = _load(path.resolve())
+        # Imported here, not at module scope: `whetstone --help` must work
+        # without the `ui` extra installed, and this module is imported for
+        # every command.
+        from .server.serve import serve
+
+        serve(
+            config=cfg,
+            project_root=project_root,
+            state_root=root,
+            port=port,
+            open_browser=not no_open,
+            show_url=print_url,
+            announce=lambda line: console.print(escape(_printable(line))),
+        )
+    except WhetstoneError as exc:
+        console.print(f"[red]{escape(_printable(str(exc)))}[/red]")
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt:
+        # Ctrl+C is how this command is MEANT to end. A traceback there reads
+        # as a crash and teaches the user that stopping it is an error.
+        console.print("Stopped.")

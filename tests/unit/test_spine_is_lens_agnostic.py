@@ -67,6 +67,22 @@ _ARGUED_SPINE_KNOWLEDGE: dict[tuple[str, str], str] = {
         "both do, and a third lens driving the app would too. Config is "
         "declarative and validated centrally; pushing it into lens_options "
         "would mean a typo in a viewport is accepted silently.",
+    ("server/serve.py", "webbrowser"):
+        "the STDLIB module that asks the operating system to open a URL. This "
+        "is a word collision with the lens, not knowledge of it: `webbrowser."
+        "open` hands a string to the user's default application and cannot "
+        "drive, inspect, screenshot or measure anything. The control plane "
+        "is not a lens and does not go through the lens contract at all -- it is "
+        "a surface over the store, in the same category as `cli.py` and "
+        "`report/html.py`. Renaming the import to dodge this scan was the "
+        "alternative and is worse: a guard you hide from is a guard that stops "
+        "working while still reporting green.",
+    ("server/serve.py", "open_browser"):
+        "the flag behind `whetstone ui --no-open`, naming the same stdlib call "
+        "as the entry above. The control plane is not a lens.",
+    ("cli.py", "open_browser"):
+        "the CLI passing that flag through -- same stdlib call, one frame up, "
+        "and the command surface is not a lens either.",
 }
 
 
@@ -177,12 +193,26 @@ def test_the_gate_does_not_fire_on_prose_or_on_the_reports_own_html():
 
 def test_every_argued_entry_says_why_a_third_lens_would_need_it():
     """The allowlist is where this gate would be quietly defeated, so an entry
-    costs a sentence rather than a name."""
+    costs a sentence rather than a name.
+
+    TWO ACCEPTABLE ARGUMENTS, and the second was added when the control plane
+    arrived. The original gate assumed every consumer of these words is a lens,
+    so the only way out was "a third lens would need this too". `whetstone ui`
+    is not a lens at all -- it never touches `LensPack`, produces no candidates
+    and yields no evidence -- and `webbrowser.open` hands a URL to the
+    operating system rather than driving anything. That assumption was
+    incomplete rather than wrong, so the second argument is admitted
+    explicitly, with its own required words, instead of being smuggled in by
+    phrasing an unrelated reason to contain "any lens".
+    """
+    third_lens = ("third lens", "ANY lens", "any lens")
+    not_a_lens = ("is not a lens", "not a lens and")
     for key, why in _ARGUED_SPINE_KNOWLEDGE.items():
         assert why and len(why.split()) >= 10, key
-        assert "third lens" in why or "ANY lens" in why or "any lens" in why, (
-            f"{key}: the reason must argue that a lens OTHER than rendered-ui "
-            "would need this. If it would not, it is an accommodation."
+        assert any(phrase in why for phrase in third_lens + not_a_lens), (
+            f"{key}: the reason must argue EITHER that a lens other than "
+            "rendered-ui would need this, OR that the module is not a lens at "
+            "all. If neither is true, it is an accommodation."
         )
 
 
