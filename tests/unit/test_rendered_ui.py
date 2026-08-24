@@ -1367,11 +1367,6 @@ def _drive_that_spends(ctx, budgeted, origin, viewports):
             stage="drive",
             prompt="look",
             schema={"type": "object"},
-            # , not "drive": 
-            # has no entry for a rendered-ui stage name at all -- the
-            # stage-name registry gap M2 recorded as a departure. The profile
-            # is irrelevant to what this test measures, which is that the
-            # charge lands on the ledger.
             # `hunt`, not `drive`: `policy/profiles.py` has no entry for any
             # rendered-ui stage name -- the stage-name registry gap M2 recorded
             # as a departure rather than fixed. The profile is irrelevant to

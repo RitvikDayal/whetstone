@@ -230,9 +230,36 @@ def cost_view(state_root: Path) -> dict[str, Any]:
                     f"{type(record).__name__}"
                 )
 
-    total_usd = sum(_number(r.get("spent_usd")) for r in records)
-    total_calls = sum(int(_number(r.get("calls"))) for r in records)
-    total_unmeasured = sum(int(_number(r.get("unmeasured_calls"))) for r in records)
+    # MALFORMED FIELDS ARE NAMED, not quietly read as zero. These files are
+    # JSON on disk and nothing revalidates them between runs, so a truncated
+    # write or a hand edit can leave `"spent_usd": null` -- and coercing that
+    # to 0.0 in silence turns real spend into $0.00 on the one screen whose
+    # entire job is to show what was spent. Same under-count `Budget.spend`
+    # already refuses to make one layer down.
+    total_usd = 0.0
+    total_calls = 0
+    total_unmeasured = 0
+    for record in records:
+        where = str(record.get("run_id") or "a cost record")
+        for field, add in (
+            ("spent_usd", "usd"),
+            ("calls", "calls"),
+            ("unmeasured_calls", "unmeasured"),
+        ):
+            value = _number(record.get(field))
+            if value is None:
+                unreadable.append(
+                    f"{where}: `{field}` is {record.get(field)!r}, which is not "
+                    f"a number. It is NOT counted as zero -- the totals below "
+                    f"are short by an unknown amount."
+                )
+                continue
+            if add == "usd":
+                total_usd += value
+            elif add == "calls":
+                total_calls += int(value)
+            else:
+                total_unmeasured += int(value)
 
     return {
         "records": records,
@@ -253,14 +280,18 @@ def cost_view(state_root: Path) -> dict[str, Any]:
     }
 
 
-def _number(value: Any) -> float:
-    """*value* as a float, or 0.0 when it is not a number.
+def _number(value: Any) -> float | None:
+    """*value* as a float, or None when it is not a number.
 
-    Cost records are JSON on disk and nothing revalidates them between runs, so
-    a hand-edited or truncated file must not take down the screen that would
-    have shown the damage. `bool` is excluded because `True` is an `int` in
-    Python and summing it as 1.0 would invent a dollar.
+    `None` RATHER THAN 0.0, and the difference is the whole point: a cost
+    record is JSON on disk that nothing revalidates between runs, and reading a
+    malformed `spent_usd` as zero reports money that was spent as money that
+    was not. The caller names it instead. A bad file must not take down the
+    screen that would have shown the damage, and it must not be silent either.
+
+    `bool` is excluded because `True` is an `int` in Python, and summing it as
+    1.0 would invent a dollar.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0.0
+        return None
     return float(value)

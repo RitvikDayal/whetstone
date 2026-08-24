@@ -51,6 +51,16 @@ runner = CliRunner()
 _GRADE_RANK = {"A": 0, "B": 1, None: 2, "C": 3, "D": 4}
 _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2}
 
+# One data row of the table `whetstone findings` prints, capturing the short id
+# and keeping the whole line -- so a test can ask what a SPECIFIC row said
+# rather than what the document contained somewhere.
+#
+# `│` is Rich's box-drawing vertical, written as an escape so this file
+# stays ASCII. Defined ONCE: two copies of this pattern drifted within an hour,
+# one of them into a `\s` that Python read as an invalid escape and warned
+# about rather than matching.
+_ROW = re.compile("^\u2502" + r"\s*([0-9a-f]{8})\s.*$", re.MULTILINE)
+
 
 def _expected_order(rows) -> list[str]:
     """Ids in the order `store/findings.py`'s prose says they should come."""
@@ -131,6 +141,22 @@ def seeded(tmp_path: Path):
     conn.close()
 
 
+# Rich sizes a table to the console, and `cli.console` is built at IMPORT time
+# from whatever terminal (or absence of one) the suite happens to run under. At
+# the 80-column default a long title is wrapped or elided, so an assertion about
+# a title would fail on a narrow terminal and pass on a wide one -- a test whose
+# verdict depends on the window it ran in. Pinned wide, once, for every
+# invocation below.
+_CONSOLE_WIDTH = 240
+
+
+@pytest.fixture(autouse=True)
+def _wide_console(monkeypatch):
+    import whetstone.cli as cli_module
+
+    monkeypatch.setattr(cli_module.console, "_width", _CONSOLE_WIDTH, raising=False)
+
+
 def _cli(tmp_path: Path, *args: str) -> str:
     result = runner.invoke(app, [*args, "--path", str(tmp_path)])
     assert result.exit_code == 0, result.output
@@ -150,7 +176,7 @@ def _ids_in(output: str) -> list[str]:
     nothing, and would have reported perfect agreement between a populated API
     and an empty terminal.
     """
-    return re.findall("^│\\s*([0-9a-f]{8})\\s", output, flags=re.MULTILINE)
+    return [match.group(1) for match in _ROW.finditer(output)]
 
 
 def test_the_store_order_matches_the_rule_it_documents(seeded):
@@ -184,10 +210,23 @@ def test_a_killed_finding_is_killed_on_every_surface(seeded):
     assert killed, "the fixture must contain a killed finding or this proves nothing"
 
     output = _cli(tmp_path, "findings")
-    assert output.count("killed") >= len(killed)
+
+    # BOUND TO THE ROW, not counted in the document. `output.count("killed")`
+    # also matches the footnote under the table, which says the word once per
+    # listing -- so with one killed finding the count assertion passed against
+    # a table whose grade column said nothing at all. The word has to be on the
+    # same line as the id it describes.
+    rows = {match.group(1): match.group(0) for match in _ROW.finditer(output)}
+    assert len(rows) == len(_SEEDS)
     for finding in killed:
         assert finding["grade"] == "D"
         assert finding["graded"] is True
+        assert "killed" in rows[finding["short_id"]], rows[finding["short_id"]]
+
+    # ...and NOT on the rows that were not killed.
+    for finding in view:
+        if not finding["killed"]:
+            assert "killed" not in rows[finding["short_id"]]
 
 
 def test_an_ungraded_finding_is_never_reported_as_killed(seeded):
@@ -243,3 +282,114 @@ def test_short_ids_are_long_enough_to_be_unique_in_the_fixture(seeded):
     shorts = [v["short_id"] for v in findings_view(conn, state=None)]
     assert len(set(shorts)) == len(shorts)
     assert all(len(s) == ID_PREFIX for s in shorts)
+
+
+def test_a_malformed_stored_severity_cannot_break_or_style_the_listing(seeded):
+    """The columns `Candidate` validates and the SCHEMA does not.
+
+    `severity` and `grade` are plain TEXT in `store/db.py` with no CHECK
+    constraint, so validation lives only on the write path a lens takes. A row
+    written by a different build, hand-edited, or restored from a torn file can
+    hold anything -- and Rich reads a bracket as markup. `[/x]` raises
+    MarkupError and destroys the whole listing at the moment it prints;
+    `[red]` is silently swallowed and the cell renders blank. `run`'s skip
+    lines already shipped this defect once.
+    """
+    tmp_path, conn = seeded
+    conn.execute(
+        "UPDATE findings SET severity = ?, grade = ? WHERE rule_id = 'k1'",
+        ("[/checkout @ 1280x800]", "[red]bogus[/red]"),
+    )
+
+    output = _cli(tmp_path, "findings")
+
+    # It printed at all -- the MarkupError half.
+    assert "divide by zero" in output
+    # And the markup is visible rather than applied -- the styling half.
+    assert "[/checkout" in output or "checkout" in output
+    assert len(_ids_in(output)) == len(_SEEDS)
+
+
+# --- the cost view, which must not read damage as zero -----------------------
+
+
+def _cost_record(state_root: Path, name: str, payload: dict) -> None:
+    import json
+
+    directory = state_root / "costs"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_a_malformed_cost_field_is_reported_rather_than_read_as_zero(tmp_path):
+    """The signature failure, in the one view whose job is showing spend.
+
+    Nothing revalidates these files between runs, so a truncated write or a
+    hand edit can leave `"spent_usd": null`. Coercing that to 0.0 turns real
+    money into $0.00 on the screen built to show it -- the same silent
+    under-count `Budget.spend` refuses to make one layer down, where an
+    unmeasured call is counted as unmeasured rather than as free.
+    """
+    from whetstone.readmodel import cost_view
+
+    _cost_record(
+        tmp_path,
+        "run-1.code-defects.json",
+        {"run_id": "run-1", "lens": "code-defects", "spent_usd": None, "calls": 3,
+         "unmeasured_calls": 0, "stages": []},
+    )
+    _cost_record(
+        tmp_path,
+        "run-2.code-defects.json",
+        {"run_id": "run-2", "lens": "code-defects", "spent_usd": 0.25, "calls": 1,
+         "unmeasured_calls": 0, "stages": []},
+    )
+
+    view = cost_view(tmp_path)
+
+    assert view["total_usd"] == pytest.approx(0.25)
+    assert any("spent_usd" in line and "run-1" in line for line in view["unreadable"])
+    assert any("short by an unknown amount" in line for line in view["unreadable"])
+
+
+def test_a_record_that_is_not_json_is_named(tmp_path):
+    from whetstone.readmodel import cost_view
+
+    (tmp_path / "costs").mkdir(parents=True)
+    (tmp_path / "costs" / "run-1.code-defects.json").write_text("{ truncated",
+                                                                encoding="utf-8")
+
+    view = cost_view(tmp_path)
+
+    assert view["records"] == []
+    assert len(view["unreadable"]) == 1
+    assert "run-1.code-defects.json" in view["unreadable"][0]
+
+
+def test_a_clean_cost_directory_reports_nothing_unreadable(tmp_path):
+    """The counterweight: a warning that always fires carries no information."""
+    from whetstone.readmodel import cost_view
+
+    _cost_record(
+        tmp_path,
+        "run-1.code-defects.json",
+        {"run_id": "run-1", "lens": "code-defects", "spent_usd": 1.5, "calls": 4,
+         "unmeasured_calls": 1, "stages": []},
+    )
+
+    view = cost_view(tmp_path)
+
+    assert view["unreadable"] == []
+    assert view["total_usd"] == pytest.approx(1.5)
+    assert view["unmeasured_calls"] == 1
+    assert view["lenses_with_records"] == ["code-defects"]
+
+
+def test_no_cost_directory_at_all_is_empty_not_an_error(tmp_path):
+    from whetstone.readmodel import cost_view
+
+    view = cost_view(tmp_path)
+
+    assert view["records"] == []
+    assert view["total_usd"] == 0.0
+    assert view["unreadable"] == []

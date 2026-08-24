@@ -384,7 +384,12 @@ def test_the_record_is_keyed_by_lens_as_well_as_run(tmp_path):
         "../../evil",
         "../" * 8 + "evil",
         "a/b",
-        "a\b",
+        # `"a\\b"`, NOT `"a\b"`. The first version of this list wrote `"a\b"`,
+        # which Python reads as `a` followed by U+0008 BACKSPACE -- so the
+        # Windows-separator case, on the platform this project targets first,
+        # was never tested at all. A parametrised case that does not contain
+        # the character it is named for is a row that always passes.
+        "a\\b",
         "C:evil",
         "with space",
         "..",
@@ -479,3 +484,27 @@ def test_a_record_that_cannot_be_written_is_reported_rather_than_swallowed(tmp_p
     )
 
     assert any("spent and not recorded" in s for s in skips)
+
+
+def test_lens_names_differing_only_in_case_get_different_files():
+    """Windows and macOS fold case, so `Foo` and `foo` are ONE file there.
+
+    Both survive character sanitisation unchanged, so the `safe != lens` check
+    alone let them collide -- and a collision here is a lens's whole spend
+    silently overwritten by another's. Asserted on the filename rather than by
+    writing two files, because on a case-SENSITIVE filesystem writing them
+    would pass while the Windows and macOS behaviour stayed broken.
+    """
+    assert _cost_filename("run-1", "Foo") != _cost_filename("run-1", "foo")
+    assert (
+        _cost_filename("run-1", "Foo").lower()
+        != _cost_filename("run-1", "foo").lower()
+    ), "the names must differ AFTER case folding, or the filesystem merges them"
+
+
+def test_the_ordinary_lens_names_keep_their_plain_filenames():
+    """The digest is for names that need disambiguating. `code-defects` and
+    `rendered-ui` are already lower-case and already safe, and a hash suffix on
+    every record would make the directory unreadable for no reason."""
+    assert _cost_filename("run-1", "code-defects") == "run-1.code-defects.json"
+    assert _cost_filename("run-1", "rendered-ui") == "run-1.rendered-ui.json"

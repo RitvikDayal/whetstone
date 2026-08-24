@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import subprocess
 import sys
@@ -314,9 +315,23 @@ def test_state_path_check_is_present(tmp_path):
 
 
 def _marker(tmp_path):
-    """A command whose only job is to prove whether it ran."""
+    """A command whose only job is to prove whether it ran.
+
+    The path is BASE64-ENCODED into the program rather than interpolated as a
+    string literal. `run_shell` uses `shell=True`, so this string is parsed
+    twice -- once by the shell, once by Python -- and a Windows `tmp_path` is
+    full of backslashes. A raw literal survives those but not a quote or a
+    trailing separator in somebody's TMPDIR, and a fixture that breaks on the
+    environment rather than on the code is a failure nobody can read. Base64 is
+    plain ASCII with no metacharacter for either parser.
+    """
     proof = tmp_path / "it-ran.txt"
-    return proof, f'"{sys.executable}" -c "open(r\'{proof}\',\'w\').write(\'x\')"'
+    encoded = base64.b64encode(str(proof).encode("utf-8")).decode("ascii")
+    program = (
+        "import base64;"
+        f"open(base64.b64decode('{encoded}').decode(),'w').write('x')"
+    )
+    return proof, f'"{sys.executable}" -c "{program}"'
 
 
 def test_execute_commands_false_does_not_execute_the_command(tmp_path):

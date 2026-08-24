@@ -217,7 +217,12 @@ def _cost_filename(run_id: str, lens: str) -> str:
     quietly becoming one.
     """
     safe = _SAFE_LENS_NAME.sub("_", lens)
-    if safe != lens:
+    # CASE AS WELL AS CHARACTERS. Windows and the default macOS filesystem fold
+    # case, so `Foo` and `foo` both survive sanitisation unchanged, produce
+    # `run-1.Foo.json` and `run-1.foo.json`, and land on ONE file -- the second
+    # lens silently overwriting the first, which is the collision this function
+    # exists to prevent, one level deeper than the character check.
+    if safe != lens or safe != safe.lower():
         safe = f"{safe}-{hashlib.sha256(lens.encode('utf-8')).hexdigest()[:8]}"
     return f"{run_id}.{safe}.json"
 
