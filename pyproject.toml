@@ -6,7 +6,37 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "Ritvik Dayal" }]
-keywords = ["static-analysis", "code-quality", "agents", "developer-tools"]
+keywords = [
+    "static-analysis",
+    "code-quality",
+    "agents",
+    "llm",
+    "developer-tools",
+    "code-review",
+    "testing",
+]
+
+# NO `License ::` CLASSIFIER. `license = "AGPL-3.0-or-later"` above is a PEP 639
+# SPDX expression, and PyPI rejects a distribution that carries both -- the
+# classifier is the pre-639 spelling of the same fact, and two spellings of one
+# fact is exactly what 639 exists to end.
+#
+# `3 - Alpha`, not Beta, and the README says the same thing in words: the
+# pipeline has been run against real defects, and how REPRODUCIBLE the
+# falsifier's judgement is remains unsettled (issue #33). A classifier that
+# claims more than the README is a claim nobody reads twice.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Bug Tracking",
+]
 dependencies = [
     "typer>=0.12",
     "rich>=13.7",
@@ -38,9 +68,15 @@ ui = ["fastapi>=0.115", "uvicorn>=0.30"]
 [project.scripts]
 whetstone = "whetstone.cli:app"
 
+# `whetstone.sh` WAS HERE AND DOES NOT EXIST -- `nslookup` returns NXDOMAIN.
+# It would have shipped as the Homepage link on the PyPI project page, which is
+# the first thing anyone clicks. A URL nobody registered is worse than no URL:
+# the second is an absence, the first is a dead end that looks intentional.
 [project.urls]
-Homepage = "https://whetstone.sh"
+Homepage = "https://github.com/RitvikDayal/whetstone"
 Source = "https://github.com/RitvikDayal/whetstone"
+Issues = "https://github.com/RitvikDayal/whetstone/issues"
+Changelog = "https://github.com/RitvikDayal/whetstone/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 # pip-audit is a DEV dependency, not a runtime one: the hygiene lens shells out

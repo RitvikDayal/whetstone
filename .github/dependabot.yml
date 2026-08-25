@@ -1,0 +1,34 @@
+# Security and version updates. Grouped, because a stream of one-line PRs on a
+# single-maintainer repo is a stream nobody reads -- and an update nobody reads
+# is the same failure mode as a health check that always fires.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      python:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: "npm"
+    directory: "/src/whetstone/ui"
+    schedule:
+      interval: "monthly"
+    groups:
+      frontend:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"

@@ -244,6 +244,17 @@ Stated here rather than discovered later.
   is the total that is unbounded.
   [#43](https://github.com/RitvikDayal/whetstone/issues/43).
 
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the setup and the one rule that matters:
+every test is forced red against the unfixed code before it is believed green.
+
+- [Code of Conduct](CODE_OF_CONDUCT.md) — Contributor Covenant 2.1
+- [Security policy](SECURITY.md) — read this before filing anything that looks
+  alarming; several behaviours are documented and deliberate
+- [Changelog](CHANGELOG.md)
+- [CLA](CLA.md) — required for contributions to this repository
+
 ## Licence
 
 AGPL-3.0-or-later. See `LICENSE`. Contributions require the `CLA.md`.
