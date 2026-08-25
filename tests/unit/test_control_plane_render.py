@@ -178,6 +178,17 @@ def page(served):
             page.goto(f"{base}/#t={token}", wait_until="domcontentloaded")
             page.wait_for_selector("h1", timeout=60_000)
             page.wait_for_selector("nav button", timeout=60_000)
+            # AND WAIT FOR THE DATA. `h1` and the tab bar render the moment
+            # React mounts, which is BEFORE `/api/findings` has answered -- so
+            # this fixture used to hand back a page still showing "Reading the
+            # queue". On this machine the fetch won that race every time; on
+            # the Windows 3.12 CI leg it did not, and two tests failed against
+            # a page that was working correctly and simply had not finished.
+            #
+            # `served` always seeds five findings, so their presence is the
+            # signal that the first render is complete. Waiting on a spinner to
+            # disappear would pass for a page that never loaded at all.
+            page.wait_for_selector("li.finding", timeout=60_000)
             yield page, problems, base, token
         finally:
             browser.close()
@@ -283,7 +294,8 @@ def test_a_page_opened_without_a_token_explains_itself(served):
         browser = play.chromium.launch()
         try:
             page = browser.new_page()
-            page.goto(base, wait_until="networkidle")
+            page.goto(base, wait_until="domcontentloaded")
+            page.wait_for_selector("div.banner-alarm", timeout=60_000)
             text = page.locator("body").inner_text()
             assert "No session token" in text
             assert "whetstone ui" in text
@@ -304,11 +316,16 @@ def test_the_token_survives_a_reload(served):
         browser = play.chromium.launch()
         try:
             page = browser.new_page()
-            page.goto(f"{base}/#t={token}", wait_until="networkidle")
+            # `wait_for_selector` before every `count()`: `count()` does not
+            # auto-wait, so it reads whatever is on the page at that instant --
+            # zero, on a runner slower than this one.
+            page.goto(f"{base}/#t={token}", wait_until="domcontentloaded")
+            page.wait_for_selector("li.finding", timeout=60_000)
             assert page.locator("li.finding").count() == len(_SEEDS)
 
-            page.reload(wait_until="networkidle")
+            page.reload(wait_until="domcontentloaded")
 
+            page.wait_for_selector("li.finding", timeout=60_000)
             assert page.locator("li.finding").count() == len(_SEEDS), (
                 "the session did not survive a reload"
             )
