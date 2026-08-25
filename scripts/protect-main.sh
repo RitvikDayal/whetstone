@@ -20,6 +20,17 @@
 # is one, this claims less than it could and means all of it. The same argument
 # is recorded in release.yml about `prevent_self_review`.
 #
+# `require_extra_approval_for_unattributed_changes` is set FALSE explicitly,
+# because GitHub defaults it to true and that default deadlocks this repository.
+# It demands an extra approval for commits not attributed to a GitHub account,
+# and these commits are unattributed -- the authoring email is not registered on
+# the account, so `author_login` comes back null from the API. One maintainer
+# cannot supply an extra approval, so the rule would be a permanent block rather
+# than a control.
+#
+# The real fix is attribution, not this flag: add the authoring email to the
+# GitHub account and the commits attribute themselves. Turn it back on that day.
+#
 # .githooks/pre-push remains as a client-side pre-check. Enable it with:
 #   git config core.hooksPath .githooks
 set -euo pipefail
@@ -45,6 +56,7 @@ gh api -X POST "repos/${REPO}/rulesets" --input - <<'JSON'
         "require_code_owner_review": false,
         "require_last_push_approval": false,
         "required_review_thread_resolution": true,
+        "require_extra_approval_for_unattributed_changes": false,
         "allowed_merge_methods": ["squash"]
       }
     },
