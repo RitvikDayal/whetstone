@@ -162,7 +162,24 @@ def _enable_wal(conn: sqlite3.Connection, db_path: Path) -> None:
 
 
 def _journal_mode(conn: sqlite3.Connection) -> str:
-    row = conn.execute("PRAGMA journal_mode").fetchone()
+    """The current mode, or "" when another connection is mid-switch.
+
+    THE READ CAN BE LOCKED OUT TOO. `PRAGMA journal_mode` is a read, but a
+    connection changing the mode holds an exclusive lock for the duration, and
+    a reader that arrives inside that window gets SQLITE_BUSY. An unhandled
+    raise here would escape the retry loop that calls it -- the loop exists
+    precisely because somebody else is mid-switch, so the read failing is the
+    expected shape of that, not an exception to it.
+
+    "" rather than a raise, so the caller retries. A non-lock error still
+    propagates: see `_is_lock_error`.
+    """
+    try:
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+    except sqlite3.OperationalError as exc:
+        if not _is_lock_error(exc):
+            raise
+        return ""
     return str(row[0]).lower() if row else ""
 
 

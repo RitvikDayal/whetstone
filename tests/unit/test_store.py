@@ -459,17 +459,29 @@ class _FakeCursor:
 
 
 class _NotADatabase:
-    """A connection whose WAL switch fails for a reason retrying cannot fix."""
+    """A connection whose WAL switch fails, and which can also fail the READ.
 
-    def __init__(self, failure: str):
+    `locked_reads` exists because the `PRAGMA journal_mode` READ can be locked
+    out too: a connection changing the mode holds an exclusive lock, and a
+    reader arriving inside that window gets SQLITE_BUSY. An unhandled raise
+    there escapes the retry loop that exists precisely because somebody else is
+    mid-switch.
+    """
+
+    def __init__(self, failure: str, locked_reads: int = 0):
         self.failure = failure
         self.wal_attempts = 0
+        self.locked_reads = locked_reads
+        self.read_attempts = 0
 
     def execute(self, sql: str, *_args):
         if "journal_mode=WAL" in sql:
             self.wal_attempts += 1
             raise sqlite3.OperationalError(self.failure)
         if "journal_mode" in sql:
+            self.read_attempts += 1
+            if self.read_attempts <= self.locked_reads:
+                raise sqlite3.OperationalError("database is locked")
             return _FakeCursor(("delete",))
         return _FakeCursor(None)
 
@@ -504,3 +516,38 @@ def test_a_lock_error_IS_retried_so_the_test_above_is_not_vacuous(tmp_path):
         db_module._enable_wal(conn, tmp_path / "whetstone.db")
 
     assert conn.wal_attempts > 1, "a lock error must be retried, not given up on"
+
+
+def test_a_locked_journal_mode_READ_is_retried_not_raised(tmp_path):
+    """The read can be locked out, not just the write.
+
+    A mutation battery caught this: replacing the read's lock handling with a
+    branch that never fires stayed green, because every fake here failed only
+    on the WRITE. `PRAGMA journal_mode` is a read, but a connection changing
+    the mode holds an exclusive lock for the duration -- so a reader arriving
+    inside that window gets SQLITE_BUSY, and raising there escapes the retry
+    loop that exists for exactly that situation.
+    """
+    conn = _NotADatabase("database is locked", locked_reads=3)
+
+    with pytest.raises(StoreError):
+        db_module._enable_wal(conn, tmp_path / "whetstone.db")
+
+    assert conn.read_attempts > 3, (
+        "the locked reads must be retried rather than ending the loop"
+    )
+
+
+def test_a_non_lock_error_from_the_READ_still_propagates(tmp_path):
+    """The counterweight: tolerating a lock is not tolerating everything."""
+
+    class _CorruptOnRead(_NotADatabase):
+        def execute(self, sql: str, *_args):
+            if "journal_mode" in sql and "=WAL" not in sql:
+                raise sqlite3.OperationalError("file is not a database")
+            return super().execute(sql, *_args)
+
+    with pytest.raises(sqlite3.OperationalError, match="not a database"):
+        db_module._enable_wal(
+            _CorruptOnRead("database is locked"), tmp_path / "whetstone.db"
+        )

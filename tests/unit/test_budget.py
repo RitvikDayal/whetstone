@@ -508,3 +508,37 @@ def test_the_ordinary_lens_names_keep_their_plain_filenames():
     every record would make the directory unreadable for no reason."""
     assert _cost_filename("run-1", "code-defects") == "run-1.code-defects.json"
     assert _cost_filename("run-1", "rendered-ui") == "run-1.rendered-ui.json"
+
+
+def test_a_lens_name_cannot_forge_the_digest_namespace():
+    """The collision the digest itself reintroduced.
+
+    `_SAFE_LENS_NAME` permits `-`, so joining the digest with a hyphen put it
+    in the SAME namespace as an ordinary lens name: `Foo` sanitises to
+    `Foo-<d>`, and a lens literally named `foo-<d>` stays `foo-<d>`. Those fold
+    to one file on Windows and macOS -- the exact overwrite `_cost_filename`
+    exists to prevent, one level up from where it was looking.
+
+    `~` is outside the permitted class, so it can only ever be emitted by the
+    marker: any `~` in a lens name is replaced before the digest is appended.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(b"Foo").hexdigest()[:8]
+    forged = f"foo-{digest}"
+
+    assert _cost_filename("run-1", "Foo").lower() != _cost_filename(
+        "run-1", forged
+    ).lower()
+
+
+@pytest.mark.parametrize("lens", ["a~b", "~", "x~~y"])
+def test_a_tilde_in_a_lens_name_never_survives_into_the_filename(lens):
+    """What makes the marker a namespace rather than a convention."""
+    name = _cost_filename("run-1", lens)
+    stem = name[len("run-1.") : -len(".json")]
+    # Exactly one `~`, and it is the one the digest marker put there.
+    assert stem.count("~") == 1
+    assert stem.split("~")[1] == __import__("hashlib").sha256(
+        lens.encode("utf-8")
+    ).hexdigest()[:8]

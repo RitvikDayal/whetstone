@@ -297,8 +297,9 @@ def test_a_malformed_stored_severity_cannot_break_or_style_the_listing(seeded):
     """
     tmp_path, conn = seeded
     conn.execute(
-        "UPDATE findings SET severity = ?, grade = ? WHERE rule_id = 'k1'",
-        ("[/checkout @ 1280x800]", "[red]bogus[/red]"),
+        "UPDATE findings SET severity = ?, grade = ?, lens = ? "
+        "WHERE rule_id = 'k1'",
+        ("[/checkout @ 1280x800]", "[red]bogus[/red]", "[bold]lens[/bold]"),
     )
 
     output = _cli(tmp_path, "findings")
@@ -315,6 +316,9 @@ def test_a_malformed_stored_severity_cannot_break_or_style_the_listing(seeded):
     # apart.
     assert "[/checkout @ 1280x800]" in output
     assert "[red]bogus[/red]" in output
+    # `lens` is the third TEXT column with no CHECK constraint, and it was the
+    # one still rendered unescaped after the other two were fixed.
+    assert "[bold]lens[/bold]" in output
 
 
 # --- the cost view, which must not read damage as zero -----------------------
@@ -400,3 +404,36 @@ def test_no_cost_directory_at_all_is_empty_not_an_error(tmp_path):
     assert view["records"] == []
     assert view["total_usd"] == 0.0
     assert view["unreadable"] == []
+
+
+@pytest.mark.parametrize(
+    ("literal", "field"),
+    [("Infinity", "spent_usd"), ("-Infinity", "spent_usd"), ("NaN", "spent_usd")],
+)
+def test_a_non_finite_cost_is_unreadable_rather_than_a_total(tmp_path, literal, field):
+    """`json.loads` accepts the JavaScript spellings by default.
+
+    `Infinity`, `-Infinity` and `NaN` are not valid JSON, and Python's decoder
+    takes them anyway -- so a hand-edited cost record turned `total_usd` into
+    `inf`. Worse, `json.dumps` emits those same non-standard tokens back out,
+    and the browser's `JSON.parse` refuses them: one bad field would have taken
+    the whole cost screen down rather than one row.
+    """
+    from whetstone.readmodel import cost_view
+
+    directory = tmp_path / "costs"
+    directory.mkdir(parents=True)
+    (directory / "run-1.code-defects.json").write_text(
+        f'{{"run_id":"run-1","lens":"code-defects","{field}":{literal},'
+        f'"calls":1,"unmeasured_calls":0,"stages":[]}}',
+        encoding="utf-8",
+    )
+
+    view = cost_view(tmp_path)
+
+    assert view["total_usd"] == 0.0
+    assert any(field in line for line in view["unreadable"])
+    # And the whole view still survives `json.dumps`, which is what the API does.
+    import json as _json
+
+    assert _json.loads(_json.dumps(view))["total_usd"] == 0.0

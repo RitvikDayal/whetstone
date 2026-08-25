@@ -384,7 +384,9 @@ def findings(
             # raises MarkupError and loses the whole listing at the moment it
             # prints. Both already happened once, to `run`'s skip lines.
             escape(_printable(row["severity"])),
-            _printable(row["lens"]),
+            # Escaped like every other stored string in this row -- `lens`
+            # is TEXT with no CHECK constraint, same as severity and grade.
+            escape(_printable(row["lens"])),
             escape(_printable(row["subject"])),
             escape(_printable(row["title"][:70])),
         )

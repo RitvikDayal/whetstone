@@ -32,6 +32,7 @@ must not need a web server installed to print a table.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -294,4 +295,13 @@ def _number(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    number = float(value)
+    # NON-FINITE IS NOT A NUMBER HERE. `json.loads` accepts the JavaScript
+    # spellings `Infinity`, `-Infinity` and `NaN` by default, so a hand-edited
+    # cost record turns `total_usd` into `inf` or `nan` -- and `json.dumps`
+    # then emits those same non-standard tokens, which the browser's
+    # `JSON.parse` refuses, taking the whole cost screen down rather than one
+    # row. Treated as unreadable, which is what it is.
+    if not math.isfinite(number):
+        return None
+    return number

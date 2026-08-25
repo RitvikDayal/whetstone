@@ -1,6 +1,6 @@
 # The control plane
 
-```
+```bash
 whetstone ui
 ```
 
@@ -11,7 +11,7 @@ terminal you ran it in.
 It needs the `ui` extra — not part of the base install, for the same reason the
 browser lens is not. **Nothing is published to PyPI yet**, so from a checkout:
 
-```
+```bash
 uv sync --all-groups --all-extras
 npm --prefix src/whetstone/ui ci && npm --prefix src/whetstone/ui run build
 ```
@@ -88,8 +88,15 @@ act on your project.
 
 - **Do not paste the URL anywhere.** Re-run `whetstone ui` instead; the token
   changes every time.
-- **A second tab, or a bookmark, will not work.** That is deliberate — the
-  token is per tab and per session. The page says so rather than going blank.
+- **A URL with the fragment WILL work in another tab, and on another machine
+  that can reach the port.** An earlier version of this document said a second
+  tab or a bookmark "will not work" — that was wrong and dangerously so, since
+  it implied pasting the link was harmless. The server validates the token and
+  nothing else; it has no idea which tab sent it. `sessionStorage` is a
+  convenience for the tab that already has one, not a restriction on the token.
+- **A tab opened WITHOUT the fragment has no token**, and says so rather than
+  going blank. That is the only sense in which a plain bookmark fails: it drops
+  the fragment.
 - **Do not put this behind a reverse proxy** to reach it from another machine.
   The `Host` check will refuse it, and that check is one of only two things
   standing between a web page and your repository.
@@ -175,7 +182,7 @@ installed. `pip install 'whetstone-cli[ui]'`.
 **"the control plane's built assets are not present"** — the Python package is
 fine; the JavaScript bundle is missing. From a source checkout:
 
-```
+```bash
 npm --prefix src/whetstone/ui ci
 npm --prefix src/whetstone/ui run build
 ```

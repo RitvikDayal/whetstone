@@ -31,6 +31,7 @@ ships is never a stale local artifact.
 from __future__ import annotations
 
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -53,18 +54,28 @@ class CustomBuildHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict) -> None:
         del version, build_data
 
+        # EVERY NO-BUILD RETURN SAYS SO. Three of these returned silently, and
+        # a build that skipped the front-end then looked exactly like one that
+        # included it -- right up until `whetstone ui` refused to start on a
+        # machine where nobody could see this output any more. A skip with no
+        # reason is the defect this whole project is about.
         if os.environ.get(SKIP):
+            self._say(f"{SKIP} is set; not building the front-end.")
             return
         if INDEX.is_file():
             # Already built. See STALENESS above -- this is the common case for
             # `uv sync`, and rebuilding here would front every test run with a
             # JavaScript build.
+            self._say(f"front-end already built at {INDEX.parent}; reusing it.")
             return
         if not (UI / "package.json").is_file():
-            # An sdist that legitimately carries no front-end source. Nothing
-            # to build and nothing to say.
+            self._say(
+                f"no front-end source at {UI}; nothing to build. A wheel from "
+                "this tree will have no control plane in it."
+            )
             return
 
+        self._guard_write_boundary()
         npm = shutil.which("npm")
         if npm is None:
             # NOT an error. See the module docstring: this path is reached by a
@@ -99,5 +110,34 @@ class CustomBuildHook(BuildHookInterface):
                     f"{result.returncode}:\n" + "\n".join(tail[-20:])
                 )
 
+    def _say(self, message: str) -> None:
+        """A build-time note. Not a warning -- these are ordinary outcomes."""
+        print(f"whetstone: {message}", file=sys.stderr)
+
     def _warn(self, message: str) -> None:
         print(f"warning: {message}", file=sys.stderr)
+
+    def _guard_write_boundary(self) -> None:
+        """Refuse to run npm anywhere but inside this repository.
+
+        `npm ci` and `npm run build` write `node_modules/` and `dist/` into
+        their working directory, and that directory is built from `__file__`
+        without resolving it. A symlinked `src/whetstone/ui` therefore points
+        the build at whatever the link targets -- outside the worktree, with no
+        boundary check anywhere in the path.
+
+        This project's rule is that writes stay inside the resolved worktree
+        and the barrier is enforced in code rather than requested in prose. A
+        build hook is not exempt from it just because it runs before anything
+        else does.
+        """
+        root = pathlib.Path(__file__).resolve().parent
+        target = UI.resolve()
+        if not target.is_relative_to(root):
+            raise RuntimeError(
+                f"the front-end directory resolves to {target}, which is "
+                f"outside this repository ({root}). `npm ci` writes "
+                "node_modules/ and `npm run build` writes dist/, so building "
+                "there would write outside the worktree. Refusing. This is "
+                "what a symlinked src/whetstone/ui looks like."
+            )

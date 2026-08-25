@@ -622,3 +622,30 @@ def test_the_token_is_absent_from_the_terminal_unless_asked_for():
     assert lines
     assert not any("#t=" in line for line in lines), lines
     assert any("--print-url" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "token_value",
+    ["tokén", "tokÿen", "ÿ" * 43],
+    ids=["latin-accent", "y-diaeresis", "all-high-bytes"],
+)
+def test_a_non_ascii_token_header_is_a_401_not_a_500(live, token_value):
+    """`hmac.compare_digest` RAISES on a non-ASCII str.
+
+    "comparing strings with non-ASCII characters is not supported" -- so one
+    byte above 0x7f in the header turned the 401 path into an unhandled
+    TypeError and a 500, on the route anybody can reach without a token. The
+    comparison is done on bytes now, which makes it total.
+
+    LATIN-1 ONLY, and the range is the point rather than a limitation of the
+    test. HTTP header values are bytes; Starlette decodes them as latin-1, so
+    nothing above U+00FF can reach the server through a header at all -- a CJK
+    value fails in `http.client` before the request is sent. The reachable
+    hostile inputs are exactly the characters between 0x80 and 0xFF, and every
+    one of them makes `compare_digest` raise.
+    """
+    base, _token, _port = live
+
+    status, _headers, _body = _request(f"{base}/api/findings", token=token_value)
+
+    assert status == 401, "a hostile header value must be refused, not crash"

@@ -155,6 +155,19 @@ async def _drain(receive: Receive) -> None:
             return
 
 
+def _tokens_match(presented: str, expected: str) -> bool:
+    """Constant-time comparison that survives any header value.
+
+    `hmac.compare_digest` accepts two str only when BOTH are ASCII, and raises
+    otherwise. The presented value comes off the wire, so it is not ours to
+    assume anything about -- `latin-1` round-trips every byte a header can
+    carry without raising, which is what makes this total.
+    """
+    return hmac.compare_digest(
+        presented.encode("latin-1", "replace"), expected.encode("latin-1", "replace")
+    )
+
+
 class HostGuard:
     """Reject any request whose `Host` is not exactly one of ours.
 
@@ -233,7 +246,17 @@ class TokenGuard:
 
         request = Request(scope)
         presented = request.headers.get(TOKEN_HEADER, "")
-        if not hmac.compare_digest(presented, self.token):
+        # `compare_digest` RAISES on a non-ASCII str -- "comparing strings with
+        # non-ASCII characters is not supported" -- so a header carrying one
+        # byte above 0x7f turned the 401 path into an unhandled TypeError and a
+        # 500. On the UNAUTHENTICATED route, which is the one anybody can
+        # reach. Measured, not theorised.
+        #
+        # Compared as BYTES rather than pre-validated as ASCII: encoding both
+        # sides makes the comparison total, keeps it constant-time, and needs
+        # no separate rejection branch that could disagree with the check it
+        # guards.
+        if not _tokens_match(presented, self.token):
             # DRAIN FIRST. Answering a POST without consuming its body leaves
             # the client still writing into a socket the server is closing, and
             # the client sees ConnectionResetError instead of the 401 that was

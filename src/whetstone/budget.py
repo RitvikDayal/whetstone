@@ -201,6 +201,12 @@ class BudgetedProvider:
 # otherwise write the cost record somewhere other than the costs directory.
 _SAFE_LENS_NAME = re.compile(r"[^A-Za-z0-9._-]")
 
+# The separator between a sanitised name and its disambiguating digest.
+# Deliberately a character `_SAFE_LENS_NAME` REPLACES, so it cannot occur
+# in the sanitised part and the digest namespace is unreachable by any
+# lens name. See `_cost_filename`.
+_DIGEST_MARKER = "~"
+
 
 def _cost_filename(run_id: str, lens: str) -> str:
     """`<run_id>.<lens>.json`, with the lens name made safe for a filename.
@@ -223,7 +229,18 @@ def _cost_filename(run_id: str, lens: str) -> str:
     # lens silently overwriting the first, which is the collision this function
     # exists to prevent, one level deeper than the character check.
     if safe != lens or safe != safe.lower():
-        safe = f"{safe}-{hashlib.sha256(lens.encode('utf-8')).hexdigest()[:8]}"
+        # `~`, NOT `-`. `_SAFE_LENS_NAME` permits `-`, so a hyphen-joined
+        # digest lives in the same namespace as an ordinary lens name and the
+        # collision comes back one level up: `Foo` sanitises to `Foo-<d>`, and
+        # a lens literally named `foo-<d>` stays `foo-<d>`. Those fold to one
+        # file on Windows and macOS, which is the exact overwrite this function
+        # exists to prevent.
+        #
+        # `~` is outside the permitted class, so it can only ever appear here
+        # -- no lens name can produce one, because any `~` in a name is
+        # replaced before this line runs.
+        digest = hashlib.sha256(lens.encode("utf-8")).hexdigest()[:8]
+        safe = f"{safe}{_DIGEST_MARKER}{digest}"
     return f"{run_id}.{safe}.json"
 
 
