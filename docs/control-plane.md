@@ -8,12 +8,16 @@ Opens a local page showing the same queue `whetstone findings` prints. It binds
 `127.0.0.1`, mints a fresh token every time it starts, and dies with the
 terminal you ran it in.
 
-Install it with the `ui` extra — it is not part of the base install, for the
-same reason the browser lens is not:
+It needs the `ui` extra — not part of the base install, for the same reason the
+browser lens is not. **Nothing is published to PyPI yet**, so from a checkout:
 
 ```
-pip install 'whetstone-cli[ui]'
+uv sync --all-groups --all-extras
+npm --prefix src/whetstone/ui ci && npm --prefix src/whetstone/ui run build
 ```
+
+Once there is a release, `pip install 'whetstone-cli[ui]'` is the whole of it —
+a release wheel carries the built front-end.
 
 | Flag | What it does |
 |---|---|

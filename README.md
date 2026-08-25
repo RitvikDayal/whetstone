@@ -24,31 +24,9 @@ limitations before you rely on a grade.
 
 ## Install
 
-```bash
-pip install whetstone-cli
-```
-
-The command is `whetstone`; the package on PyPI is `whetstone-cli`.
-
-The browser lens is an extra: Playwright pulls a few hundred megabytes of
-Chromium, and most people never run it.
-
-```bash
-pip install 'whetstone-cli[browser]'
-playwright install chromium
-```
-
-Without it that lens reports it could not run, and says which command fixes it.
-It never silently finds nothing.
-
-The local control plane is an extra for the same reason -- installing Whetstone
-to run `hygiene` in CI should not also install a web server.
-
-```bash
-pip install 'whetstone-cli[ui]'
-```
-
-From a checkout instead, which is what you want if you intend to change it:
+**Not on PyPI yet.** `pyproject.toml` declares the distribution name
+`whetstone-cli` and `release.yml` is wired for Trusted Publishing, but nothing
+has been published and the name is not claimed. Install from a checkout:
 
 ```bash
 git clone https://github.com/RitvikDayal/whetstone
@@ -56,16 +34,29 @@ cd whetstone
 uv sync --all-groups
 ```
 
-The browser lens needs an extra: Playwright pulls a few hundred megabytes of
-Chromium, and most people never run it.
+The command is `whetstone`. Two capabilities are **extras** rather than
+dependencies, because installing Whetstone to run `hygiene` in CI should cost
+neither a Chromium download nor a web server:
+
+| Extra | What it adds | Cost of not having it |
+|---|---|---|
+| `browser` | The `rendered-ui` lens (Playwright) | The lens reports it could not run, and names the command that fixes it. It never silently finds nothing. |
+| `ui` | `whetstone ui`, the local control plane | The command refuses with a sentence naming the extra, rather than a `ModuleNotFoundError`. |
 
 ```bash
 uv sync --all-groups --all-extras
 uv run playwright install chromium
 ```
 
-Without it the lens reports that it could not run, with the command to fix it.
-It never silently finds nothing.
+The control plane also needs its front-end built, which is a separate thing and
+fails separately:
+
+```bash
+npm --prefix src/whetstone/ui ci
+npm --prefix src/whetstone/ui run build
+```
+
+A release wheel carries that bundle already; a checkout does not.
 
 ## Commands
 
