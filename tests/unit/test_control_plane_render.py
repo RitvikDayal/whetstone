@@ -402,8 +402,12 @@ def test_an_in_flight_run_is_picked_up_again_after_leaving_the_tab(served):
 def _state_root_for(base: str, token: str) -> str:
     """The state directory this served fixture is using.
 
-    Read back off the API rather than reconstructed, so the test cannot drift
-    from where the server is actually looking.
+    The PROJECT ROOT is read off the API; the `.state` suffix is this file's
+    own knowledge of what the fixture's `whetstone.yaml` declares. An earlier
+    docstring said the whole path was read back "rather than reconstructed",
+    which was half true and the wrong half -- if the fixture's `state_dir`
+    changed, this would still point at `.state` and the test would fail
+    somewhere unhelpful.
     """
     request = urllib.request.Request(f"{base}/api/config")
     request.add_header(TOKEN_HEADER, token)

@@ -145,6 +145,19 @@ export default function Run({
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const abort = useRef<AbortController | null>(null)
+  // Whether this component is still on screen. `start()` used to pass
+  // `() => false` as its cancelled predicate, so a run started here and left
+  // running while the user switched tabs called `setError` and `onFinished`
+  // on an unmounted component -- a React warning at best, and at worst a
+  // refresh firing against a screen nobody is looking at.
+  const mounted = useRef(true)
+
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
 
   useEffect(() => {
     apiGet<ConfigView>('api/config', token)
@@ -211,11 +224,13 @@ export default function Run({
     try {
       const { ticket } = await apiPost<{ ticket: string }>('api/runs', token, {})
       sessionStorage.setItem(TICKET_KEY, ticket)
-      await follow(ticket, () => false)
+      await follow(ticket, () => !mounted.current)
     } catch (exc: unknown) {
-      setError(exc instanceof ApiError ? exc.message : String(exc))
+      if (mounted.current) {
+        setError(exc instanceof ApiError ? exc.message : String(exc))
+      }
     } finally {
-      setBusy(false)
+      if (mounted.current) setBusy(false)
     }
   }
 

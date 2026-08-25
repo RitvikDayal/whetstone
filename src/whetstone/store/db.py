@@ -81,6 +81,19 @@ _WAL_RETRY_SECONDS = 5.0
 _WAL_RETRY_PAUSE = 0.02
 
 
+# SQLite's own wording for "somebody else holds it". Matched on the message
+# because `sqlite3` does not expose the extended result code on the exception
+# in a form worth depending on -- `sqlite3_errorcode` is not surfaced, and
+# `OperationalError` covers everything from a lock to a corrupt file.
+_LOCK_MESSAGES = ("database is locked", "database table is locked",
+                  "locking protocol")
+
+
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    lowered = str(exc).lower()
+    return any(message in lowered for message in _LOCK_MESSAGES)
+
+
 def _enable_wal(conn: sqlite3.Connection, db_path: Path) -> None:
     """Put the database in WAL mode, tolerating a concurrent first open.
 
@@ -109,7 +122,15 @@ def _enable_wal(conn: sqlite3.Connection, db_path: Path) -> None:
     while True:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            # ONLY A LOCK. `OperationalError` also covers "file is not a
+            # database", "disk I/O error" and "attempt to write a readonly
+            # database" -- none of which another five seconds of retrying will
+            # fix, and every one of which would have been re-reported as a WAL
+            # contention problem, sending the reader to look for a second
+            # Whetstone process that does not exist.
+            if not _is_lock_error(exc):
+                raise
             # Somebody else is mid-switch. Re-READ rather than assuming the
             # attempt failed: the exception may mean they already succeeded.
             if _journal_mode(conn) == "wal":

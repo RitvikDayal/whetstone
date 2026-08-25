@@ -422,3 +422,85 @@ def test_a_database_already_in_wal_is_not_switched_again(tmp_path, monkeypatch):
     assert not any("journal_mode=WAL" in sql for sql in statements), (
         "an already-WAL database was asked to switch again"
     )
+
+
+def test_a_non_lock_operational_error_is_not_retried():
+    """`OperationalError` is not a synonym for "somebody else holds it".
+
+    It also covers "file is not a database", "disk I/O error" and "attempt to
+    write a readonly database" -- none of which another five seconds of
+    retrying will fix, and every one of which would otherwise have been
+    re-reported as a WAL contention problem, sending the reader to look for a
+    second Whetstone process that does not exist.
+
+    Asserted on the predicate the retry loop consults rather than by forcing a
+    corrupt database into `connect`: the branch is one `if`, and a test that
+    manufactures a torn file to reach it measures the manufacturing.
+    """
+    assert db_module._is_lock_error(sqlite3.OperationalError("database is locked"))
+    assert db_module._is_lock_error(
+        sqlite3.OperationalError("database table is locked")
+    )
+    for fatal in (
+        "file is not a database",
+        "disk I/O error",
+        "attempt to write a readonly database",
+        "no such table: findings",
+    ):
+        assert not db_module._is_lock_error(sqlite3.OperationalError(fatal)), fatal
+
+
+class _FakeCursor:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+class _NotADatabase:
+    """A connection whose WAL switch fails for a reason retrying cannot fix."""
+
+    def __init__(self, failure: str):
+        self.failure = failure
+        self.wal_attempts = 0
+
+    def execute(self, sql: str, *_args):
+        if "journal_mode=WAL" in sql:
+            self.wal_attempts += 1
+            raise sqlite3.OperationalError(self.failure)
+        if "journal_mode" in sql:
+            return _FakeCursor(("delete",))
+        return _FakeCursor(None)
+
+
+def test_a_fatal_open_error_propagates_instead_of_being_retried(tmp_path):
+    """THE BRANCH, not just the predicate it consults.
+
+    A mutation battery removed `if not _is_lock_error(exc): raise` and the
+    predicate test above stayed green -- it asserted the function classifies
+    correctly, never that the retry loop acts on the classification. So this
+    drives `_enable_wal` with a connection that fails for a fatal reason and
+    requires the error to come straight back out, ONCE.
+    """
+    conn = _NotADatabase("file is not a database")
+
+    with pytest.raises(sqlite3.OperationalError) as caught:
+        db_module._enable_wal(conn, tmp_path / "whetstone.db")
+
+    assert "not a database" in str(caught.value)
+    assert conn.wal_attempts == 1, (
+        f"a fatal error was retried {conn.wal_attempts} times; it is not "
+        "contention and no amount of waiting fixes it"
+    )
+
+
+def test_a_lock_error_IS_retried_so_the_test_above_is_not_vacuous(tmp_path):
+    """The counterweight. Without it, an implementation that never retried
+    anything would satisfy the assertion above."""
+    conn = _NotADatabase("database is locked")
+
+    with pytest.raises(StoreError):
+        db_module._enable_wal(conn, tmp_path / "whetstone.db")
+
+    assert conn.wal_attempts > 1, "a lock error must be retried, not given up on"
