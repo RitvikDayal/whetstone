@@ -56,3 +56,31 @@ if BUNDLE_MISSING and bundle_is_expected():  # pragma: no cover - CI guard
 needs_bundle = pytest.mark.skipif(
     BUNDLE_MISSING is not None, reason=BUNDLE_MISSING or "bundle present"
 )
+
+
+# --- the `ui` extra, which has the same failure mode ---------------------------
+
+
+def _fastapi_missing() -> str | None:
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except ImportError as exc:
+        return f"the `ui` extra is not installed ({exc})"
+    return None
+
+
+UI_EXTRA_MISSING = _fastapi_missing()
+
+if UI_EXTRA_MISSING and bundle_is_expected():  # pragma: no cover - CI guard
+    raise RuntimeError(
+        f"{UI_EXTRA_MISSING}. `pytest.importorskip` here would turn every "
+        "control-plane test module into a SKIP on a green leg -- the whole "
+        "security envelope, the mutations, and the rendered DOM, covered by "
+        "nothing. The workflow runs `uv sync --all-extras`; if that flag was "
+        "dropped, this is what it looks like."
+    )
+
+needs_ui_extra = pytest.mark.skipif(
+    UI_EXTRA_MISSING is not None, reason=UI_EXTRA_MISSING or "ui extra present"
+)

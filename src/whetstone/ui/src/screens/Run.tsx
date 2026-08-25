@@ -122,6 +122,17 @@ function Progress({ events }: { events: RunEvent[] }) {
   )
 }
 
+// THE TICKET OUTLIVES THIS COMPONENT. Switching to the Findings tab unmounts
+// Run, which aborts the stream -- and with the ticket held in component state
+// the user could never get back to a run that was still going. It is parked in
+// `sessionStorage` (per tab, cleared when the tab closes, like the token) and
+// picked up again on mount.
+//
+// Resuming costs nothing because the server replays the event file from byte
+// zero: a reconnect and a first connect are the same request. That property is
+// what makes this two lines rather than a state machine.
+const TICKET_KEY = 'whetstone.run.ticket'
+
 export default function Run({
   token,
   onFinished,
@@ -144,23 +155,63 @@ export default function Run({
     return () => abort.current?.abort()
   }, [token])
 
-  async function start() {
+  // Reattach to a run this tab started earlier, if there is one.
+  useEffect(() => {
+    const parked = sessionStorage.getItem(TICKET_KEY)
+    if (!parked) return
+    let cancelled = false
     setBusy(true)
-    setError(null)
     setEvents([])
+    follow(parked, () => cancelled).finally(() => {
+      if (!cancelled) setBusy(false)
+    })
+    return () => {
+      cancelled = true
+    }
+    // Mount only. `follow` closes over `token`, which does not change for the
+    // life of the page.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  async function follow(ticket: string, cancelled: () => boolean) {
+    const controller = new AbortController()
+    abort.current = controller
     try {
-      const { ticket } = await apiPost<{ ticket: string }>('api/runs', token, {})
-      const controller = new AbortController()
-      abort.current = controller
       await streamEvents(
         `api/runs/${ticket}/events`,
         token,
         (event) => setEvents((prior) => [...prior, event as RunEvent]),
         controller.signal,
       )
-      // The stream ended, which means the run reached a terminal event. Refresh
-      // the queue from the STORE rather than assembling it from what streamed.
-      onFinished()
+      // The stream ended, which means the run reached a terminal event. The
+      // ticket is spent; leaving it parked would re-follow a finished run on
+      // every remount.
+      sessionStorage.removeItem(TICKET_KEY)
+      // Refresh the queue from the STORE rather than assembling it from what
+      // streamed -- the stream is a convenience and never the record.
+      if (!cancelled()) onFinished()
+    } catch (exc: unknown) {
+      // An abort is this component unmounting, not a failure.
+      if (controller.signal.aborted) return
+      // THE TICKET STAYS PARKED. Losing the stream is not losing the run --
+      // it is still going server-side, and the event file replays from the
+      // start, so the next mount picks it back up. Discarding the ticket on a
+      // transient network error would throw away the only handle on a run that
+      // is still spending money.
+      if (!cancelled()) {
+        setError(exc instanceof ApiError ? exc.message : String(exc))
+      }
+    }
+  }
+
+  async function start() {
+    setBusy(true)
+    setError(null)
+    setEvents([])
+    try {
+      const { ticket } = await apiPost<{ ticket: string }>('api/runs', token, {})
+      sessionStorage.setItem(TICKET_KEY, ticket)
+      await follow(ticket, () => false)
     } catch (exc: unknown) {
       setError(exc instanceof ApiError ? exc.message : String(exc))
     } finally {

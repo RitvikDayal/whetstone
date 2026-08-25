@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,23 @@ from .assets import assets_root
 from .runs import events_path, tail
 from .runs import start as start_background_run
 from .security import HostGuard, ResponseHeaders, TokenGuard
+
+# MODULE LEVEL, AND IN A TRY. `from __future__ import annotations` makes every
+# annotation a string, and FastAPI resolves a route's annotations with
+# `get_type_hints` against this MODULE's globals -- so a `Request` imported
+# inside `_require_web_dependencies` and unpacked into a local is invisible to
+# it. FastAPI could not resolve the name, treated `request` as a request BODY,
+# and answered every decide call with a 422 before the handler ran. Measured:
+# ten tests went red at once and the route never executed.
+#
+# The try/except keeps the deferred-dependency behaviour that matters. This
+# module is imported only by `serve()`, which the CLI imports only when
+# `whetstone ui` runs, and `create_app` still raises the sentence naming the
+# extra via `_require_web_dependencies`.
+try:  # pragma: no cover - the except arm needs fastapi absent
+    from fastapi import Request
+except ImportError:  # pragma: no cover
+    Request = Any  # type: ignore[assignment,misc]
 
 
 def missing_ui_extra() -> WhetstoneError:
@@ -60,10 +78,17 @@ def _require_web_dependencies():
     try:
         from fastapi import FastAPI
         from fastapi.responses import JSONResponse, StreamingResponse
+        from starlette.concurrency import iterate_in_threadpool
         from starlette.staticfiles import StaticFiles
     except ImportError as exc:
         raise missing_ui_extra() from exc
-    return FastAPI, JSONResponse, StreamingResponse, StaticFiles
+    return (
+        FastAPI,
+        JSONResponse,
+        StreamingResponse,
+        iterate_in_threadpool,
+        StaticFiles,
+    )
 
 
 def create_app(
@@ -81,7 +106,13 @@ def create_app(
     second caller ships an unguarded server -- and the test suite would be the
     first such caller.
     """
-    FastAPI, JSONResponse, StreamingResponse, StaticFiles = _require_web_dependencies()
+    (
+        FastAPI,
+        JSONResponse,
+        StreamingResponse,
+        iterate_in_threadpool,
+        StaticFiles,
+    ) = _require_web_dependencies()
 
     # Assets are resolved BEFORE the server binds, so a missing bundle is a
     # sentence in the terminal the user is already looking at rather than a
@@ -188,7 +219,7 @@ def create_app(
     # -- mutations ------------------------------------------------------------
 
     @app.post("/api/findings/{finding_id}/decide")
-    def decide(finding_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def decide(finding_id: str, request: Request) -> dict[str, Any]:
         """Record a decision. The argument rules are NOT restated here.
 
         `queue/dispositions.py` already writes a sentence naming the missing
@@ -205,8 +236,24 @@ def create_app(
         has no prompt, so the caller has to have decided already; without the
         flag this refuses rather than assuming.
         """
+        # READ AND VALIDATED HERE rather than typed as `dict[str, Any]` on the
+        # signature. FastAPI validates a declared body model BEFORE the handler
+        # runs and answers a non-object with its own 422 -- so an
+        # `isinstance(body, dict)` guard inside the function was dead code, and
+        # a caller sending `[]` or `"x"` got a validation blob instead of the
+        # sentence this API writes for every other refusal.
+        try:
+            body = await request.json()
+        except ValueError as exc:
+            raise WhetstoneError(
+                "the request body is not valid JSON. Send a JSON object naming "
+                "a disposition."
+            ) from exc
         if not isinstance(body, dict):
-            raise WhetstoneError("the request body must be a JSON object.")
+            raise WhetstoneError(
+                f"the request body must be a JSON object naming a disposition, "
+                f"not a {type(body).__name__}."
+            )
         try:
             disposition = Disposition(str(body.get("disposition", "")))
         except ValueError as exc:
@@ -235,7 +282,7 @@ def create_app(
             return {"id": finding_id, "state": new_state}
 
     @app.post("/api/runs")
-    def start_run(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def start_run(request: Request) -> dict[str, Any]:
         """Start a run. 409 when one is already in progress.
 
         THE CEILING IS NOT RE-CHECKED HERE. It is enforced in
@@ -243,7 +290,13 @@ def create_app(
         model, and a second check in this layer would be a number that agrees
         with the real one until the day it does not.
         """
-        options = body or {}
+        # An empty body is the ordinary case -- the button sends `{}` -- so a
+        # missing or unparseable one is defaults rather than an error.
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        options = body if isinstance(body, dict) else {}
         try:
             ticket = start_background_run(
                 config=config,
@@ -270,12 +323,24 @@ def create_app(
         """
         path = events_path(state_root, ticket)
 
-        def stream():
+        # Set when this response is torn down for ANY reason -- the client
+        # closing the tab, navigating away, or the server shutting down.
+        # Without it a disconnected client leaves `tail` polling the file until
+        # the run reaches a terminal event, holding a threadpool worker for the
+        # length of somebody else's run. Cancellation alone does not stop a
+        # SYNC generator running in a thread; it only stops anyone reading it,
+        # so the generator needs a flag it checks for itself.
+        stop = threading.Event()
+
+        async def stream():
             # A blank line terminates an SSE frame. `json.dumps` never emits a
             # raw newline, so one event is always exactly one `data:` line and
             # no re-escaping is needed.
-            for event in tail(path):
-                yield "data: " + json.dumps(event) + "\n\n"
+            try:
+                async for event in iterate_in_threadpool(tail(path, stop=stop)):
+                    yield "data: " + json.dumps(event) + "\n\n"
+            finally:
+                stop.set()
 
         return StreamingResponse(
             stream(),

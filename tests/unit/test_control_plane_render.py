@@ -26,6 +26,11 @@ from pathlib import Path
 
 import pytest
 
+# NOT `pytest.importorskip`. That skips the WHOLE MODULE when the extra
+# is absent -- and on a CI leg that dropped `--all-extras`, every test in
+# here would skip while the leg stayed green. `_bundle` raises instead
+# wherever CI is set, and skips only on a developer machine.
+from _bundle import UI_EXTRA_MISSING  # noqa: E402
 from whetstone.config.loader import load_config
 from whetstone.grade import Grade
 from whetstone.lenses.base import Candidate, Evidence, EvidenceKind
@@ -35,7 +40,9 @@ from whetstone.severity import Severity
 from whetstone.store.db import connect
 from whetstone.store.findings import upsert
 
-pytest.importorskip("fastapi", reason="the ui extra is not installed")
+pytestmark = pytest.mark.skipif(
+    UI_EXTRA_MISSING is not None, reason=UI_EXTRA_MISSING or "ui extra present"
+)
 
 from _browser import needs_browser  # noqa: E402
 
@@ -307,5 +314,139 @@ def test_the_token_survives_a_reload(served):
             )
             # And the token is no longer in the address bar.
             assert "#t=" not in page.url
+        finally:
+            browser.close()
+
+
+@needs_browser
+@needs_bundle
+def test_an_in_flight_run_is_picked_up_again_after_leaving_the_tab(served):
+    """Switching tabs unmounts Run and aborts its stream.
+
+    With the ticket in component state the user could never get back to a run
+    that was still going -- it would keep running server-side with no way to
+    watch it. The ticket is parked in `sessionStorage` and reattached on mount.
+
+    DETERMINISTIC, not a race. Driving this through a real run would mean
+    switching tabs inside the second or so a `hygiene` run takes. Instead the
+    event file is written by hand, mid-run -- `run_started` and a `lens_started`
+    with no terminal event -- and the ticket is planted in `sessionStorage`.
+    That is exactly the state the browser would be in, without the timing.
+    """
+    from playwright.sync_api import sync_playwright
+
+    from whetstone.server import runs as runs_module
+
+    base, token = served
+    state = Path(_state_root_for(base, token))
+    ticket = runs_module.new_ticket()
+    events = runs_module.events_path(state, ticket)
+    events.parent.mkdir(parents=True, exist_ok=True)
+    events.write_text(
+        json.dumps(
+            {
+                "kind": "run_started",
+                "run_id": "run-inflight01",
+                "tier": "deep",
+                "file_count": 5,
+                "lens_count": 1,
+                "lenses": ["code-defects"],
+                "skips": [],
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {"kind": "lens_started", "run_id": "run-inflight01", "lens": "code-defects"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with sync_playwright() as play:
+        browser = play.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(f"{base}/#t={token}", wait_until="domcontentloaded")
+            page.wait_for_selector("nav button", timeout=60_000)
+            page.evaluate(
+                "t => sessionStorage.setItem('whetstone.run.ticket', t)", ticket
+            )
+
+            page.get_by_role("button", name="run", exact=True).click()
+
+            page.wait_for_selector("ol.events li", timeout=60_000)
+            shown = page.locator("ol.events").inner_text()
+            assert "code-defects" in shown
+            assert "run-inflight01" in page.locator("main").inner_text()
+        finally:
+            browser.close()
+            # The stream is still tailing a file with no terminal event; the
+            # 60-second no-progress timeout in `tail` ends it.
+            events.write_text(
+                events.read_text(encoding="utf-8")
+                + json.dumps(
+                    {
+                        "kind": "run_finished",
+                        "run_id": "run-inflight01",
+                        "status": "complete",
+                        "new": 0,
+                        "seen": 0,
+                        "skips": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+
+def _state_root_for(base: str, token: str) -> str:
+    """The state directory this served fixture is using.
+
+    Read back off the API rather than reconstructed, so the test cannot drift
+    from where the server is actually looking.
+    """
+    request = urllib.request.Request(f"{base}/api/config")
+    request.add_header(TOKEN_HEADER, token)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        project_root = json.loads(response.read())["project_root"]
+    return str(Path(project_root) / ".state")
+
+
+@needs_browser
+@needs_bundle
+def test_starting_a_run_parks_its_ticket_before_anything_can_lose_it(served):
+    """The other half: the ticket has to be WRITTEN, not just read back.
+
+    A mutation battery removed the `sessionStorage.setItem` and the resume test
+    above stayed green -- because that test plants the ticket itself and only
+    exercises the restore path. This exercises the park path.
+
+    Deterministic by aborting the event stream at the network layer: the run
+    starts server-side, the browser never gets a stream, and `follow` takes its
+    error branch. The ticket must survive that, because a lost stream is not a
+    lost run -- it is still going, and still spending.
+    """
+    from playwright.sync_api import sync_playwright
+
+    base, token = served
+
+    with sync_playwright() as play:
+        browser = play.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.route("**/api/runs/*/events", lambda route: route.abort())
+            page.goto(f"{base}/#t={token}", wait_until="domcontentloaded")
+            page.wait_for_selector("nav button", timeout=60_000)
+            page.get_by_role("button", name="run", exact=True).click()
+            page.get_by_role("button", name="Start a run").click()
+
+            page.wait_for_function(
+                "() => sessionStorage.getItem('whetstone.run.ticket') !== null",
+                timeout=60_000,
+            )
+            parked = page.evaluate(
+                "() => sessionStorage.getItem('whetstone.run.ticket')"
+            )
+            assert parked and len(parked) == 32
         finally:
             browser.close()

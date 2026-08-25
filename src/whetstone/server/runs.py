@@ -44,7 +44,11 @@ from ..store.db import connect
 # before the value is joined to a path AND the result is checked to be under
 # the events directory -- the regex is the real defence and the containment
 # check is the one that survives somebody loosening the regex.
-_TICKET = re.compile(r"^[0-9a-f]{32}$")
+# `fullmatch`, NOT a `$` anchor. Python's `$` matches before a trailing
+# newline, so `"a" * 32 + chr(10)` satisfies `match(r"^[0-9a-f]{32}$")` -- a
+# value that is not a ticket, passing the check that exists to say what a
+# ticket is. `\Z` would fix it too; `fullmatch` says it at the call site.
+_TICKET = re.compile(r"[0-9a-f]{32}")
 
 # How long a stream waits for its first byte before giving up. The run has
 # already been accepted at this point, so this only bounds the window between
@@ -71,7 +75,7 @@ def events_path(state_root: Path, ticket: str) -> Path:
     comparing is what still stops one if the pattern is ever relaxed. Neither
     alone is the belt-and-braces -- they fail in different directions.
     """
-    if not _TICKET.match(ticket):
+    if not _TICKET.fullmatch(ticket):
         raise UnknownRunError(
             f"{ticket!r} is not a run ticket. Tickets are issued by "
             "`POST /api/runs` and are 32 hex characters."
@@ -167,7 +171,26 @@ def start(
         finally:
             stack.close()
 
-    threading.Thread(target=_run, name=f"whetstone-run-{ticket}", daemon=True).start()
+    try:
+        threading.Thread(
+            target=_run, name=f"whetstone-run-{ticket}", daemon=True
+        ).start()
+    except BaseException:
+        # `Thread.start()` raises RuntimeError when the process cannot create
+        # another thread. The lock was taken above and `_run`'s `finally` is
+        # what releases it, so a thread that never starts leaves nothing to run
+        # it.
+        #
+        # NOT "held forever" -- that claim was wrong and a mutation battery
+        # showed it. CPython eventually collects the abandoned `ExitStack`,
+        # which collects the suspended `run_lock` generator, which raises
+        # `GeneratorExit` at its `yield` and runs the `finally` after all. What
+        # the explicit close buys is DETERMINISM: without it the lock returns
+        # once the exception's traceback stops referencing this frame, which is
+        # not a moment anyone can name, and in the meantime every run is
+        # refused with a 409 naming a run that does not exist.
+        stack.close()
+        raise
     return ticket
 
 
@@ -175,10 +198,16 @@ def tail(path: Path, *, stop: threading.Event | None = None):
     """Yield every event in *path*, then follow it until the run ends.
 
     A GENERATOR OVER BYTES, not lines held in memory: the offset is carried
-    across polls so a partially-written final line is re-read rather than
-    yielded half-formed. JSONL plus a flush per event makes a torn line
-    unlikely; "unlikely" is not a guarantee, so a line that does not parse is
-    treated as not yet complete and retried.
+    across polls, and a chunk ending mid-line is held in `pending` until the
+    rest arrives -- so a partially-written line is never yielded half-formed.
+    That is what makes a torn write a non-event.
+
+    A COMPLETE LINE THAT DOES NOT PARSE ENDS THE STREAM with an error event.
+    It is not retried: the line is terminated, so it is not a partial write --
+    it is a flushed line that is not JSON, which is a bug in the writer and
+    worth surfacing rather than looping on. An earlier version of this
+    docstring said "retried", which the code has never done; the claim was
+    wrong, not the behaviour.
 
     Terminates on `run_finished` or `error`, which are the only two events that
     can be last. A stream that never terminates holds a request open for the

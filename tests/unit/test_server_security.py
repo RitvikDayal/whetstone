@@ -13,6 +13,7 @@ the other. Every test below is pinned to one of them.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import threading
 import urllib.error
@@ -21,13 +22,20 @@ from pathlib import Path
 
 import pytest
 
+# NOT `pytest.importorskip`. That skips the WHOLE MODULE when the extra
+# is absent -- and on a CI leg that dropped `--all-extras`, every test in
+# here would skip while the leg stayed green. `_bundle` raises instead
+# wherever CI is set, and skips only on a developer machine.
+from _bundle import UI_EXTRA_MISSING  # noqa: E402
 from whetstone.config.loader import load_config
 from whetstone.readmodel import ID_PREFIX
 from whetstone.server import serve as serve_module
 from whetstone.server.security import TOKEN_HEADER, allowed_hosts
 from whetstone.store.db import connect
 
-pytest.importorskip("fastapi", reason="the ui extra is not installed")
+pytestmark = pytest.mark.skipif(
+    UI_EXTRA_MISSING is not None, reason=UI_EXTRA_MISSING or "ui extra present"
+)
 
 # The shared guard, which FAILS rather than skips wherever CI is set.
 # A local `skipif` let a forgotten `npm run build` turn these into skips
@@ -41,7 +49,7 @@ def project(tmp_path: Path) -> Path:
         "version: 1\nproject:\n  name: guarded\nstate_dir: .state\n",
         encoding="utf-8",
     )
-    with connect(tmp_path / ".state") as conn:
+    with contextlib.closing(connect(tmp_path / ".state")) as conn:
         conn.execute(
             "INSERT INTO runs (id, tier, scope_mode, file_count, started_at, "
             "status, skipped_json) VALUES ('run-0000000001','quick','full',1,"

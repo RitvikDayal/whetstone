@@ -6,6 +6,7 @@ import pytest
 from whetstone.errors import SchemaVersionError, StoreError
 from whetstone.grade import Grade
 from whetstone.lenses.base import Candidate, Evidence, EvidenceKind, Severity
+from whetstone.store import db as db_module
 from whetstone.store.db import SCHEMA_VERSION, connect
 from whetstone.store.findings import count_by_state, list_findings, upsert
 
@@ -348,3 +349,76 @@ def test_a_refresh_that_matches_no_row_raises(tmp_path, monkeypatch):
         upsert(conn, _candidate(), "run-1", NOW)
     assert list_findings(conn) == []
     conn.close()
+
+
+# --- opening a brand-new database from several threads at once ----------------
+
+
+def test_concurrent_first_opens_all_succeed_and_all_get_wal(tmp_path):
+    """MEASURED FIRST, then fixed. Three threads opening a fresh database
+    failed with `OperationalError: database is locked` in roughly half of
+    twenty-five trials.
+
+    Switching journal modes takes an EXCLUSIVE lock and SQLite returns
+    SQLITE_BUSY for it immediately rather than calling the busy handler, so the
+    connection's 30-second timeout -- which covers every ordinary write -- did
+    nothing here.
+
+    Not an exotic case: the control plane's first page load fires
+    `/api/findings`, `/api/trust` and `/api/costs` in parallel, each opening
+    its own connection. A fresh project met this on its first screen about half
+    the time and got a 500 with no explanation on either side.
+
+    FOUR WORKERS AND SEVERAL TRIALS, because one trial of one open reproduces
+    nothing -- the race window is the first milliseconds of a database's life,
+    so the test has to create a new database each time.
+    """
+    import concurrent.futures
+
+    for trial in range(12):
+        root = tmp_path / f"trial-{trial}" / "state"
+
+        def _open(_index, root=root):
+            conn = connect(root)
+            try:
+                return str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            finally:
+                conn.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            modes = list(pool.map(_open, range(4)))
+
+        assert modes == ["wal"] * 4, (trial, modes)
+
+
+def test_a_database_already_in_wal_is_not_switched_again(tmp_path, monkeypatch):
+    """The read-before-write half, which is what makes the retry converge.
+
+    `journal_mode` is a persistent property of the FILE, so every open after
+    the first only has to read it back -- and reading takes no exclusive lock.
+    Without this the common path would contend on every single open rather
+    than only during a database's first milliseconds.
+    """
+    root = tmp_path / "state"
+    first = connect(root)
+    first.close()
+
+    # A TRACE CALLBACK, because `sqlite3.Connection` is an immutable type and
+    # its `execute` cannot be patched. The callback sees every statement the
+    # connection actually runs, which is a stronger observation anyway.
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    def _traced(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", _traced)
+    second = connect(root)
+    second.close()
+
+    assert statements, "the trace callback saw nothing; it is not measuring"
+    assert not any("journal_mode=WAL" in sql for sql in statements), (
+        "an already-WAL database was asked to switch again"
+    )

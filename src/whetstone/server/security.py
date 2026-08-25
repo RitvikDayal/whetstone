@@ -54,7 +54,9 @@ nothing and costs the product its boot. The Host check still applies to it.
 from __future__ import annotations
 
 import hmac
+import time
 
+import anyio
 from starlette.datastructures import MutableHeaders
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -114,13 +116,38 @@ def allowed_hosts(port: int) -> frozenset[str]:
 # sending a decision.
 _DRAIN_LIMIT_BYTES = 1 << 20
 _DRAIN_LIMIT_MESSAGES = 64
+# AND A CLOCK. Bytes and messages bound how MUCH is read; neither bounds how
+# LONG it takes. A client sending one byte a minute satisfies both limits and
+# holds a worker for an hour -- the slow-loris shape, reachable here without a
+# token because draining happens before the request is authenticated. The whole
+# point of this function is a courtesy to a well-behaved client; two seconds is
+# far more than loopback needs and far less than an attack wants.
+_DRAIN_LIMIT_SECONDS = 2.0
 
 
 async def _drain(receive: Receive) -> None:
-    """Consume the request body so the client can finish writing it."""
+    """Consume the request body so the client can finish writing it.
+
+    Bounded three ways, and past any of them the response goes out anyway. The
+    client may then see a connection reset -- which is the right trade, because
+    a caller that has exceeded these is not a browser sending a decision.
+    """
+    deadline = time.monotonic() + _DRAIN_LIMIT_SECONDS
     read = 0
     for _ in range(_DRAIN_LIMIT_MESSAGES):
-        message = await receive()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        # `move_on_after`, not a bare await: `receive()` blocks until the client
+        # sends something, and a client that sends NOTHING is the cheapest
+        # version of this attack -- one connection, no traffic, one worker held
+        # indefinitely. `message` stays None when the scope times out, which is
+        # how the timeout is distinguished from a real message.
+        message: Message | None = None
+        with anyio.move_on_after(remaining):
+            message = await receive()
+        if message is None:
+            return
         if message["type"] != "http.request":
             return
         read += len(message.get("body", b""))

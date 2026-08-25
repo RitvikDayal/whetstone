@@ -8,6 +8,7 @@ findings` then shows, and a run started in the browser has to contend with
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
@@ -18,6 +19,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+# NOT `pytest.importorskip`. That skips the WHOLE MODULE when the extra
+# is absent -- and on a CI leg that dropped `--all-extras`, every test in
+# here would skip while the leg stayed green. `_bundle` raises instead
+# wherever CI is set, and skips only on a developer machine.
+from _bundle import UI_EXTRA_MISSING  # noqa: E402
 from whetstone.cli import app as cli_app
 from whetstone.config.loader import load_config
 from whetstone.grade import Grade
@@ -32,7 +38,9 @@ from whetstone.severity import Severity
 from whetstone.store.db import connect
 from whetstone.store.findings import list_findings, upsert
 
-pytest.importorskip("fastapi", reason="the ui extra is not installed")
+pytestmark = pytest.mark.skipif(
+    UI_EXTRA_MISSING is not None, reason=UI_EXTRA_MISSING or "ui extra present"
+)
 
 
 def _candidate(rule_id: str, subject: str) -> Candidate:
@@ -66,7 +74,7 @@ def project(tmp_path: Path) -> Path:
         "version: 1\nproject:\n  name: mutable\nstate_dir: .state\n",
         encoding="utf-8",
     )
-    with connect(tmp_path / ".state") as conn:
+    with contextlib.closing(connect(tmp_path / ".state")) as conn:
         conn.execute(
             "INSERT INTO runs (id, tier, scope_mode, file_count, started_at, "
             "status, skipped_json) VALUES ('run-0000000001','quick','full',1,"
@@ -139,7 +147,7 @@ def _call(url: str, *, token: str | None = None, payload=None, method="GET"):
 
 
 def _first_id(project: Path) -> str:
-    with connect(project / ".state") as conn:
+    with contextlib.closing(connect(project / ".state")) as conn:
         return list_findings(conn, state="queued")[0].id
 
 
@@ -183,7 +191,7 @@ def test_rejecting_without_confirming_is_refused(live):
     assert status == 400
     assert "permanent" in body["error"]
 
-    with connect(project / ".state") as conn:
+    with contextlib.closing(connect(project / ".state")) as conn:
         assert list_findings(conn, state="queued")
 
 
@@ -227,7 +235,10 @@ def test_the_argument_rules_come_back_in_dispositions_own_words(live):
 
     from whetstone.errors import WhetstoneError
 
-    with connect(project / ".state") as conn, pytest.raises(WhetstoneError) as caught:
+    with (
+        contextlib.closing(connect(project / ".state")) as conn,
+        pytest.raises(WhetstoneError) as caught,
+    ):
         apply_disposition(
             conn,
             finding_id,
@@ -307,13 +318,40 @@ def test_the_run_lock_is_released_and_a_run_is_accepted_afterwards(live):
     assert len(body["ticket"]) == 32
 
 
-def test_a_ticket_is_not_a_path(live):
-    """`/api/runs/<ticket>/events` joins the ticket to a filesystem path."""
+@pytest.mark.parametrize(
+    ("hostile", "expected"),
+    [
+        # Reaches the route and is REFUSED BY VALIDATION -- these are single
+        # path segments, so routing matches and the handler runs.
+        ("..", 400),
+        ("a" * 31, 400),
+        ("Z" * 32, 400),
+        ("0" * 32 + chr(10), 400),
+        # ...and never reaches it, because the slashes make it a different
+        # path. A 404 here is routing, NOT the ticket check.
+        ("../../etc/passwd", 404),
+        ("", 404),
+    ],
+    ids=["dotdot", "too-short", "uppercase", "trailing-newline", "traversal", "empty"],
+)
+def test_a_ticket_is_not_a_path(live, hostile, expected):
+    """`/api/runs/<ticket>/events` joins the ticket to a filesystem path.
+
+    THE STATUS IS ASSERTED PER CASE. The first version accepted `status in
+    (400, 404)` for every input, which let ROUTING stand in for VALIDATION: a
+    case that 404s because the URL has slashes in it proves nothing about the
+    ticket check, and the two are told apart only by which number comes back.
+
+    `"0" * 32 + chr(10)` is the case that motivated `fullmatch`: Python's `$`
+    matches before a trailing newline, so `match(r"^[0-9a-f]{32}$")` accepted
+    it.
+    """
     base, token, _project = live
-    for hostile in ("..", "../../etc/passwd", "a" * 31, "Z" * 32, ""):
-        url = f"{base}/api/runs/{urllib.request.quote(hostile, safe='')}/events"
-        status, _body = _call(url, token=token)
-        assert status in (400, 404), (hostile, status)
+    url = f"{base}/api/runs/{urllib.request.quote(hostile, safe='')}/events"
+
+    status, _body = _call(url, token=token)
+
+    assert status == expected, (hostile, status)
 
 
 def test_the_event_stream_replays_from_the_start_and_terminates(live):
@@ -451,7 +489,7 @@ def test_a_progress_sink_that_raises_does_not_end_the_run(tmp_path):
         calls.append(event["kind"])
         raise RuntimeError("the watcher is broken")
 
-    with connect(tmp_path / ".state") as conn:
+    with contextlib.closing(connect(tmp_path / ".state")) as conn:
         result = execute_run(
             conn,
             config,
@@ -510,3 +548,156 @@ def test_a_post_refused_by_the_host_check_also_gets_its_status(live):
         urllib.request.urlopen(request, timeout=60)
 
     assert caught.value.code == 403
+
+
+# --- what the review round changed --------------------------------------------
+
+
+def test_a_ticket_with_a_trailing_newline_is_not_a_ticket(tmp_path):
+    """Python's `$` matches BEFORE a trailing newline.
+
+    `re.match(r"^[0-9a-f]{32}$", "0"*32 + chr(10))` succeeds, so the anchored
+    pattern accepted a value that is not a ticket -- in the check whose entire
+    job is deciding what a ticket is. `fullmatch` is the fix; this is the case
+    that distinguishes it from the version that shipped.
+    """
+    with pytest.raises(runs_module.UnknownRunError):
+        runs_module.events_path(tmp_path, "0" * 32 + chr(10))
+
+
+def test_the_run_lock_is_released_when_the_thread_cannot_start(project, monkeypatch):
+    """Released DETERMINISTICALLY, not eventually.
+
+    The lock is taken in `start()` and released by the worker's `finally`. If
+    `Thread.start()` raises -- which it does when the process cannot create
+    another thread -- no worker ever runs and nothing runs that `finally`.
+
+    A first version of this test checked the lock AFTER the `pytest.raises`
+    block and passed with the fix removed, which is what a mutation battery is
+    for. The reason is worth writing down: CPython collects the abandoned
+    `ExitStack`, collecting the suspended `run_lock` generator, which raises
+    `GeneratorExit` at its `yield` and runs the `finally` after all. So the
+    lock does come back -- once the exception's traceback stops referencing the
+    frame that holds the stack, which is not a moment anyone can name.
+
+    So the check happens INSIDE the `except`, while the traceback is still
+    alive and collection cannot have happened. That is the difference between
+    releasing it and hoping.
+    """
+    state = project / ".state"
+
+    def _refuse(self):
+        raise RuntimeError("cannot start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", _refuse)
+
+    try:
+        runs_module.start(
+            config=load_config(project / "whetstone.yaml"),
+            project_root=project,
+            state_root=state,
+            tier="quick",
+            changed_only=False,
+        )
+    except RuntimeError:
+        # The traceback is live here, so the ExitStack cannot have been
+        # collected. If `start()` did not close it explicitly, the lock is
+        # still held and this raises RunInProgressError.
+        with run_lock(state):
+            pass
+    else:  # pragma: no cover - the monkeypatch guarantees the raise
+        raise AssertionError("Thread.start was expected to raise")
+
+
+@pytest.mark.parametrize("body", ["[]", '"just a string"', "12", "null"])
+def test_a_body_that_is_not_an_object_gets_this_api_s_own_sentence(live, body):
+    """FastAPI validates a DECLARED body model before the handler runs.
+
+    With `body: dict[str, Any]` on the signature, a caller sending `[]` got
+    FastAPI's 422 validation blob and the `isinstance` guard inside the
+    function was dead code. The body is read in the handler now, so every
+    refusal on this route is one sentence written for a human.
+    """
+    base, token, project = live
+    request = urllib.request.Request(
+        f"{base}/api/findings/{_first_id(project)}/decide",
+        data=body.encode(),
+        method="POST",
+    )
+    request.add_header(TOKEN_HEADER, token)
+    request.add_header("Content-Type", "application/json")
+
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(request, timeout=60)
+
+    assert caught.value.code == 400
+    payload = json.loads(caught.value.read())
+    assert "JSON object" in payload["error"]
+
+
+def test_a_body_that_is_not_json_at_all_says_so(live):
+    base, token, project = live
+    request = urllib.request.Request(
+        f"{base}/api/findings/{_first_id(project)}/decide",
+        data=b"{ truncated",
+        method="POST",
+    )
+    request.add_header(TOKEN_HEADER, token)
+    request.add_header("Content-Type", "application/json")
+
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(request, timeout=60)
+
+    assert caught.value.code == 400
+    assert "not valid JSON" in json.loads(caught.value.read())["error"]
+
+
+def test_starting_a_run_with_no_body_at_all_is_the_ordinary_case(live):
+    """The button sends `{}`; `curl -X POST` sends nothing. Both are defaults."""
+    base, token, _project = live
+    request = urllib.request.Request(f"{base}/api/runs", data=b"", method="POST")
+    request.add_header(TOKEN_HEADER, token)
+
+    with urllib.request.urlopen(request, timeout=60) as response:
+        assert response.status == 200
+        assert len(json.loads(response.read())["ticket"]) == 32
+
+
+def test_a_reader_that_goes_away_stops_the_tail(tmp_path):
+    """A disconnected client must not hold a worker for the rest of a run.
+
+    Cancellation does not stop a SYNC generator running in a threadpool -- it
+    only stops whoever was reading it -- so `tail` takes a `stop` event and the
+    route sets it when the response is torn down. Asserted on `tail` directly:
+    driving a real disconnect through uvicorn would be timing-dependent, and
+    the flag is the mechanism either way.
+    """
+    events = tmp_path / "events" / f"{runs_module.new_ticket()}.jsonl"
+    events.parent.mkdir(parents=True)
+    events.write_text(json.dumps({"kind": "run_started"}) + "\n", encoding="utf-8")
+
+    stop = threading.Event()
+    stream = runs_module.tail(events, stop=stop)
+
+    assert next(stream)["kind"] == "run_started"
+    stop.set()
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_a_complete_line_that_is_not_json_ends_the_stream_with_an_error(tmp_path):
+    """The behaviour the docstring used to describe wrongly.
+
+    It said such a line was "treated as not yet complete and retried", which
+    the code has never done. A terminated line is not a partial write -- it is
+    a flushed line that is not JSON, which is a bug in the writer.
+    """
+    events = tmp_path / "events" / f"{runs_module.new_ticket()}.jsonl"
+    events.parent.mkdir(parents=True)
+    events.write_text("not json at all\n", encoding="utf-8")
+
+    collected = list(runs_module.tail(events))
+
+    assert len(collected) == 1
+    assert collected[0]["kind"] == "error"
+    assert "unreadable event" in collected[0]["error"]
