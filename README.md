@@ -24,24 +24,9 @@ limitations before you rely on a grade.
 
 ## Install
 
-```bash
-pip install whetstone-cli
-```
-
-The command is `whetstone`; the package on PyPI is `whetstone-cli`.
-
-The browser lens is an extra: Playwright pulls a few hundred megabytes of
-Chromium, and most people never run it.
-
-```bash
-pip install 'whetstone-cli[browser]'
-playwright install chromium
-```
-
-Without it that lens reports it could not run, and says which command fixes it.
-It never silently finds nothing.
-
-From a checkout instead, which is what you want if you intend to change it:
+**Not on PyPI yet.** `pyproject.toml` declares the distribution name
+`whetstone-cli` and `release.yml` is wired for Trusted Publishing, but nothing
+has been published and the name is not claimed. Install from a checkout:
 
 ```bash
 git clone https://github.com/RitvikDayal/whetstone
@@ -49,20 +34,33 @@ cd whetstone
 uv sync --all-groups
 ```
 
-The browser lens needs an extra: Playwright pulls a few hundred megabytes of
-Chromium, and most people never run it.
+The command is `whetstone`. Two capabilities are **extras** rather than
+dependencies, because installing Whetstone to run `hygiene` in CI should cost
+neither a Chromium download nor a web server:
+
+| Extra | What it adds | Cost of not having it |
+|---|---|---|
+| `browser` | The `rendered-ui` lens (Playwright) | The lens reports it could not run, and names the command that fixes it. It never silently finds nothing. |
+| `ui` | `whetstone ui`, the local control plane | The command refuses with a sentence naming the extra, rather than a `ModuleNotFoundError`. |
 
 ```bash
 uv sync --all-groups --all-extras
 uv run playwright install chromium
 ```
 
-Without it the lens reports that it could not run, with the command to fix it.
-It never silently finds nothing.
+The control plane also needs its front-end built, which is a separate thing and
+fails separately:
+
+```bash
+npm --prefix src/whetstone/ui ci
+npm --prefix src/whetstone/ui run build
+```
+
+A release wheel carries that bundle already; a checkout does not.
 
 ## Commands
 
-All seven are real.
+All eight are real.
 
 ```bash
 whetstone init      # interactive setup; verifies every answer by running it
@@ -71,8 +69,33 @@ whetstone run       # find issues
 whetstone findings  # list what it found
 whetstone decide    # accept, reject, defer, hand off - the decision survives re-runs
 whetstone report    # write a shareable HTML report
+whetstone ui        # the same queue, in a browser  (needs the `ui` extra)
 whetstone version   # print the installed version
 ```
+
+### `whetstone ui`
+
+A local page showing the same queue `whetstone findings` prints, in the same
+order, with the same verdicts -- one projection feeds both, and a test drives a
+real browser to check the terminal and the DOM agree.
+
+It binds `127.0.0.1` and requires a per-session token on every API call.
+**Localhost is not a security boundary:** any page in your browser can reach a
+local server, and an attacker's domain can re-resolve to `127.0.0.1` and become
+same-origin with it. The token and a `Host` check are the two things that stop
+those, and neither substitutes for the other.
+
+The token is printed only if you ask for it with `--print-url`. Read
+[docs/control-plane.md](docs/control-plane.md) before exposing it to anything.
+
+Four tabs: **findings** (with deciding), **run** (with live progress),
+**trust** and **cost**. Deciding here is the same act as `whetstone decide` --
+one projection feeds both surfaces and the API delegates to the same function,
+so the two cannot disagree about what a decision means.
+
+Runs are one at a time per project, enforced by an OS lock rather than in
+process: a run started in a terminal blocks the button, and the button blocks
+that terminal.
 
 ### Exit codes
 
@@ -220,6 +243,17 @@ Stated here rather than discovered later.
   twice the ceiling you set. Each still stops and reports at its own limit; it
   is the total that is unbounded.
   [#43](https://github.com/RitvikDayal/whetstone/issues/43).
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the setup and the one rule that matters:
+every test is forced red against the unfixed code before it is believed green.
+
+- [Code of Conduct](CODE_OF_CONDUCT.md) — Contributor Covenant 2.1
+- [Security policy](SECURITY.md) — read this before filing anything that looks
+  alarming; several behaviours are documented and deliberate
+- [Changelog](CHANGELOG.md)
+- [CLA](CLA.md) — required for contributions to this repository
 
 ## Licence
 

@@ -29,7 +29,7 @@ import math
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
-from ...budget import Budget, BudgetedProvider
+from ...budget import Budget, BudgetedProvider, write_cost_record
 from ...errors import WhetstoneError
 from ...severity import Severity
 from ..base import (
@@ -274,6 +274,32 @@ class RenderedUiPack:
             )
 
         budget = Budget(ceiling_usd=self.ceiling_usd)
+        # try/finally, the same shape `code-defects` uses and for the same
+        # reason: every path out of here has already been charged for the drive
+        # stage, and four of them are early returns. Without this the entire
+        # spend of this lens went unrecorded -- the drive stage ran, the model
+        # was paid, and `costs/` held nothing to say so.
+        try:
+            return self._pipeline(ctx, budget, provider, origin)
+        finally:
+            write_cost_record(
+                state_root=ctx.state_root,
+                run_id=ctx.run_id,
+                lens=self.name,
+                tier=ctx.tier,
+                budget=budget,
+                on_skip=ctx.skip,
+            )
+
+    def _pipeline(
+        self,
+        ctx: RunContext,
+        budget: Budget,
+        provider: Provider,
+        origin: Origin,
+    ) -> list[Candidate]:
+        """Everything downstream of the budget. Extracted so the cost record is
+        written on every path out, including the four early returns below."""
         budgeted = BudgetedProvider(provider, budget, subject="(drive)")
         viewports = _viewports(ctx)
 

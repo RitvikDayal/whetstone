@@ -1,0 +1,40 @@
+name: Feature request
+description: Something Whetstone should be able to do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Whetstone's design deliberately excludes some things. It never merges
+        and never deploys, it will not act on evidence it cannot reproduce, and
+        it does not surface a finding it cannot show its working for. Proposals
+        that need one of those to change need to argue for the change first.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you were trying to do, and where Whetstone got in the way. Not the solution yet.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: How would anyone know it worked
+      description: |
+        Whetstone grades its own findings on whether the evidence is
+        executable. The same question applies to a feature: what would
+        demonstrate this works, as opposed to appearing to?
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead

@@ -251,6 +251,17 @@ def list_findings(
     #
     # Severity is stored as text, so alphabetical ordering is meaningless
     # ("medium" would outrank "critical"). Both ranks are explicit.
+    #
+    # `id ASC` LAST, and it is not decoration: without it this ordering is not
+    # total. `subject` is a file path and is routinely shared -- `code-defects`
+    # hunts several candidates out of one file, so two findings at the same
+    # grade and severity in the same file tie completely, and SQLite is then
+    # free to return them in whatever order the query plan happens to produce.
+    # Two callers issuing the same query can therefore get different orders,
+    # which is exactly the silent two-surface disagreement the control plane
+    # has to be able to test for. `get_last_run` learned the same lesson from a
+    # measured tie on `started_at` and added a rowid tiebreaker; this is that
+    # fix, applied where the ties are common rather than rare.
     rows = conn.execute(
         "SELECT * FROM findings"
         + where
@@ -259,7 +270,7 @@ def list_findings(
         "   WHEN 'C' THEN 3 WHEN 'D' THEN 4 ELSE 2 END,"
         " CASE severity"
         "   WHEN 'critical' THEN 0 WHEN 'high' THEN 1"
-        "   WHEN 'medium' THEN 2 ELSE 3 END, subject ASC",
+        "   WHEN 'medium' THEN 2 ELSE 3 END, subject ASC, id ASC",
         params,
     ).fetchall()
     return [_row_to_finding(row) for row in rows]

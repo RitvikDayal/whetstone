@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
-from ..errors import SchemaVersionError
+from ..errors import SchemaVersionError, StoreError
 
 SCHEMA_VERSION = 2
 
@@ -74,6 +75,114 @@ CREATE TABLE IF NOT EXISTS runs (
 """
 
 
+# How long to keep retrying the switch into WAL. Small, because the contention
+# it covers lasts microseconds -- see `_enable_wal`.
+_WAL_RETRY_SECONDS = 5.0
+_WAL_RETRY_PAUSE = 0.02
+
+
+# SQLite's own wording for "somebody else holds it". Matched on the message
+# because `sqlite3` does not expose the extended result code on the exception
+# in a form worth depending on -- `sqlite3_errorcode` is not surfaced, and
+# `OperationalError` covers everything from a lock to a corrupt file.
+_LOCK_MESSAGES = ("database is locked", "database table is locked",
+                  "locking protocol")
+
+
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    lowered = str(exc).lower()
+    return any(message in lowered for message in _LOCK_MESSAGES)
+
+
+def _enable_wal(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Put the database in WAL mode, tolerating a concurrent first open.
+
+    THE BUSY TIMEOUT DOES NOT COVER THIS. Switching journal modes takes an
+    EXCLUSIVE lock, and SQLite returns SQLITE_BUSY for it immediately rather
+    than invoking the busy handler -- so the 30-second timeout on the
+    connection above, which covers every ordinary write, does nothing here.
+
+    MEASURED, not theorised: three threads opening a brand-new database at once
+    failed with `OperationalError: database is locked` in roughly half of
+    twenty-five trials. That is not an exotic case -- the control plane's first
+    page load fires `/api/findings`, `/api/trust` and `/api/costs` in parallel,
+    each opening its own connection, so a fresh project met this on its first
+    screen about half the time and got a 500.
+
+    READ BEFORE WRITE, which is what makes the retry converge. `journal_mode`
+    is a persistent property of the FILE, so once any connection has set it,
+    every later one only has to read it back -- and reading takes no exclusive
+    lock. The race window is therefore the first few milliseconds of a
+    database's life, and a loser of that race finds the winner's work done.
+    """
+    if _journal_mode(conn) == "wal":
+        return
+
+    deadline = time.monotonic() + _WAL_RETRY_SECONDS
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as exc:
+            # ONLY A LOCK. `OperationalError` also covers "file is not a
+            # database", "disk I/O error" and "attempt to write a readonly
+            # database" -- none of which another five seconds of retrying will
+            # fix, and every one of which would have been re-reported as a WAL
+            # contention problem, sending the reader to look for a second
+            # Whetstone process that does not exist.
+            if not _is_lock_error(exc):
+                raise
+            # Somebody else is mid-switch. Re-READ rather than assuming the
+            # attempt failed: the exception may mean they already succeeded.
+            if _journal_mode(conn) == "wal":
+                return
+            if time.monotonic() >= deadline:
+                raise StoreError(
+                    f"{db_path} could not be put into WAL mode within "
+                    f"{_WAL_RETRY_SECONDS:.0f}s because another process holds "
+                    "it. WAL is not optional here -- `paths.py` refuses "
+                    "cloud-synced state directories precisely because the -wal "
+                    "and -shm sidecars must stay consistent with the main "
+                    "file, and running without it would silently drop that "
+                    "guarantee. Close other Whetstone processes and retry."
+                ) from None
+            time.sleep(_WAL_RETRY_PAUSE)
+            continue
+        if _journal_mode(conn) == "wal":
+            return
+        # `PRAGMA journal_mode=WAL` can return the OLD mode without raising
+        # when it could not take the lock. Reading it back is the only honest
+        # confirmation that the mode actually changed.
+        if time.monotonic() >= deadline:
+            raise StoreError(
+                f"{db_path} reports journal_mode "
+                f"{_journal_mode(conn)!r} after being asked for WAL. See "
+                "above for why WAL is required."
+            )
+        time.sleep(_WAL_RETRY_PAUSE)
+
+
+def _journal_mode(conn: sqlite3.Connection) -> str:
+    """The current mode, or "" when another connection is mid-switch.
+
+    THE READ CAN BE LOCKED OUT TOO. `PRAGMA journal_mode` is a read, but a
+    connection changing the mode holds an exclusive lock for the duration, and
+    a reader that arrives inside that window gets SQLITE_BUSY. An unhandled
+    raise here would escape the retry loop that calls it -- the loop exists
+    precisely because somebody else is mid-switch, so the read failing is the
+    expected shape of that, not an exception to it.
+
+    "" rather than a raise, so the caller retries. A non-lock error still
+    propagates: see `_is_lock_error`.
+    """
+    try:
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+    except sqlite3.OperationalError as exc:
+        if not _is_lock_error(exc):
+            raise
+        return ""
+    return str(row[0]).lower() if row else ""
+
+
 def connect(state_root: Path) -> sqlite3.Connection:
     """Open (creating if needed) the database under *state_root*.
 
@@ -89,7 +198,7 @@ def connect(state_root: Path) -> sqlite3.Connection:
     # terminals are one keystroke apart.
     conn = sqlite3.connect(db_path, isolation_level=None, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    _enable_wal(conn, db_path)
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
 

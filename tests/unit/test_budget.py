@@ -14,7 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from whetstone.budget import Budget, BudgetedProvider, StageCost
+from whetstone.budget import (
+    Budget,
+    BudgetedProvider,
+    StageCost,
+    _cost_filename,
+    write_cost_record,
+)
 from whetstone.policy.profiles import profile_for
 from whetstone.provider.base import StageRequest, StageResult, Usage
 
@@ -320,3 +326,219 @@ def test_a_refusal_is_a_well_formed_failed_result():
     assert result.data is None
     assert result.error
     assert result.usage.total_tokens == 0
+
+
+# --- the cost record --------------------------------------------------------
+#
+# MOVED HERE FROM `lenses/code_defects/pack.py`, where it was a private method,
+# and the move is the point rather than tidiness: `rendered-ui` builds a
+# `Budget`, wraps its provider in a `BudgetedProvider`, spends real money
+# through it, and wrote no record at all. One writer, called by both.
+
+
+def _spent(usd: float | None = 0.25, *, calls: int = 1) -> Budget:
+    budget = Budget()
+    for _ in range(calls):
+        # The measured cache shape, per this module docstring: a stub that spends
+        # nothing makes every assertion below pass vacuously.
+        budget.spend(
+            Usage(input_tokens=4, cache_creation_input_tokens=41036, cost_usd=usd),
+            stage="hunt",
+            subject="a.py",
+        )
+    return budget
+
+
+def _read(state_root: Path, name: str) -> dict:
+    import json
+
+    return json.loads((state_root / "costs" / name).read_text(encoding="utf-8"))
+
+
+def test_the_record_is_keyed_by_lens_as_well_as_run(tmp_path):
+    """Two lenses in one run must not overwrite each other.
+
+    The first version wrote `<run_id>.json` while carrying a `"lens"` field
+    inside it -- a record whose own contents say more than one lens was
+    expected, in a filename that can hold exactly one. It was invisible because
+    only `code-defects` wrote records; the second lens to do so would have
+    silently destroyed the first, and the lost half is money that was spent.
+    """
+    write_cost_record(
+        state_root=tmp_path, run_id="run-1", lens="code-defects", tier="deep",
+        budget=_spent(0.25), on_skip=lambda _s: None,
+    )
+    write_cost_record(
+        state_root=tmp_path, run_id="run-1", lens="rendered-ui", tier="deep",
+        budget=_spent(0.10), on_skip=lambda _s: None,
+    )
+
+    assert _read(tmp_path, "run-1.code-defects.json")["spent_usd"] == pytest.approx(0.25)
+    assert _read(tmp_path, "run-1.rendered-ui.json")["spent_usd"] == pytest.approx(0.10)
+    assert len(list((tmp_path / "costs").glob("*.json"))) == 2
+
+
+@pytest.mark.parametrize(
+    "lens",
+    [
+        "../../evil",
+        "../" * 8 + "evil",
+        "a/b",
+        # `"a\\b"`, NOT `"a\b"`. The first version of this list wrote `"a\b"`,
+        # which Python reads as `a` followed by U+0008 BACKSPACE -- so the
+        # Windows-separator case, on the platform this project targets first,
+        # was never tested at all. A parametrised case that does not contain
+        # the character it is named for is a row that always passes.
+        "a\\b",
+        "C:evil",
+        "with space",
+        "..",
+        ".",
+    ],
+)
+def test_no_lens_name_can_put_a_separator_in_the_filename(lens):
+    """The sanitiser, tested DIRECTLY, because containment is not enough.
+
+    The first version of this test wrote a record with `lens="../../evil"` and
+    asserted the file landed under `costs/`. It passed with the sanitiser
+    REMOVED -- the mutation battery caught it. `costs/run-1.../../evil.json`
+    resolves back into `costs/` by arithmetic, so containment held while the
+    defence was gone, and the test was measuring a coincidence.
+
+    A separator in the name is the thing that turns a lens name into a
+    traversal, so that is what is asserted, on the function that decides it.
+    """
+    name = _cost_filename("run-1", lens)
+
+    assert "/" not in name
+    assert "\\" not in name
+    assert Path(name).name == name
+    assert name.startswith("run-1.") and name.endswith(".json")
+
+
+def test_a_lens_name_cannot_escape_the_costs_directory(tmp_path):
+    """And the end-to-end half: the bytes land under `costs/` and nowhere else."""
+    write_cost_record(
+        state_root=tmp_path, run_id="run-1", lens="../" * 8 + "evil", tier="deep",
+        budget=_spent(), on_skip=lambda _s: None,
+    )
+
+    everywhere = list(tmp_path.rglob("*.json"))
+    assert len(everywhere) == 1
+    assert everywhere[0].resolve().parent == (tmp_path / "costs").resolve()
+
+
+def test_two_lens_names_that_sanitise_alike_still_get_two_files(tmp_path):
+    """Sanitising alone would silently merge them, which is the same defect."""
+    for lens in ("a/b", "a:b"):
+        write_cost_record(
+            state_root=tmp_path, run_id="run-1", lens=lens, tier="deep",
+            budget=_spent(), on_skip=lambda _s: None,
+        )
+
+    assert len(list((tmp_path / "costs").glob("*.json"))) == 2
+
+
+def test_a_lens_that_spent_nothing_still_writes_a_record(tmp_path):
+    """`calls: 0` is a fact. Absence is three different facts at once.
+
+    The earlier version skipped an empty ledger, reasoning that "an empty
+    record would read as a run that cost nothing rather than one that never
+    called a model". That is backwards: a record saying `calls: 0` states
+    exactly that the lens ran and made no billable call. ABSENCE is what
+    collapses "not configured", "declined before building a budget" and "ran
+    and spent nothing" into one silence -- and a cost surface then cannot tell
+    $0.00 from unmeasured.
+    """
+    write_cost_record(
+        state_root=tmp_path, run_id="run-1", lens="code-defects", tier="quick",
+        budget=Budget(), on_skip=lambda _s: None,
+    )
+
+    record = _read(tmp_path, "run-1.code-defects.json")
+    assert record["calls"] == 0
+    assert record["spent_usd"] == 0.0
+    assert record["stages"] == []
+
+
+def test_an_unmeasured_call_is_reported_as_unmeasured_not_as_free(tmp_path):
+    skips: list[str] = []
+    write_cost_record(
+        state_root=tmp_path, run_id="run-1", lens="code-defects", tier="deep",
+        budget=_spent(None), on_skip=skips.append,
+    )
+
+    assert _read(tmp_path, "run-1.code-defects.json")["unmeasured_calls"] == 1
+    assert any("known to be short" in s for s in skips)
+
+
+def test_a_record_that_cannot_be_written_is_reported_rather_than_swallowed(tmp_path):
+    """Spend that happened and was not recorded has to reach the user."""
+    blocked = tmp_path / "costs"
+    blocked.write_text("not a directory", encoding="utf-8")
+    skips: list[str] = []
+
+    write_cost_record(
+        state_root=tmp_path, run_id="run-1", lens="code-defects", tier="deep",
+        budget=_spent(0.25), on_skip=skips.append,
+    )
+
+    assert any("spent and not recorded" in s for s in skips)
+
+
+def test_lens_names_differing_only_in_case_get_different_files():
+    """Windows and macOS fold case, so `Foo` and `foo` are ONE file there.
+
+    Both survive character sanitisation unchanged, so the `safe != lens` check
+    alone let them collide -- and a collision here is a lens's whole spend
+    silently overwritten by another's. Asserted on the filename rather than by
+    writing two files, because on a case-SENSITIVE filesystem writing them
+    would pass while the Windows and macOS behaviour stayed broken.
+    """
+    assert _cost_filename("run-1", "Foo") != _cost_filename("run-1", "foo")
+    assert (
+        _cost_filename("run-1", "Foo").lower()
+        != _cost_filename("run-1", "foo").lower()
+    ), "the names must differ AFTER case folding, or the filesystem merges them"
+
+
+def test_the_ordinary_lens_names_keep_their_plain_filenames():
+    """The digest is for names that need disambiguating. `code-defects` and
+    `rendered-ui` are already lower-case and already safe, and a hash suffix on
+    every record would make the directory unreadable for no reason."""
+    assert _cost_filename("run-1", "code-defects") == "run-1.code-defects.json"
+    assert _cost_filename("run-1", "rendered-ui") == "run-1.rendered-ui.json"
+
+
+def test_a_lens_name_cannot_forge_the_digest_namespace():
+    """The collision the digest itself reintroduced.
+
+    `_SAFE_LENS_NAME` permits `-`, so joining the digest with a hyphen put it
+    in the SAME namespace as an ordinary lens name: `Foo` sanitises to
+    `Foo-<d>`, and a lens literally named `foo-<d>` stays `foo-<d>`. Those fold
+    to one file on Windows and macOS -- the exact overwrite `_cost_filename`
+    exists to prevent, one level up from where it was looking.
+
+    `~` is outside the permitted class, so it can only ever be emitted by the
+    marker: any `~` in a lens name is replaced before the digest is appended.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(b"Foo").hexdigest()
+    forged = f"foo-{digest}"
+
+    assert _cost_filename("run-1", "Foo").lower() != _cost_filename(
+        "run-1", forged
+    ).lower()
+
+
+@pytest.mark.parametrize("lens", ["a~b", "~", "x~~y"])
+def test_a_tilde_in_a_lens_name_never_survives_into_the_filename(lens):
+    """What makes the marker a namespace rather than a convention."""
+    name = _cost_filename("run-1", lens)
+    stem = name[len("run-1.") : -len(".json")]
+    # Exactly one `~`, and it is the one the digest marker put there.
+    import hashlib
+
+    assert stem.count("~") == 1
+    assert stem.split("~")[1] == hashlib.sha256(lens.encode("utf-8")).hexdigest()

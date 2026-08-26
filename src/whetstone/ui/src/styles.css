@@ -1,0 +1,494 @@
+/* Same palette and the same constraints as report/html.py: no web fonts, no
+   remote images, nothing that leaves the document. The control plane is served
+   from loopback and must render identically on a machine with no network. */
+
+:root {
+  --bg: #ffffff;
+  --fg: #17181c;
+  --muted: #61646b;
+  --line: #e3e5e9;
+  --card: #f7f8fa;
+  --low: #6b7280;
+  --medium: #b45309;
+  --high: #b91c1c;
+  --critical: #7f1d1d;
+  --killed: #b91c1c;
+  --ok: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --fg: #e8eaee;
+    --muted: #9aa0a8;
+    --line: #2a2e35;
+    --card: #1b1e23;
+    --low: #9aa0a8;
+    --medium: #f0b429;
+    --high: #f87171;
+    --critical: #fca5a5;
+    --killed: #f87171;
+    --ok: #4ade80;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 2rem 1.25rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+}
+
+main {
+  max-width: 62rem;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0 0 0.25rem;
+}
+
+.sub,
+.muted {
+  color: var(--muted);
+}
+
+.sub {
+  margin: 0 0 1.5rem;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+}
+
+/* --- banners ------------------------------------------------------------ */
+
+.banner {
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  background: var(--card);
+  padding: 0.85rem 1rem;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+}
+
+.banner ul {
+  margin: 0.4rem 0 0;
+  padding-left: 1.1rem;
+  color: var(--muted);
+}
+
+.banner-quiet {
+  border-left-color: var(--muted);
+}
+
+.banner-warn {
+  border-left-color: var(--medium);
+}
+
+/* Louder than the skip list on purpose: a skip says part of the work was not
+   done, this says the whole page may be a partial record of a partial run. */
+.banner-alarm {
+  border-color: var(--high);
+  border-left-color: var(--high);
+  color: var(--high);
+}
+
+/* --- findings ----------------------------------------------------------- */
+
+.findings {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.finding {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  margin-bottom: 0.6rem;
+  overflow: hidden;
+}
+
+.finding.killed {
+  opacity: 0.72;
+}
+
+.finding-head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  padding: 0.8rem 1rem;
+  cursor: pointer;
+}
+
+.finding-head:hover {
+  background: rgba(127, 127, 127, 0.07);
+}
+
+.finding-head:focus-visible {
+  outline: 2px solid var(--medium);
+  outline-offset: -2px;
+}
+
+.verdict {
+  flex: 0 0 auto;
+  font-weight: 600;
+  font-size: 0.74rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  min-width: 6.5rem;
+}
+
+.verdict-A {
+  color: var(--ok);
+}
+
+.verdict-B,
+.verdict-C {
+  color: var(--medium);
+}
+
+.verdict-killed {
+  color: var(--killed);
+}
+
+.verdict-none {
+  color: var(--muted);
+}
+
+.sev {
+  flex: 0 0 auto;
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  min-width: 4.5rem;
+}
+
+.sev-low {
+  color: var(--low);
+}
+.sev-medium {
+  color: var(--medium);
+}
+.sev-high {
+  color: var(--high);
+}
+.sev-critical {
+  color: var(--critical);
+}
+
+.subject {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.title {
+  flex: 1 1 auto;
+}
+
+.finding-body {
+  padding: 0 1rem 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.detail {
+  white-space: pre-wrap;
+  margin: 0.8rem 0 0;
+}
+
+.why {
+  color: var(--muted);
+  margin: 0.6rem 0 0;
+}
+
+.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.9rem;
+  margin: 0.9rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.meta dt {
+  font-weight: 600;
+}
+
+.meta dd {
+  margin: 0;
+}
+
+/* Model output and advisory text carry URLs and package specifiers, neither of
+   which has a break opportunity -- the same measurement report/html.py records.
+   `anywhere` rather than `break-word` because only `anywhere` also stops an
+   oversized token setting the element's min-content width. */
+.detail,
+.why,
+.subject,
+.title,
+.banner li {
+  overflow-wrap: anywhere;
+}
+
+.footnote {
+  color: var(--muted);
+  font-size: 0.88rem;
+  margin-top: 1.2rem;
+}
+
+/* --- shell -------------------------------------------------------------- */
+
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+header h1 {
+  margin: 0;
+}
+
+nav {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.tab {
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font: inherit;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+  text-transform: capitalize;
+}
+
+.tab:hover {
+  color: var(--fg);
+}
+
+.tab.active {
+  color: var(--fg);
+  border-bottom-color: var(--medium);
+  font-weight: 600;
+}
+
+.tab .count {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  background: var(--line);
+  color: var(--fg);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+/* --- panels ------------------------------------------------------------- */
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  padding: 1rem 1.1rem;
+  margin-bottom: 0.85rem;
+  list-style: none;
+}
+
+.panel h2 {
+  font-size: 1rem;
+  margin: 0 0 0.7rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.panel > .finding-head {
+  margin: -1rem -1.1rem;
+  width: calc(100% + 2.2rem);
+}
+
+.tag {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 0.35rem;
+}
+
+.meta.wide {
+  grid-template-columns: 8rem 1fr;
+}
+
+/* --- buttons and inputs ------------------------------------------------- */
+
+button.primary {
+  background: var(--fg);
+  color: var(--bg);
+  border: 0;
+  border-radius: 6px;
+  padding: 0.45rem 0.9rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.primary:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+button.big {
+  padding: 0.6rem 1.3rem;
+}
+
+.decide {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.7rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.decide label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.decide select,
+.decide input {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  min-width: 12rem;
+}
+
+.error {
+  color: var(--high);
+  margin: 0;
+  flex-basis: 100%;
+}
+
+/* --- run progress ------------------------------------------------------- */
+
+.events {
+  margin: 0.6rem 0 0;
+  padding-left: 1.2rem;
+}
+
+.events li {
+  margin-bottom: 0.3rem;
+}
+
+.events li.live strong::after {
+  content: ' …';
+  color: var(--muted);
+}
+
+.events .skips {
+  margin: 0.25rem 0 0.5rem;
+  padding-left: 1rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* --- trust -------------------------------------------------------------- */
+
+.trust,
+.costs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.levels,
+.totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  margin-bottom: 0.7rem;
+}
+
+.totals {
+  margin-bottom: 1.2rem;
+}
+
+.levels > div,
+.totals > div {
+  display: flex;
+  flex-direction: column;
+}
+
+.label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.totals > div.alarm strong {
+  color: var(--high);
+}
+
+/* --- cost --------------------------------------------------------------- */
+
+.stages {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.9rem;
+  font-size: 0.88rem;
+}
+
+.stages th {
+  text-align: left;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  padding: 0.3rem 0.5rem 0.3rem 0;
+}
+
+.stages td {
+  padding: 0.3rem 0.5rem 0.3rem 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.unmeasured {
+  color: var(--high);
+  font-weight: 600;
+}
+
+/* Wide content scrolls inside its own box; the page never scrolls sideways. */
+.finding-body {
+  overflow-x: auto;
+}

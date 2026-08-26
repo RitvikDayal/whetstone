@@ -1,0 +1,90 @@
+name: Bug report
+description: Something Whetstone did that it should not have, or did not do that it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check [SECURITY.md](../blob/main/SECURITY.md) —
+        several alarming-looking behaviours are documented and deliberate,
+        notably that `whetstone doctor` runs your project's own commands.
+
+        Security vulnerabilities go through
+        [private advisories](../security/advisories/new), not here.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: |
+        **This is the field that matters.** Whetstone refuses to report a
+        finding it cannot reproduce, and the same standard helps here: a
+        failing command, a minimal repository, or a test that goes red is a
+        finding. A description alone is a starting point.
+      placeholder: |
+        1. whetstone init --yes
+        2. whetstone run --full
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: What it printed
+      description: |
+        The full output, including any skip lines. Whetstone reports what it
+        did NOT check as well as what it found, and that half is often where
+        the answer is.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Your whetstone.yaml
+      description: Redact anything sensitive. Secrets should be references, never literals — the config loader refuses literal ones.
+      render: yaml
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `whetstone version`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: extras
+    attributes:
+      label: Which extras are installed
+      options:
+        - label: "`browser` (the rendered-ui lens)"
+        - label: "`ui` (the control plane)"
+        - label: Docker is available and running

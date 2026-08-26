@@ -1348,3 +1348,97 @@ def test_the_quick_tier_says_why_it_did_not_run(tmp_path):
     )
     assert RenderedUiPack(provider=_FakeProvider({}))._collect(ctx) == []
     assert any("costs real money" in skip for skip in ctx.skips)
+
+
+def _drive_that_spends(ctx, budgeted, origin, viewports):
+    """A `drive` replacement that actually puts a charge on the ledger.
+
+    The stage is stubbed out, but the SPEND is what the cost-record tests are
+    about, so the stub goes through the budgeted provider exactly once and
+    returns an empty proposal -- the earliest of the four early returns that
+    happen after the money is gone.
+    """
+    from whetstone.lenses.rendered_ui.drive import DriveResult
+    from whetstone.policy.profiles import profile_for
+    from whetstone.provider.base import StageRequest
+
+    budgeted.run_stage(
+        StageRequest(
+            stage="drive",
+            prompt="look",
+            schema={"type": "object"},
+            # `hunt`, not `drive`: `policy/profiles.py` has no entry for any
+            # rendered-ui stage name -- the stage-name registry gap M2 recorded
+            # as a departure rather than fixed. The profile is irrelevant to
+            # what this measures, which is that the charge reaches the ledger.
+            permissions=profile_for("hunt"),
+            effort="medium",
+            max_budget_usd=None,
+            cwd=Path("."),
+        )
+    )
+    return DriveResult((), (), ())
+
+
+def test_the_spend_of_an_early_return_is_still_recorded(tmp_path, monkeypatch):
+    """This lens paid for the drive stage and recorded nothing. Four times.
+
+    `_collect` has four returns AFTER the budget exists and after `drive` has
+    been charged for -- an empty proposal, the ceiling stopping the run, a
+    screenshot directory that cannot be created, and the normal path. Only the
+    last one reached the end of the function, and none of them wrote a cost
+    record, because this pack had no equivalent of the one `code-defects` kept
+    as a private method. The lens spent real money and `costs/` held nothing to
+    say so.
+
+    `code-defects` documented the fix for itself two milestones ago: "Eager
+    means the ledger is written on every path out of `_collect`." The
+    `try/finally` here is that, and this test is the empty-proposal path --
+    the one that returns earliest with money already gone.
+    """
+    import json
+
+    from whetstone.lenses.rendered_ui import pack as pack_module
+
+    monkeypatch.setattr(pack_module, "availability", lambda: None)
+    # THE STUB SPENDS. A `drive` replaced by `lambda: DriveResult((),(),())`
+    # never touches the budgeted provider, so the ledger is empty and the test
+    # asserts a record exists for a run that cost nothing -- which is the
+    # opposite of the defect. It has to be charged for the assertion to mean
+    # what its name says.
+    monkeypatch.setattr(pack_module, "drive", _drive_that_spends)
+
+    ctx = _ctx(tmp_path, base_url="http://127.0.0.1:3000")
+    pack = RenderedUiPack(provider=_FakeProvider({"checks": [], "notes": "nothing"}))
+
+    assert pack._collect(ctx) == []
+
+    record = ctx.state_root / "costs" / f"{ctx.run_id}.rendered-ui.json"
+    assert record.exists(), (
+        "the drive stage was charged for and the run returned early; a cost "
+        "record has to exist or that spend is invisible"
+    )
+    spent = json.loads(record.read_text(encoding="utf-8"))
+    assert spent["calls"] == 1
+    assert spent["spent_usd"] > 0
+
+
+def test_the_cost_record_names_this_lens_and_not_the_other_one(tmp_path, monkeypatch):
+    """Keyed by lens, so two paying lenses in one run do not overwrite."""
+    import json
+
+    from whetstone.lenses.rendered_ui import pack as pack_module
+
+    monkeypatch.setattr(pack_module, "availability", lambda: None)
+    monkeypatch.setattr(pack_module, "drive", _drive_that_spends)
+
+    ctx = _ctx(tmp_path, base_url="http://127.0.0.1:3000")
+    RenderedUiPack(provider=_FakeProvider({"checks": []}))._collect(ctx)
+
+    record = json.loads(
+        (ctx.state_root / "costs" / f"{ctx.run_id}.rendered-ui.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert record["lens"] == "rendered-ui"
+    assert record["calls"] >= 1

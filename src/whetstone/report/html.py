@@ -7,14 +7,13 @@ must render identically on a machine with no network.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Environment, select_autoescape
 
 from ..config.model import BoundariesConfig
 from ..errors import ReportError, WriteForbiddenError
-from ..runner import RunResult
 from ..scope.resolver import guarded_write
-from ..store.findings import Finding
 
 _TEMPLATE = """\
 <!doctype html>
@@ -150,11 +149,11 @@ _TEMPLATE = """\
   {% endif %}
 
   {% for f in findings %}
-  <article class="finding{% if f.grade == 'D' %} killed{% endif %}">
+  <article class="finding{% if f.killed %} killed{% endif %}">
     <h3>{{ f.title }}</h3>
     <p class="meta">
-      {% if f.grade %}
-      <span class="grade grade-{{ f.grade }}">{% if f.grade == 'D' %}killed by
+      {% if f.graded %}
+      <span class="grade grade-{{ f.grade }}">{% if f.killed %}killed by
         the falsifier{% else %}grade {{ f.grade }}{% endif %}</span> ·
       {% endif %}
       <span class="sev sev-{{ f.severity }}">{{ f.severity }}</span>
@@ -174,8 +173,25 @@ _TEMPLATE = """\
 
 
 def render_report(
-    findings: list[Finding], *, project_name: str, run: RunResult | None
+    findings: list[dict[str, Any]],
+    *,
+    project_name: str,
+    run: dict[str, Any] | None,
 ) -> str:
+    """Render the read model's projection. NOT `Finding` objects.
+
+    THE THIRD SURFACE. This report used to compute `f.grade == 'D'` and the
+    words "killed by the falsifier" for itself, alongside `cli.py` computing
+    the same thing separately -- two independent answers to "is this killed",
+    in the two places a user reads a verdict. The control plane would have made
+    it three. `readmodel.finding_view` decides it once and every surface
+    renders the decision; the report was the copy most likely to drift
+    unnoticed, because it is the artifact people email to other people.
+
+    Jinja resolves `f.killed` on a dict via `__getitem__`, so the template
+    reads the same either way -- which is what kept this migration to a
+    template change rather than a rewrite.
+    """
     env = Environment(autoescape=select_autoescape(default_for_string=True))
     return env.from_string(_TEMPLATE).render(
         findings=findings, project_name=project_name, run=run

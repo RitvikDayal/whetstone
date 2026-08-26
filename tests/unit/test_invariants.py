@@ -156,9 +156,21 @@ _ALLOWED_WRITE_CALLS = {
     ("initialize/wizard.py", "os.fdopen"): (1,
         "wraps the descriptor the wizard opened with O_NOFOLLOW two lines "
         "above, which is that module's local form of the same check"),
-    ("lenses/code_defects/pack.py", "path.write_text"): (1,
-        "the cost ledger, at a path built from the run id under state_root; no "
-        "user or model input reaches it"),
+    ("budget.py", "path.write_text"): (1,
+        "the cost ledger, at a path built from the run id and the LENS NAME "
+        "under state_root. It moved here from lenses/code_defects/pack.py so "
+        "both paying lenses write one -- rendered-ui spent money and recorded "
+        "nothing -- and the lens name is sanitised against [^A-Za-z0-9._-] "
+        "before it reaches the filename, because M5 opens the lens registry to "
+        "third parties and a name carrying a separator would write outside the "
+        "costs directory"),
+    ("runlock.py", "open"): (1,
+        "the run lock. It is opened to be LOCKED, not to be written -- nothing "
+        "is ever written to it and a test pins it at zero bytes. Deliberately "
+        "outside the barrier: guarded_write resolves boundaries from config, "
+        "and the lock has to be takeable before a run has loaded anything. The "
+        "path is state_root / a module-level literal, so no user or model "
+        "input reaches it"),
     ("lenses/code_defects/reproduce.py", "path.write_text"): (1,
         "the pytest artifact: model-authored CONTENT, uuid4 PATH. That "
         "distinction is why it is safe, and it stops being true the moment a "
