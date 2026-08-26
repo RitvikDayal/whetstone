@@ -3,7 +3,7 @@
 Notable changes, newest first. Versions follow [semantic versioning](https://semver.org),
 and everything below 1.0 may break without a major bump.
 
-## Unreleased
+## 0.1.0
 
 ### Added
 
@@ -64,11 +64,17 @@ and everything below 1.0 may break without a major bump.
   keeps no cross-run accounting; both model-driven lenses report this rather
   than dropping it silently.
 
-## 0.1.0
+### The rest of what 0.1.0 is
 
-First tagged version. Not published to PyPI.
-
-The evidence pipeline — hunt, reproduce in a container, falsify in a separate
+Everything above landed on top of the work this version is mostly made of: the
+evidence pipeline — hunt, reproduce in a container, falsify in a separate
 process, grade — running over three lenses (`hygiene`, `code-defects`,
 `rendered-ui`), a queue with six dispositions, earned per-lens autonomy, GitHub
 Issues and PR sinks, and a self-contained HTML report.
+
+**There is no earlier release to compare against.** An earlier draft of this
+file had 0.1.0 as a shipped version with the control plane listed under
+"Unreleased" above it. No `v0.1.0` tag was ever pushed and nothing was ever
+published, so that would have described a release that did not exist and
+excluded a feature that is in this one. First tag, first publish, everything
+in it.
