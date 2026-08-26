@@ -1,6 +1,6 @@
 [project]
 name = "whetstone-cli"
-version = "0.1.0"
+version = "0.1.1"
 description = "Evidence-gated project improvement — finds real issues in your code and your running app"
 readme = "README.md"
 requires-python = ">=3.11"

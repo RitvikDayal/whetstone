@@ -172,8 +172,25 @@ jobs:
       # cannot start until a human approves the deployment.
       id-token: write
     steps:
+      # LEFT AT v4, matching `upload-artifact` above. The runner warns that v4
+      # targets Node 20 and forces it onto 24 -- a warning, not the failure
+      # being fixed here, and `upload-artifact` has no v8 to pair with. Bumping
+      # only one side of an upload/download pair on the release path trades a
+      # known warning for an unknown incompatibility. Both move together, or
+      # neither does.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+      # v1.14.2, NOT v1.12.4, and the bump is a fix rather than hygiene.
+      # v1.12.4 bundles a twine that refuses `Metadata-Version: 2.5`:
+      #
+      #   InvalidDistribution: Invalid distribution metadata: '2.5' is not a
+      #   valid metadata version
+      #
+      # Hatchling emits 2.5 because `license = "AGPL-3.0-or-later"` is a PEP 639
+      # SPDX expression, which is carried as `License-Expression`. So the first
+      # real release failed at the action's LOCAL validation step, before any
+      # upload was attempted and before Trusted Publishing was exercised at all.
+      # Nothing about the PyPI configuration was wrong.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
