@@ -524,7 +524,7 @@ def test_a_lens_name_cannot_forge_the_digest_namespace():
     """
     import hashlib
 
-    digest = hashlib.sha256(b"Foo").hexdigest()[:8]
+    digest = hashlib.sha256(b"Foo").hexdigest()
     forged = f"foo-{digest}"
 
     assert _cost_filename("run-1", "Foo").lower() != _cost_filename(
@@ -538,7 +538,7 @@ def test_a_tilde_in_a_lens_name_never_survives_into_the_filename(lens):
     name = _cost_filename("run-1", lens)
     stem = name[len("run-1.") : -len(".json")]
     # Exactly one `~`, and it is the one the digest marker put there.
+    import hashlib
+
     assert stem.count("~") == 1
-    assert stem.split("~")[1] == __import__("hashlib").sha256(
-        lens.encode("utf-8")
-    ).hexdigest()[:8]
+    assert stem.split("~")[1] == hashlib.sha256(lens.encode("utf-8")).hexdigest()

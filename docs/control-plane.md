@@ -88,12 +88,18 @@ act on your project.
 
 - **Do not paste the URL anywhere.** Re-run `whetstone ui` instead; the token
   changes every time.
-- **A URL with the fragment WILL work in another tab, and on another machine
-  that can reach the port.** An earlier version of this document said a second
-  tab or a bookmark "will not work" — that was wrong and dangerously so, since
-  it implied pasting the link was harmless. The server validates the token and
-  nothing else; it has no idea which tab sent it. `sessionStorage` is a
-  convenience for the tab that already has one, not a restriction on the token.
+- **A URL with the fragment WILL work in another tab on this machine.** An
+  earlier version of this document said a second tab or a bookmark "will not
+  work" — wrong, and dangerously so, since it implied pasting the link was
+  harmless. The server validates the token and has no idea which tab sent it;
+  `sessionStorage` is a convenience for the tab that already has one, not a
+  restriction on the token.
+
+  **Not from another machine, though**, and the correction above overshot in
+  its turn: `http://127.0.0.1:<port>` on someone else's computer addresses
+  *their* loopback, and anything that rewrites the URL to reach yours arrives
+  with a `Host` the allowlist refuses. The token is what you are protecting;
+  the `Host` check is why a leaked URL is not immediately a remote session.
 - **A tab opened WITHOUT the fragment has no token**, and says so rather than
   going blank. That is the only sense in which a plain bookmark fails: it drops
   the fragment.

@@ -239,7 +239,14 @@ def _cost_filename(run_id: str, lens: str) -> str:
         # `~` is outside the permitted class, so it can only ever appear here
         # -- no lens name can produce one, because any `~` in a name is
         # replaced before this line runs.
-        digest = hashlib.sha256(lens.encode("utf-8")).hexdigest()[:8]
+        # THE FULL 256 BITS, not a prefix. Eight hex characters is 32 bits,
+        # and a birthday collision on 32 bits is about 2^16 tries -- trivial to
+        # brute-force for anyone who can choose a lens name, which M5's plugin
+        # registry is exactly the mechanism for. A collision here means one
+        # lens's cost record silently overwriting another's, which is the thing
+        # this whole function exists to prevent. A long filename is a cheaper
+        # price than a collision nobody can detect.
+        digest = hashlib.sha256(lens.encode("utf-8")).hexdigest()
         safe = f"{safe}{_DIGEST_MARKER}{digest}"
     return f"{run_id}.{safe}.json"
 

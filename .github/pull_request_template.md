@@ -1,4 +1,4 @@
-## What changed, and why
+# What changed, and why
 
 <!-- The why matters more. If you found the defect by measuring something, put
      the measurement here. -->

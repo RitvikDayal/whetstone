@@ -62,6 +62,16 @@ class CustomBuildHook(BuildHookInterface):
         if os.environ.get(SKIP):
             self._say(f"{SKIP} is set; not building the front-end.")
             return
+
+        # BEFORE the `INDEX.is_file()` check below, not after. `is_file()`
+        # FOLLOWS a symlink, so a symlinked `dist` would satisfy it and return
+        # early -- past the boundary check entirely. And `dist` needs resolving
+        # in its own right: `vite.config.ts` sets `emptyOutDir: true`, so a
+        # build does not merely write there, it DELETES the directory first.
+        # A symlinked `dist` therefore aims a recursive delete at whatever the
+        # link points to.
+        self._guard_write_boundary()
+
         if INDEX.is_file():
             # Already built. See STALENESS above -- this is the common case for
             # `uv sync`, and rebuilding here would front every test run with a
@@ -75,7 +85,6 @@ class CustomBuildHook(BuildHookInterface):
             )
             return
 
-        self._guard_write_boundary()
         npm = shutil.which("npm")
         if npm is None:
             # NOT an error. See the module docstring: this path is reached by a
@@ -132,12 +141,23 @@ class CustomBuildHook(BuildHookInterface):
         else does.
         """
         root = pathlib.Path(__file__).resolve().parent
-        target = UI.resolve()
-        if not target.is_relative_to(root):
-            raise RuntimeError(
-                f"the front-end directory resolves to {target}, which is "
-                f"outside this repository ({root}). `npm ci` writes "
-                "node_modules/ and `npm run build` writes dist/, so building "
-                "there would write outside the worktree. Refusing. This is "
-                "what a symlinked src/whetstone/ui looks like."
-            )
+        # `dist` AS WELL AS `ui`. Resolving only the parent leaves the output
+        # directory free to be a link of its own, and `emptyOutDir: true` makes
+        # that a recursive delete rather than a stray write.
+        for label, path in (("front-end directory", UI), ("build output", UI / "dist")):
+            if not path.exists() and label == "build output":
+                continue
+            target = path.resolve()
+            if not target.is_relative_to(root):
+                raise RuntimeError(
+                    f"the {label} resolves to {target}, which is outside this "
+                    f"repository ({root}). `npm ci` writes node_modules/ and "
+                    "`npm run build` EMPTIES and rewrites dist/, so building "
+                    "there would write -- and delete -- outside the worktree. "
+                    "Refusing. This is what a symlink here looks like."
+                )
+            if ".git" in target.parts:
+                raise RuntimeError(
+                    f"the {label} resolves to {target}, which is inside .git. "
+                    "Refusing: a build there rewrites repository internals."
+                )

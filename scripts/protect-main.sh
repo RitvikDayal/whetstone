@@ -16,9 +16,21 @@
 # thread is resolved before merge. That last one is real -- CodeRabbit opens
 # threads and they have to be answered, not waved through.
 #
-# The honest version of "a second reviewer" is a second maintainer. Until there
-# is one, this claims less than it could and means all of it. The same argument
-# is recorded in release.yml about `prevent_self_review`.
+# BUT THE REVIEW GATE IS STILL REAL, and it is a status check rather than an
+# approval. CONTRIBUTING.md says CodeRabbit is the merge gate, and with zero
+# required approvals that was a claim nothing enforced -- thread resolution only
+# requires EXISTING threads to be resolved, which a pull request nobody reviewed
+# satisfies trivially by having none.
+#
+# CodeRabbit posts a commit status under the context `CodeRabbit`, so requiring
+# it makes the documented gate the actual gate: no review, no merge. That is a
+# bot rather than a person, and it is what this repository has -- it once found
+# 21 defects, including a critical fail-open, on a branch three self-run
+# reviewers had passed.
+#
+# The honest version of "a second reviewer" is still a second maintainer. Until
+# there is one, this claims less than an approval rule would and means all of
+# it. The same argument is recorded in release.yml about `prevent_self_review`.
 #
 # `require_extra_approval_for_unattributed_changes` is set FALSE explicitly,
 # because GitHub defaults it to true and that default deadlocks this repository.
@@ -69,7 +81,8 @@ gh api -X POST "repos/${REPO}/rulesets" --input - <<'JSON'
           { "context": "test (ubuntu-latest, 3.12)" },
           { "context": "test (windows-latest, 3.11)" },
           { "context": "test (windows-latest, 3.12)" },
-          { "context": "wheel" }
+          { "context": "wheel" },
+          { "context": "CodeRabbit" }
         ]
       }
     }

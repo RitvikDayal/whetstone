@@ -17,9 +17,15 @@ keywords = [
 ]
 
 # NO `License ::` CLASSIFIER. `license = "AGPL-3.0-or-later"` above is a PEP 639
-# SPDX expression, and PyPI rejects a distribution that carries both -- the
-# classifier is the pre-639 spelling of the same fact, and two spellings of one
-# fact is exactly what 639 exists to end.
+# SPDX expression, and 639 DEPRECATES the licence classifiers in favour of it --
+# the classifier is the pre-639 spelling of the same fact, and two spellings of
+# one fact is what 639 exists to end.
+#
+# Stated carefully, because an earlier version of this comment claimed PyPI
+# "rejects a distribution that carries both". PyPI's mandatory rejection is for
+# a distribution carrying both the legacy `License` FIELD and
+# `License-Expression`; a classifier alongside an expression is deprecated
+# rather than refused. Omitting it is still right, but for the smaller reason.
 #
 # `3 - Alpha`, not Beta, and the README says the same thing in words: the
 # pipeline has been run against real defects, and how REPRODUCIBLE the
