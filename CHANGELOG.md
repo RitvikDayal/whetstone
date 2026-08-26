@@ -3,7 +3,37 @@
 Notable changes, newest first. Versions follow [semantic versioning](https://semver.org),
 and everything below 1.0 may break without a major bump.
 
+## 0.1.1
+
+The first version that reaches PyPI. Identical to 0.1.0 in every line of
+shipped code — the difference is one pinned action in the release workflow.
+
+`v0.1.0` was tagged, verified on four legs, built, and then failed at the
+publish step:
+
+```
+InvalidDistribution: Invalid distribution metadata:
+  '2.5' is not a valid metadata version
+```
+
+`pypa/gh-action-pypi-publish@v1.12.4` bundles a twine that predates metadata
+version 2.5, which hatchling emits because `license = "AGPL-3.0-or-later"` is a
+PEP 639 SPDX expression carried as `License-Expression`. So it failed at the
+action's own LOCAL validation, before any upload — Trusted Publishing was never
+exercised and nothing about the PyPI configuration was wrong. A current twine
+passes both artifacts unchanged.
+
+**`v0.1.0` is not deleted, and could not be.** The `v*` ruleset forbids deleting
+or force-updating a release tag so that a published version can never later
+point at different code. It applies to a tag that failed to publish too, which
+is the rule costing something rather than being free — and moving it would have
+been the first exception, on the first release. It stays as the record that this
+happened.
+
 ## 0.1.0
+
+Tagged, never published. See above.
+
 
 ### Added
 
