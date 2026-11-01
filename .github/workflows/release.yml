@@ -38,13 +38,13 @@ jobs:
         python: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       # The front-end, BEFORE uv touches Python. `uv sync` and `uv build` both
       # invoke the build backend, and `hatch_build.py` can only warn when there
       # is no bundle and no Node -- so a release built without these steps would
       # publish a wheel with no control plane in it. `test_package.py` would
       # catch it, which is the point of ordering rather than hoping.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
           cache: npm
@@ -69,13 +69,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       # The front-end, BEFORE uv touches Python. `uv sync` and `uv build` both
       # invoke the build backend, and `hatch_build.py` can only warn when there
       # is no bundle and no Node -- so a release built without these steps would
       # publish a wheel with no control plane in it. `test_package.py` would
       # catch it, which is the point of ordering rather than hoping.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
           cache: npm
@@ -121,7 +121,7 @@ jobs:
           /tmp/fresh/bin/whetstone version
           /tmp/fresh/bin/whetstone --help > /dev/null
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/
@@ -178,7 +178,7 @@ jobs:
       # only one side of an upload/download pair on the release path trades a
       # known warning for an unknown incompatibility. Both move together, or
       # neither does.
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
@@ -193,4 +193,4 @@ jobs:
       # real release failed at the action's LOCAL validation step, before any
       # upload was attempted and before Trusted Publishing was exercised at all.
       # Nothing about the PyPI configuration was wrong.
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
